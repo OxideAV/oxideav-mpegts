@@ -1,0 +1,25 @@
+[package]
+name = "oxideav-mpegts"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust clean-room MPEG-TS (ISO/IEC 13818-1) demuxer — 188-byte TS packet parser, PAT/PMT discovery, PES reassembly. Built to ingest Blu-ray .m2ts bytes for remux pipelines."
+repository = "https://github.com/OxideAV/oxideav-mpegts"
+homepage = "https://github.com/OxideAV/oxideav-mpegts"
+readme = "README.md"
+keywords = ["multimedia", "container", "mpegts", "demuxer", "bluray"]
+categories = ["multimedia", "parser-implementations"]
+
+[features]
+default = ["registry"]
+
+# Wire the crate's container declaration into `oxideav-core`'s
+# `ContainerRegistry`. Disable for a standalone build that exposes
+# the parser without dragging in the framework dependency tree.
+registry = ["dep:oxideav-core"]
+
+[dependencies]
+oxideav-core = { version = "0.1", optional = true }
+thiserror = "2"
