@@ -56,5 +56,7 @@ pub use packet::{
     iter_packets, AdaptationField, TsPacket, TsPacketIter, TS_PACKET_LEN, TS_SYNC_BYTE,
 };
 pub use pes::{PesPacket, PesReassembler};
-pub use psi::{PmtStream, ProgramAssociationTable, ProgramMapTable};
+pub use psi::{
+    iter_sections, mpeg2_crc32, PmtStream, ProgramAssociationTable, ProgramMapTable, SectionIter,
+};
 pub use stream_type::StreamType;
