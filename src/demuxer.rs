@@ -63,6 +63,8 @@ pub struct MpegTsDemuxer {
     /// `true` once `read_one_packet` has returned `Eof` and every
     /// reassembler has been flushed.
     eof_reached: bool,
+    /// Input bytes consumed so far — for diagnostic error messages.
+    bytes_read: u64,
 }
 
 impl std::fmt::Debug for MpegTsDemuxer {
@@ -84,8 +86,10 @@ impl MpegTsDemuxer {
         // PAT in one TS packet).
         let mut pmt_pid: Option<u16> = None;
         let mut programs_found: Option<ProgramAssociationTable> = None;
+        let mut probe_bytes: u64 = 0;
         loop {
-            let buf = match read_one_packet(&mut input)? {
+            probe_bytes += TS_PACKET_LEN as u64;
+            let buf = match read_one_packet(&mut input, probe_bytes - TS_PACKET_LEN as u64)? {
                 Some(b) => b,
                 None => {
                     return Err(CoreError::invalid(
@@ -120,7 +124,8 @@ impl MpegTsDemuxer {
 
         // Step 2: scan for the matching PMT.
         let pmt = loop {
-            let buf = match read_one_packet(&mut input)? {
+            probe_bytes += TS_PACKET_LEN as u64;
+            let buf = match read_one_packet(&mut input, probe_bytes - TS_PACKET_LEN as u64)? {
                 Some(b) => b,
                 None => {
                     return Err(CoreError::invalid(
@@ -176,6 +181,7 @@ impl MpegTsDemuxer {
             reassemblers,
             pending: VecDeque::new(),
             eof_reached: false,
+            bytes_read: probe_bytes,
         })
     }
 
@@ -183,10 +189,11 @@ impl MpegTsDemuxer {
     /// track, feed the per-PID reassembler. Returns the number of
     /// `Packet`s pushed into `self.pending` by this call.
     fn read_one_into_pending(&mut self) -> CoreResult<usize> {
-        let buf = match read_one_packet(&mut self.input)? {
+        let buf = match read_one_packet(&mut self.input, self.bytes_read)? {
             Some(b) => b,
             None => return Ok(0),
         };
+        self.bytes_read += TS_PACKET_LEN as u64;
         let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
         let stream_idx = match self.pid_to_stream.get(&pkt.pid).copied() {
             Some(i) => i,
@@ -245,12 +252,13 @@ impl Demuxer for MpegTsDemuxer {
                 // when there are no more 188-byte chunks. We need a
                 // signal here without re-reading; do a single
                 // try-read and on `None` set eof + flush.
-                match read_one_packet(&mut self.input)? {
+                match read_one_packet(&mut self.input, self.bytes_read)? {
                     None => {
                         self.eof_reached = true;
                         self.flush_reassemblers();
                     }
                     Some(buf) => {
+                        self.bytes_read += TS_PACKET_LEN as u64;
                         // We've already advanced past an EOF earlier
                         // when this branch was taken with pushed=0 but
                         // there ARE more bytes — that means the prior
@@ -281,7 +289,10 @@ impl Demuxer for MpegTsDemuxer {
 /// next 188 bytes forward for `0x47`; if we can't recover, surface as
 /// `Err`. Real-world BD `.m2ts` is sync-aligned, so this is just a
 /// safety net.
-fn read_one_packet(input: &mut Box<dyn ReadSeek>) -> CoreResult<Option<[u8; TS_PACKET_LEN]>> {
+fn read_one_packet(
+    input: &mut Box<dyn ReadSeek>,
+    bytes_read: u64,
+) -> CoreResult<Option<[u8; TS_PACKET_LEN]>> {
     use std::io::Read;
     let mut buf = [0u8; TS_PACKET_LEN];
     let mut filled = 0;
@@ -292,7 +303,7 @@ fn read_one_packet(input: &mut Box<dyn ReadSeek>) -> CoreResult<Option<[u8; TS_P
                     return Ok(None);
                 }
                 return Err(CoreError::invalid(format!(
-                    "mpegts: short read at packet boundary ({filled}/{TS_PACKET_LEN} bytes)"
+                    "mpegts: short read at packet boundary ({filled}/{TS_PACKET_LEN} bytes, offset {bytes_read})"
                 )));
             }
             Ok(n) => filled += n,
@@ -301,8 +312,9 @@ fn read_one_packet(input: &mut Box<dyn ReadSeek>) -> CoreResult<Option<[u8; TS_P
     }
     if buf[0] != TS_SYNC_BYTE {
         return Err(CoreError::invalid(format!(
-            "mpegts: bad sync byte 0x{:02X} (want 0x47)",
-            buf[0]
+            "mpegts: bad sync byte 0x{:02X} (want 0x47) at offset {bytes_read} (packet {})",
+            buf[0],
+            bytes_read / TS_PACKET_LEN as u64,
         )));
     }
     Ok(Some(buf))
