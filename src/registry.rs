@@ -14,6 +14,7 @@ use oxideav_core::{ContainerRegistry, RuntimeContext};
 /// point.
 pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("mpegts", crate::demuxer::open);
+    reg.register_muxer("mpegts", crate::muxer::open);
     reg.register_probe("mpegts", crate::demuxer::probe);
     // Conventional file extensions for an MPEG-TS payload.
     reg.register_extension("ts", "mpegts");
@@ -30,4 +31,3 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 pub fn register(ctx: &mut RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
-
