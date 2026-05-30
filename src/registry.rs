@@ -1,14 +1,34 @@
-//! Wiring into `oxideav-core`'s container registry. Stub.
+//! Wiring into `oxideav-core`'s container registry. The Demuxer
+//! factory + probe + extension hooks land here so a downstream
+//! `RuntimeContext` populated by `oxideav-meta::register_all` ends
+//! up with a working `"mpegts"` container.
 
-#[cfg(feature = "registry")]
-use oxideav_core::RuntimeContext;
+use oxideav_core::{ContainerRegistry, RuntimeContext};
 
-/// Register the MPEG-TS container declaration in the runtime
-/// context. Stub — to be filled by a downstream pass that wires
-/// the actual demuxer factory.
-#[cfg(feature = "registry")]
-pub fn register(_ctx: &mut RuntimeContext) {
-    // TODO: hook the demuxer factory once `oxideav-mpegts::pes` and
-    // `psi` land. For now this is a placeholder so the workspace's
-    // `populate_container_registry` doesn't crash on us.
+/// Install the MPEG-TS Demuxer factory + probe + file extensions on
+/// a [`ContainerRegistry`].
+///
+/// Mirrors the shape every sibling container crate exposes
+/// ([`oxideav_mkv::register_containers`], etc.) so the populate
+/// helpers in `oxideav-meta` can call it through one uniform entry
+/// point.
+pub fn register_containers(reg: &mut ContainerRegistry) {
+    reg.register_demuxer("mpegts", crate::demuxer::open);
+    reg.register_probe("mpegts", crate::demuxer::probe);
+    // Conventional file extensions for an MPEG-TS payload.
+    reg.register_extension("ts", "mpegts");
+    reg.register_extension("m2ts", "mpegts");
+    reg.register_extension("mts", "mpegts");
 }
+
+/// Install the MPEG-TS container into a [`RuntimeContext`].
+///
+/// Convenience wrapper around [`register_containers`] matching the
+/// uniform `register(&mut RuntimeContext)` entry point every sibling
+/// crate exposes. Also wired into the `oxideav_meta::register_all`
+/// fan-out via the [`oxideav_core::register!`] macro below.
+pub fn register(ctx: &mut RuntimeContext) {
+    register_containers(&mut ctx.containers);
+}
+
+oxideav_core::register!("mpegts", register);

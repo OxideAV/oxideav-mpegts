@@ -49,6 +49,8 @@ pub mod psi;
 pub mod stream_type;
 
 #[cfg(feature = "registry")]
+pub mod demuxer;
+#[cfg(feature = "registry")]
 pub mod registry;
 
 pub use error::TsError;
@@ -60,3 +62,6 @@ pub use psi::{
     iter_sections, mpeg2_crc32, PmtStream, ProgramAssociationTable, ProgramMapTable, SectionIter,
 };
 pub use stream_type::StreamType;
+
+#[cfg(feature = "registry")]
+pub use demuxer::{open as open_demuxer, probe as probe_mpegts, MpegTsDemuxer};
