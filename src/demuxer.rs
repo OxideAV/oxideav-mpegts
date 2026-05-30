@@ -65,6 +65,13 @@ pub struct MpegTsDemuxer {
     eof_reached: bool,
     /// Input bytes consumed so far — for diagnostic error messages.
     bytes_read: u64,
+    /// Tiny look-ahead buffer used by the resync path: we may peek a
+    /// "probe" byte to validate a candidate sync, and need to feed it
+    /// to the next `read_one_packet` rather than discard it (which
+    /// would leave the input cursor 1 byte misaligned and force every
+    /// subsequent read through another resync). Holds at most a few
+    /// bytes in practice.
+    putback: VecDeque<u8>,
 }
 
 impl std::fmt::Debug for MpegTsDemuxer {
@@ -87,9 +94,14 @@ impl MpegTsDemuxer {
         let mut pmt_pid: Option<u16> = None;
         let mut programs_found: Option<ProgramAssociationTable> = None;
         let mut probe_bytes: u64 = 0;
+        let mut probe_putback: VecDeque<u8> = VecDeque::new();
         loop {
             probe_bytes += TS_PACKET_LEN as u64;
-            let buf = match read_one_packet(&mut input, probe_bytes - TS_PACKET_LEN as u64)? {
+            let buf = match read_one_packet(
+                &mut input,
+                &mut probe_putback,
+                probe_bytes - TS_PACKET_LEN as u64,
+            )? {
                 Some(b) => b,
                 None => {
                     return Err(CoreError::invalid(
@@ -125,7 +137,11 @@ impl MpegTsDemuxer {
         // Step 2: scan for the matching PMT.
         let pmt = loop {
             probe_bytes += TS_PACKET_LEN as u64;
-            let buf = match read_one_packet(&mut input, probe_bytes - TS_PACKET_LEN as u64)? {
+            let buf = match read_one_packet(
+                &mut input,
+                &mut probe_putback,
+                probe_bytes - TS_PACKET_LEN as u64,
+            )? {
                 Some(b) => b,
                 None => {
                     return Err(CoreError::invalid(
@@ -182,6 +198,7 @@ impl MpegTsDemuxer {
             pending: VecDeque::new(),
             eof_reached: false,
             bytes_read: probe_bytes,
+            putback: probe_putback,
         })
     }
 
@@ -189,7 +206,7 @@ impl MpegTsDemuxer {
     /// track, feed the per-PID reassembler. Returns the number of
     /// `Packet`s pushed into `self.pending` by this call.
     fn read_one_into_pending(&mut self) -> CoreResult<usize> {
-        let buf = match read_one_packet(&mut self.input, self.bytes_read)? {
+        let buf = match read_one_packet(&mut self.input, &mut self.putback, self.bytes_read)? {
             Some(b) => b,
             None => return Ok(0),
         };
@@ -252,7 +269,7 @@ impl Demuxer for MpegTsDemuxer {
                 // when there are no more 188-byte chunks. We need a
                 // signal here without re-reading; do a single
                 // try-read and on `None` set eof + flush.
-                match read_one_packet(&mut self.input, self.bytes_read)? {
+                match read_one_packet(&mut self.input, &mut self.putback, self.bytes_read)? {
                     None => {
                         self.eof_reached = true;
                         self.flush_reassemblers();
@@ -279,23 +296,49 @@ impl Demuxer for MpegTsDemuxer {
     }
 }
 
+/// Maximum 188-byte packets we'll skip while resyncing after a bad
+/// sync byte. We've observed real BD M2TS streams with ~2 AACS units
+/// (~12 KB ≈ 64 TS packets) of undecryptable bytes at chapter
+/// boundaries — `libaacs` reproduces the same garbage bytes there,
+/// so the bytes are part of the protected variant-key area, not a
+/// flaw in our decryption. 256 packets gives a comfortable ceiling
+/// without silently swallowing a longer corruption that the caller
+/// should know about.
+const RESYNC_PACKET_LIMIT: usize = 256;
+
 /// Read exactly one 188-byte TS packet from the input.
+///
+/// Drains from `putback` first (used by the resync path to feed peeked
+/// bytes back to the caller) and then from `input`.
 ///
 /// Returns `Ok(None)` cleanly when fewer than 188 bytes remain — the
 /// caller treats that as end-of-stream. A short read mid-packet (e.g.
 /// the stream is truncated) surfaces as `Err`.
 ///
-/// On a sync-byte mismatch we attempt a single resync by scanning the
-/// next 188 bytes forward for `0x47`; if we can't recover, surface as
-/// `Err`. Real-world BD `.m2ts` is sync-aligned, so this is just a
-/// safety net.
+/// On a sync-byte mismatch we **resync** by discarding 188-byte chunks
+/// until we find one whose first byte is `0x47` AND whose immediately-
+/// following byte is also `0x47` (the next packet's sync). The probe
+/// byte is buffered in `putback` so the next call to `read_one_packet`
+/// sees it as the first byte of a fresh packet — without that, every
+/// subsequent read would land 1 byte off and re-trigger resync.
 fn read_one_packet(
     input: &mut Box<dyn ReadSeek>,
+    putback: &mut VecDeque<u8>,
     bytes_read: u64,
 ) -> CoreResult<Option<[u8; TS_PACKET_LEN]>> {
     use std::io::Read;
     let mut buf = [0u8; TS_PACKET_LEN];
     let mut filled = 0;
+    // Drain putback first.
+    while filled < TS_PACKET_LEN {
+        match putback.pop_front() {
+            Some(b) => {
+                buf[filled] = b;
+                filled += 1;
+            }
+            None => break,
+        }
+    }
     while filled < TS_PACKET_LEN {
         match input.read(&mut buf[filled..]) {
             Ok(0) => {
@@ -311,13 +354,80 @@ fn read_one_packet(
         }
     }
     if buf[0] != TS_SYNC_BYTE {
-        return Err(CoreError::invalid(format!(
-            "mpegts: bad sync byte 0x{:02X} (want 0x47) at offset {bytes_read} (packet {})",
-            buf[0],
-            bytes_read / TS_PACKET_LEN as u64,
-        )));
+        return resync(input, putback, buf, bytes_read).map(Some);
     }
     Ok(Some(buf))
+}
+
+/// Resync after a bad sync byte. Read 188 new bytes; if they start
+/// with `0x47`, accept them as the recovered packet — but **only**
+/// after confirming the byte 188 positions later is also `0x47` (the
+/// next packet's sync). The double-sync check is what rejects random
+/// `0x47` bytes inside garbage data.
+///
+/// We don't try to recover the failing packet itself; we just skip it
+/// (and any further failing 188-byte chunks) until a clean packet
+/// boundary appears. After at most [`RESYNC_PACKET_LIMIT`] failed
+/// chunks, surface as `Err`.
+///
+/// `initial` is the 188-byte slice that just failed the sync check;
+/// we don't need its contents, just the failing byte for diagnostics.
+fn resync(
+    input: &mut Box<dyn ReadSeek>,
+    putback: &mut VecDeque<u8>,
+    initial: [u8; TS_PACKET_LEN],
+    bytes_read: u64,
+) -> CoreResult<[u8; TS_PACKET_LEN]> {
+    use std::io::Read;
+    let mut buf = [0u8; TS_PACKET_LEN];
+    let mut probe = [0u8; 1];
+    for _ in 0..RESYNC_PACKET_LIMIT {
+        // Read 188 fresh bytes.
+        let mut filled = 0;
+        while filled < TS_PACKET_LEN {
+            match input.read(&mut buf[filled..]) {
+                Ok(0) => {
+                    return Err(CoreError::invalid(format!(
+                        "mpegts: bad sync byte 0x{:02X} at offset {bytes_read} \
+                         and EOF reached during resync",
+                        initial[0]
+                    )));
+                }
+                Ok(n) => filled += n,
+                Err(e) => return Err(CoreError::Io(e)),
+            }
+        }
+        if buf[0] != TS_SYNC_BYTE {
+            continue;
+        }
+        // Candidate passes single-sync; probe the next byte for a
+        // double-sync. If probe is also 0x47, we're aligned.
+        match input.read(&mut probe) {
+            Ok(0) => {
+                // EOF immediately after a clean candidate. Trust the
+                // single sync byte; if we can't probe, we can't
+                // double-check, but the packet itself parsed.
+                return Ok(buf);
+            }
+            Ok(_) => {}
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+        if probe[0] == TS_SYNC_BYTE {
+            // Push the probe byte back so the next call sees it as
+            // the start of a fresh packet.
+            putback.push_back(probe[0]);
+            return Ok(buf);
+        }
+        // Single 0x47 not followed by another at +188; treat as
+        // coincidence inside garbage data and keep scanning.  The
+        // probe byte is also part of the corrupt span — drop it.
+    }
+    Err(CoreError::invalid(format!(
+        "mpegts: bad sync byte 0x{:02X} at offset {bytes_read} (packet {}), \
+         resync failed after {RESYNC_PACKET_LIMIT} 188-byte chunks",
+        initial[0],
+        bytes_read / TS_PACKET_LEN as u64,
+    )))
 }
 
 fn map_ts_err(e: crate::TsError) -> CoreError {
@@ -546,6 +656,59 @@ mod tests {
             ext: None,
         };
         assert_eq!(probe(&p), 100);
+    }
+
+    #[test]
+    fn resync_recovers_after_short_garbage_run() {
+        // Direct test of read_one_packet → resync, without going
+        // through the PES reassembler (which would need a multi-PES
+        // synthetic stream to flush mid-recovery).
+        //
+        // Layout: [valid 188-byte TS packet][2 KB garbage]
+        //         [valid 188-byte TS packet][valid 188-byte TS packet].
+        // Call read_one_packet 3 times: the first returns the leading
+        // valid packet, the second hits garbage and resyncs to the
+        // second valid packet, the third returns the third valid packet
+        // (with no resync needed because the input cursor is already
+        // aligned by the double-sync probe).
+        fn make_pkt(cc: u8) -> [u8; TS_PACKET_LEN] {
+            let mut p = [0xFFu8; TS_PACKET_LEN];
+            p[0] = TS_SYNC_BYTE;
+            p[1] = 0x10; // pid 0x1000 high byte (no PUSI)
+            p[2] = 0x00;
+            p[3] = 0x10 | (cc & 0x0F);
+            p
+        }
+        let p0 = make_pkt(0);
+        let p1 = make_pkt(1);
+        let p2 = make_pkt(2);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&p0);
+        // 11 packets' worth of garbage — 188-aligned to match real-
+        // world BD layout (AACS units are exactly 32 × 188-byte TS
+        // packets, so any failure region is a multiple of 188).
+        buf.extend_from_slice(&vec![0xAAu8; 11 * TS_PACKET_LEN]);
+        buf.extend_from_slice(&p1);
+        buf.extend_from_slice(&p2);
+        let mut cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut putback = VecDeque::new();
+        // First read: clean.
+        let r0 = read_one_packet(&mut cursor, &mut putback, 0)
+            .expect("first")
+            .expect("Some");
+        assert_eq!(r0[3] & 0x0F, 0);
+        // Second read: bytes start at offset 188 (inside garbage), so
+        // resync triggers. It should land on p1.
+        let r1 = read_one_packet(&mut cursor, &mut putback, 188)
+            .expect("resync")
+            .expect("Some");
+        assert_eq!(r1[3] & 0x0F, 1, "expected CC=1, got CC={}", r1[3] & 0x0F);
+        // Third read: should pick up p2 thanks to the probe-byte
+        // putback — no second resync needed.
+        let r2 = read_one_packet(&mut cursor, &mut putback, 376)
+            .expect("p2")
+            .expect("Some");
+        assert_eq!(r2[3] & 0x0F, 2, "expected CC=2, got CC={}", r2[3] & 0x0F);
     }
 
     #[test]
