@@ -52,7 +52,9 @@ pub mod stream_type;
 pub mod registry;
 
 pub use error::TsError;
-pub use packet::{TsPacket, TS_PACKET_LEN, TS_SYNC_BYTE};
+pub use packet::{
+    iter_packets, AdaptationField, TsPacket, TsPacketIter, TS_PACKET_LEN, TS_SYNC_BYTE,
+};
 pub use pes::{PesPacket, PesReassembler};
 pub use psi::{PmtStream, ProgramAssociationTable, ProgramMapTable};
 pub use stream_type::StreamType;
