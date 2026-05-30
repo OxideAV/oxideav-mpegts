@@ -65,3 +65,9 @@ pub use stream_type::StreamType;
 
 #[cfg(feature = "registry")]
 pub use demuxer::{open as open_demuxer, probe as probe_mpegts, MpegTsDemuxer};
+
+#[cfg(feature = "registry")]
+pub use registry::{register, register_containers};
+
+#[cfg(feature = "registry")]
+oxideav_core::register!("mpegts", register);

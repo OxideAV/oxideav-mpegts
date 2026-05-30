@@ -31,4 +31,3 @@ pub fn register(ctx: &mut RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
 
-oxideav_core::register!("mpegts", register);
