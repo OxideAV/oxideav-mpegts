@@ -42,6 +42,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod descriptor;
 pub mod error;
 pub mod packet;
 pub mod pes;
@@ -55,6 +56,11 @@ pub mod muxer;
 #[cfg(feature = "registry")]
 pub mod registry;
 
+pub use descriptor::{
+    iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
+    Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor, Iso639Language,
+    VideoStreamDescriptor,
+};
 pub use error::TsError;
 pub use packet::{
     iter_packets, AdaptationField, TsPacket, TsPacketIter, TS_PACKET_LEN, TS_SYNC_BYTE,

@@ -19,11 +19,19 @@ language-tagged tracks and chapter marks.
 |------------------|-----------------------------------------------------------------------------|
 | `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field, payload.      |
 | `psi`            | PAT (Program Association Table) + PMT (Program Map Table) sections.         |
+| `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / AVC / HEVC. |
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. |
 | `stream_type`    | `stream_type` byte → BD-relevant codec class enum.                          |
 
 No decoders. No re-multiplexing. Every payload byte stays as a
 borrowed slice unless reassembly forces a copy.
+
+`ProgramMapTable::iter_program_descriptors` and
+`PmtStream::iter_descriptors` lift the raw descriptor bytes carried
+inside a PMT into typed [`Descriptor`] records (TLV envelope + a
+decoded body for the most common tags). Unrecognised tags surface as
+`DescriptorBody::Raw` so downstream callers still see the payload
+bytes verbatim.
 
 ## License
 

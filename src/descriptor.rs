@@ -1,0 +1,719 @@
+//! Program / elementary-stream descriptor parser per ISO/IEC 13818-1
+//! §2.6 ("Program and program element descriptors").
+//!
+//! Every descriptor on the wire is a TLV record:
+//!
+//! ```text
+//! descriptor_tag    (8)
+//! descriptor_length (8) — count of bytes after this field
+//! descriptor data   (descriptor_length × 8)
+//! ```
+//!
+//! `descriptor_length == 0` is legal (header-only descriptor). A
+//! descriptor list lives either inside a PMT's `program_info` block
+//! (program-wide) or inside one PMT entry's `ES_info` block
+//! (per-elementary-stream). The list ends when the enclosing block's
+//! length budget is exhausted.
+//!
+//! ## Scope
+//!
+//! The parser walks the TLV envelope generically — every descriptor
+//! surfaces as a [`Descriptor`] borrowing its data slice from the
+//! source — and additionally decodes a small set of tags that the
+//! crate's downstream pipeline routinely needs to identify a stream:
+//!
+//! | Tag    | Name                              | Decoded variant                                |
+//! |--------|-----------------------------------|-----------------------------------------------|
+//! | `0x02` | video_stream_descriptor (§2.6.2)  | [`DescriptorBody::VideoStream`]              |
+//! | `0x03` | audio_stream_descriptor (§2.6.4)  | [`DescriptorBody::AudioStream`]              |
+//! | `0x05` | registration_descriptor (§2.6.8)  | [`DescriptorBody::Registration`]             |
+//! | `0x09` | CA_descriptor (§2.6.16)           | [`DescriptorBody::Ca`]                       |
+//! | `0x0A` | ISO_639_language_descriptor (§2.6.18) | [`DescriptorBody::Iso639Language`]       |
+//! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
+//! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
+//!
+//! Every other tag is preserved as [`DescriptorBody::Raw`] so callers
+//! still see the payload bytes without losing information.
+
+use crate::TsError;
+
+/// One descriptor decoded from a descriptor list.
+#[derive(Debug, Clone)]
+pub struct Descriptor<'a> {
+    /// 8-bit descriptor tag (Table 2-45).
+    pub tag: u8,
+    /// Raw descriptor payload — exactly `descriptor_length` bytes.
+    pub data: &'a [u8],
+    /// Decoded body for the tags this module knows how to interpret,
+    /// or [`DescriptorBody::Raw`] for unrecognised tags.
+    pub body: DescriptorBody<'a>,
+}
+
+/// Typed body for descriptors this module decodes.
+#[derive(Debug, Clone)]
+pub enum DescriptorBody<'a> {
+    /// `0x02` video_stream_descriptor (§2.6.2).
+    VideoStream(VideoStreamDescriptor),
+    /// `0x03` audio_stream_descriptor (§2.6.4).
+    AudioStream(AudioStreamDescriptor),
+    /// `0x05` registration_descriptor (§2.6.8). `format_identifier` is
+    /// a 4-byte ASCII code (e.g. `b"HDMV"` on Blu-ray) plus optional
+    /// additional bytes whose semantics are scoped to the FOURCC.
+    Registration {
+        format_identifier: [u8; 4],
+        additional_identification_info: &'a [u8],
+    },
+    /// `0x09` CA_descriptor (§2.6.16) — Conditional Access PID + system.
+    Ca(CaDescriptor<'a>),
+    /// `0x0A` ISO_639_language_descriptor (§2.6.18).
+    Iso639Language(Vec<Iso639Language>),
+    /// `0x28` AVC_video_descriptor (§2.6.64).
+    AvcVideo(AvcVideoDescriptor),
+    /// `0x38` HEVC_video_descriptor (Amd. 3 §2.6.95).
+    HevcVideo(HevcVideoDescriptor),
+    /// Unrecognised tag — payload bytes preserved verbatim.
+    Raw,
+}
+
+/// video_stream_descriptor body (§2.6.2 Table 2-46).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoStreamDescriptor {
+    /// `multiple_frame_rate_flag`.
+    pub multiple_frame_rate_flag: bool,
+    /// 4-bit `frame_rate_code` (Table 6-4 of ISO/IEC 13818-2).
+    pub frame_rate_code: u8,
+    /// `MPEG_1_only_flag` — when set, no MPEG-2 extension byte follows.
+    pub mpeg_1_only_flag: bool,
+    /// `constrained_parameter_flag`.
+    pub constrained_parameter_flag: bool,
+    /// `still_picture_flag`.
+    pub still_picture_flag: bool,
+    /// `profile_and_level_indication`, when `mpeg_1_only_flag = 0`.
+    pub profile_and_level_indication: Option<u8>,
+    /// 2-bit `chroma_format` (00=reserved, 01=4:2:0, 10=4:2:2, 11=4:4:4).
+    pub chroma_format: Option<u8>,
+    /// `frame_rate_extension_flag`.
+    pub frame_rate_extension_flag: Option<bool>,
+}
+
+/// audio_stream_descriptor body (§2.6.4 Table 2-47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioStreamDescriptor {
+    /// `free_format_flag` — `1` when the bitrate is "free format".
+    pub free_format_flag: bool,
+    /// `ID` — `1` indicates ISO/IEC 11172-3 (MPEG-1) audio, `0`
+    /// indicates ISO/IEC 13818-3 (MPEG-2) audio extension.
+    pub id: bool,
+    /// 2-bit `layer` (00=reserved, 01=III, 10=II, 11=I).
+    pub layer: u8,
+    /// `variable_rate_audio_indicator`.
+    pub variable_rate_audio_indicator: bool,
+}
+
+/// CA_descriptor body (§2.6.16 Table 2-50).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaDescriptor<'a> {
+    /// `CA_system_ID`.
+    pub ca_system_id: u16,
+    /// 13-bit `CA_PID` carrying the ECM/EMM stream.
+    pub ca_pid: u16,
+    /// `private_data_bytes` — payload bytes after the PID.
+    pub private_data: &'a [u8],
+}
+
+/// One language entry from an ISO_639_language_descriptor (§2.6.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Iso639Language {
+    /// 3-byte ISO 639-2 language code (typically lowercase ASCII).
+    pub language: [u8; 3],
+    /// `audio_type` — `0x00` undefined, `0x01` clean effects,
+    /// `0x02` hearing impaired, `0x03` visual impaired commentary.
+    pub audio_type: u8,
+}
+
+/// AVC_video_descriptor body (§2.6.64 Table 2-71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AvcVideoDescriptor {
+    /// `profile_idc`.
+    pub profile_idc: u8,
+    /// Compound flags byte (`constraint_set0..2_flag` + 5 bits of
+    /// `AVC_compatible_flags`).
+    pub constraint_set_and_compat: u8,
+    /// `level_idc`.
+    pub level_idc: u8,
+    /// `AVC_still_present`.
+    pub avc_still_present: bool,
+    /// `AVC_24_hour_picture_flag`.
+    pub avc_24_hour_picture_flag: bool,
+    /// `frame_packing_SEI_not_present_flag` (introduced in
+    /// Amendment 1).
+    pub frame_packing_sei_not_present_flag: bool,
+}
+
+/// HEVC_video_descriptor body (Amd. 3 §2.6.95 Table 2-96).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HevcVideoDescriptor {
+    /// `profile_space`, 2 bits.
+    pub profile_space: u8,
+    /// `tier_flag`.
+    pub tier_flag: bool,
+    /// `profile_idc`, 5 bits.
+    pub profile_idc: u8,
+    /// `profile_compatibility_indication` (32 bits).
+    pub profile_compatibility_indication: u32,
+    /// `progressive_source_flag`.
+    pub progressive_source_flag: bool,
+    /// `interlaced_source_flag`.
+    pub interlaced_source_flag: bool,
+    /// `non_packed_constraint_flag`.
+    pub non_packed_constraint_flag: bool,
+    /// `frame_only_constraint_flag`.
+    pub frame_only_constraint_flag: bool,
+    /// `level_idc`.
+    pub level_idc: u8,
+    /// `temporal_layer_subset_flag`.
+    pub temporal_layer_subset_flag: bool,
+    /// `HEVC_still_present_flag`.
+    pub hevc_still_present_flag: bool,
+    /// `HEVC_24hr_picture_present_flag`.
+    pub hevc_24hr_picture_present_flag: bool,
+    /// `temporal_id_min` (3 bits), populated only when
+    /// `temporal_layer_subset_flag = 1`.
+    pub temporal_id_min: Option<u8>,
+    /// `temporal_id_max` (3 bits), populated only when
+    /// `temporal_layer_subset_flag = 1`.
+    pub temporal_id_max: Option<u8>,
+}
+
+/// Iterate the descriptor TLV records carried inside `block`.
+///
+/// `block` is the exact slice that follows a `_info_length` field —
+/// typically `pmt.program_info` or `pmt_stream.descriptors`. The
+/// iterator stops cleanly once the slice is exhausted; a truncated
+/// trailer (a descriptor header that claims more bytes than remain)
+/// surfaces as [`TsError::Truncated`] on the next `next()` call.
+pub fn iter_descriptors(block: &[u8]) -> DescriptorIter<'_> {
+    DescriptorIter { rest: block }
+}
+
+/// Iterator returned by [`iter_descriptors`].
+#[derive(Debug)]
+pub struct DescriptorIter<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for DescriptorIter<'a> {
+    type Item = Result<Descriptor<'a>, TsError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        if self.rest.len() < 2 {
+            let have = self.rest.len();
+            self.rest = &[][..];
+            return Some(Err(TsError::Truncated {
+                what: "descriptor header",
+                have,
+                need: 2,
+            }));
+        }
+        let tag = self.rest[0];
+        let len = self.rest[1] as usize;
+        if self.rest.len() < 2 + len {
+            let have = self.rest.len() - 2;
+            self.rest = &[][..];
+            return Some(Err(TsError::Truncated {
+                what: "descriptor body",
+                have,
+                need: len,
+            }));
+        }
+        let data = &self.rest[2..2 + len];
+        self.rest = &self.rest[2 + len..];
+        Some(Ok(Descriptor {
+            tag,
+            data,
+            body: decode_body(tag, data),
+        }))
+    }
+}
+
+/// Collect every descriptor in `block` into a `Vec`, returning the
+/// first parse error if any.
+pub fn parse_descriptors(block: &[u8]) -> Result<Vec<Descriptor<'_>>, TsError> {
+    iter_descriptors(block).collect()
+}
+
+fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
+    match tag {
+        0x02 => decode_video_stream(data).unwrap_or(DescriptorBody::Raw),
+        0x03 => decode_audio_stream(data).unwrap_or(DescriptorBody::Raw),
+        0x05 => decode_registration(data).unwrap_or(DescriptorBody::Raw),
+        0x09 => decode_ca(data).unwrap_or(DescriptorBody::Raw),
+        0x0A => decode_iso639_language(data).unwrap_or(DescriptorBody::Raw),
+        0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
+        0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
+        _ => DescriptorBody::Raw,
+    }
+}
+
+fn decode_video_stream(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    if data.is_empty() {
+        return None;
+    }
+    let b0 = data[0];
+    let multiple_frame_rate_flag = (b0 & 0b1000_0000) != 0;
+    let frame_rate_code = (b0 >> 3) & 0b0000_1111;
+    let mpeg_1_only_flag = (b0 & 0b0000_0100) != 0;
+    let constrained_parameter_flag = (b0 & 0b0000_0010) != 0;
+    let still_picture_flag = (b0 & 0b0000_0001) != 0;
+    let (profile_and_level_indication, chroma_format, frame_rate_extension_flag) =
+        if !mpeg_1_only_flag && data.len() >= 3 {
+            let pli = data[1];
+            let b2 = data[2];
+            let chroma = (b2 >> 6) & 0b11;
+            let fre = (b2 & 0b0010_0000) != 0;
+            (Some(pli), Some(chroma), Some(fre))
+        } else {
+            (None, None, None)
+        };
+    Some(DescriptorBody::VideoStream(VideoStreamDescriptor {
+        multiple_frame_rate_flag,
+        frame_rate_code,
+        mpeg_1_only_flag,
+        constrained_parameter_flag,
+        still_picture_flag,
+        profile_and_level_indication,
+        chroma_format,
+        frame_rate_extension_flag,
+    }))
+}
+
+fn decode_audio_stream(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    if data.is_empty() {
+        return None;
+    }
+    let b0 = data[0];
+    let free_format_flag = (b0 & 0b1000_0000) != 0;
+    let id = (b0 & 0b0100_0000) != 0;
+    let layer = (b0 >> 4) & 0b0000_0011;
+    let variable_rate_audio_indicator = (b0 & 0b0000_1000) != 0;
+    Some(DescriptorBody::AudioStream(AudioStreamDescriptor {
+        free_format_flag,
+        id,
+        layer,
+        variable_rate_audio_indicator,
+    }))
+}
+
+fn decode_registration(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    if data.len() < 4 {
+        return None;
+    }
+    let mut format_identifier = [0u8; 4];
+    format_identifier.copy_from_slice(&data[..4]);
+    Some(DescriptorBody::Registration {
+        format_identifier,
+        additional_identification_info: &data[4..],
+    })
+}
+
+fn decode_ca(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    if data.len() < 4 {
+        return None;
+    }
+    let ca_system_id = u16::from_be_bytes([data[0], data[1]]);
+    let ca_pid = (((data[2] & 0b0001_1111) as u16) << 8) | (data[3] as u16);
+    Some(DescriptorBody::Ca(CaDescriptor {
+        ca_system_id,
+        ca_pid,
+        private_data: &data[4..],
+    }))
+}
+
+fn decode_iso639_language(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    if data.len() % 4 != 0 {
+        return None;
+    }
+    let mut langs = Vec::with_capacity(data.len() / 4);
+    for chunk in data.chunks_exact(4) {
+        let mut language = [0u8; 3];
+        language.copy_from_slice(&chunk[..3]);
+        langs.push(Iso639Language {
+            language,
+            audio_type: chunk[3],
+        });
+    }
+    Some(DescriptorBody::Iso639Language(langs))
+}
+
+fn decode_avc_video(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    if data.len() < 4 {
+        return None;
+    }
+    let profile_idc = data[0];
+    let constraint_set_and_compat = data[1];
+    let level_idc = data[2];
+    let flags = data[3];
+    let avc_still_present = (flags & 0b1000_0000) != 0;
+    let avc_24_hour_picture_flag = (flags & 0b0100_0000) != 0;
+    let frame_packing_sei_not_present_flag = (flags & 0b0010_0000) != 0;
+    Some(DescriptorBody::AvcVideo(AvcVideoDescriptor {
+        profile_idc,
+        constraint_set_and_compat,
+        level_idc,
+        avc_still_present,
+        avc_24_hour_picture_flag,
+        frame_packing_sei_not_present_flag,
+    }))
+}
+
+fn decode_hevc_video(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // 13 fixed bytes; +1 byte when temporal_layer_subset_flag = 1.
+    if data.len() < 13 {
+        return None;
+    }
+    let b0 = data[0];
+    let profile_space = (b0 >> 6) & 0b11;
+    let tier_flag = (b0 & 0b0010_0000) != 0;
+    let profile_idc = b0 & 0b0001_1111;
+    let profile_compatibility_indication = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+    let b5 = data[5];
+    let progressive_source_flag = (b5 & 0b1000_0000) != 0;
+    let interlaced_source_flag = (b5 & 0b0100_0000) != 0;
+    let non_packed_constraint_flag = (b5 & 0b0010_0000) != 0;
+    let frame_only_constraint_flag = (b5 & 0b0001_0000) != 0;
+    // bytes 6..=11 carry the 44-bit `reserved_zero_44bits` field, which
+    // we don't surface; per spec it must be zero on conformant streams
+    // but we don't enforce.
+    let level_idc = data[12];
+    let (temporal_layer_subset_flag, hevc_still_present_flag, hevc_24hr_picture_present_flag) =
+        if data.len() >= 14 {
+            let b13 = data[13];
+            (
+                (b13 & 0b1000_0000) != 0,
+                (b13 & 0b0100_0000) != 0,
+                (b13 & 0b0010_0000) != 0,
+            )
+        } else {
+            (false, false, false)
+        };
+    let (temporal_id_min, temporal_id_max) = if temporal_layer_subset_flag && data.len() >= 16 {
+        // Two bytes: `temporal_id_min (3) | reserved (5)` then
+        // `temporal_id_max (3) | reserved (5)`.
+        let lo = (data[14] >> 5) & 0b111;
+        let hi = (data[15] >> 5) & 0b111;
+        (Some(lo), Some(hi))
+    } else {
+        (None, None)
+    };
+    Some(DescriptorBody::HevcVideo(HevcVideoDescriptor {
+        profile_space,
+        tier_flag,
+        profile_idc,
+        profile_compatibility_indication,
+        progressive_source_flag,
+        interlaced_source_flag,
+        non_packed_constraint_flag,
+        frame_only_constraint_flag,
+        level_idc,
+        temporal_layer_subset_flag,
+        hevc_still_present_flag,
+        hevc_24hr_picture_present_flag,
+        temporal_id_min,
+        temporal_id_max,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag, body.len() as u8];
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn iter_empty_block_yields_none() {
+        let mut it = iter_descriptors(&[]);
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn unknown_tag_passes_through_as_raw() {
+        let block = tlv(0x42, &[0xAA, 0xBB, 0xCC]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x42);
+        assert_eq!(d.data, &[0xAA, 0xBB, 0xCC]);
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn two_descriptors_back_to_back() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x05, b"HDMV"));
+        block.extend_from_slice(&tlv(0x09, &[0x09, 0x00, 0xE5, 0x00, 0xAB, 0xCD]));
+        let v: Vec<_> = iter_descriptors(&block).collect();
+        assert_eq!(v.len(), 2);
+        let d0 = v[0].as_ref().unwrap();
+        assert_eq!(d0.tag, 0x05);
+        match &d0.body {
+            DescriptorBody::Registration {
+                format_identifier,
+                additional_identification_info,
+            } => {
+                assert_eq!(format_identifier, b"HDMV");
+                assert!(additional_identification_info.is_empty());
+            }
+            other => panic!("expected Registration, got {other:?}"),
+        }
+        let d1 = v[1].as_ref().unwrap();
+        assert_eq!(d1.tag, 0x09);
+        match &d1.body {
+            DescriptorBody::Ca(ca) => {
+                assert_eq!(ca.ca_system_id, 0x0900);
+                assert_eq!(ca.ca_pid, 0x0500);
+                assert_eq!(ca.private_data, &[0xAB, 0xCD]);
+            }
+            other => panic!("expected Ca, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_header_surfaces_error_then_stops() {
+        let block = [0x05u8]; // only 1 byte — no length follows
+        let mut it = iter_descriptors(&block);
+        let err = it.next().expect("one error").unwrap_err();
+        assert!(matches!(err, TsError::Truncated { .. }));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn truncated_body_surfaces_error_then_stops() {
+        let mut block = vec![0x05u8, 0x08]; // claims 8 bytes
+        block.extend_from_slice(&[0xAA, 0xBB]); // only 2 supplied
+        let mut it = iter_descriptors(&block);
+        let err = it.next().expect("one error").unwrap_err();
+        assert!(matches!(err, TsError::Truncated { .. }));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn registration_descriptor_decodes_hdmv_with_trailer() {
+        let block = tlv(0x05, b"HDMV\x88\x99");
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Registration {
+                format_identifier,
+                additional_identification_info,
+            } => {
+                assert_eq!(format_identifier, b"HDMV");
+                assert_eq!(additional_identification_info, &[0x88, 0x99]);
+            }
+            other => panic!("expected Registration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iso639_language_descriptor_two_entries() {
+        // "eng" audio_type=0, "jpn" audio_type=2
+        let body = [b'e', b'n', b'g', 0x00, b'j', b'p', b'n', 0x02];
+        let block = tlv(0x0A, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Iso639Language(langs) => {
+                assert_eq!(langs.len(), 2);
+                assert_eq!(&langs[0].language, b"eng");
+                assert_eq!(langs[0].audio_type, 0);
+                assert_eq!(&langs[1].language, b"jpn");
+                assert_eq!(langs[1].audio_type, 2);
+            }
+            other => panic!("expected Iso639Language, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iso639_language_bad_length_falls_back_to_raw() {
+        // 5 bytes — not a multiple of 4.
+        let body = [b'e', b'n', b'g', 0x00, 0xFF];
+        let block = tlv(0x0A, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &body);
+    }
+
+    #[test]
+    fn video_stream_descriptor_mpeg2_three_bytes() {
+        // multiple_frame_rate=0, frame_rate_code=4 (29.97), MPEG_1_only=0,
+        // CPF=0, still=0, profile_and_level=0x44 (Main@Main),
+        // chroma=01 (4:2:0), fre=0.
+        let body = [4u8 << 3, 0x44u8, 0b01 << 6];
+        let block = tlv(0x02, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::VideoStream(v) => {
+                assert!(!v.multiple_frame_rate_flag);
+                assert_eq!(v.frame_rate_code, 4);
+                assert!(!v.mpeg_1_only_flag);
+                assert_eq!(v.profile_and_level_indication, Some(0x44));
+                assert_eq!(v.chroma_format, Some(0b01));
+                assert_eq!(v.frame_rate_extension_flag, Some(false));
+            }
+            other => panic!("expected VideoStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn video_stream_descriptor_mpeg1_one_byte() {
+        // mpeg_1_only_flag = 1, frame_rate_code = 3, still = 1.
+        let body = [(3 << 3) | 0b0000_0101];
+        let block = tlv(0x02, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::VideoStream(v) => {
+                assert!(v.mpeg_1_only_flag);
+                assert_eq!(v.frame_rate_code, 3);
+                assert!(v.still_picture_flag);
+                assert!(v.profile_and_level_indication.is_none());
+                assert!(v.chroma_format.is_none());
+                assert!(v.frame_rate_extension_flag.is_none());
+            }
+            other => panic!("expected VideoStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_stream_descriptor_layer_ii() {
+        // free_format=0, ID=1 (MPEG-1), layer=10 (Layer II), VRA=1.
+        let body = [(1u8 << 6) | (0b10 << 4) | (1 << 3)];
+        let block = tlv(0x03, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::AudioStream(a) => {
+                assert!(!a.free_format_flag);
+                assert!(a.id);
+                assert_eq!(a.layer, 0b10);
+                assert!(a.variable_rate_audio_indicator);
+            }
+            other => panic!("expected AudioStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ca_descriptor_min_no_private_data() {
+        // CA_system_ID=0x4AAA, CA_PID=0x123 (with reserved=111 in high byte).
+        let body = [0x4A, 0xAA, 0xE1 /* 111_00001 */, 0x23];
+        let block = tlv(0x09, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Ca(ca) => {
+                assert_eq!(ca.ca_system_id, 0x4AAA);
+                assert_eq!(ca.ca_pid, 0x0123);
+                assert!(ca.private_data.is_empty());
+            }
+            other => panic!("expected Ca, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avc_video_descriptor_typical_values() {
+        // profile_idc=100 (High), constraint+compat=0, level_idc=41,
+        // flags: still=0, 24h=0, fp_sei_npresent=0.
+        let body = [100, 0x00, 41, 0x00];
+        let block = tlv(0x28, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::AvcVideo(a) => {
+                assert_eq!(a.profile_idc, 100);
+                assert_eq!(a.level_idc, 41);
+                assert!(!a.avc_still_present);
+                assert!(!a.frame_packing_sei_not_present_flag);
+            }
+            other => panic!("expected AvcVideo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hevc_video_descriptor_min_13_bytes() {
+        // profile_space=0, tier_flag=1, profile_idc=2 (Main 10):
+        let b0 = (1u8 << 5) | 2;
+        let compat: u32 = 0x6000_0000;
+        // progressive=1, interlaced=0, non_packed=1, frame_only=1, rest 0.
+        let b5: u8 = 0b1011_0000;
+        let level_idc: u8 = 153;
+        let body = vec![
+            b0,
+            (compat >> 24) as u8,
+            (compat >> 16) as u8,
+            (compat >> 8) as u8,
+            compat as u8,
+            b5,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            level_idc,
+        ];
+        // No temporal_layer_subset byte.
+        let block = tlv(0x38, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::HevcVideo(h) => {
+                assert_eq!(h.profile_space, 0);
+                assert!(h.tier_flag);
+                assert_eq!(h.profile_idc, 2);
+                assert_eq!(h.profile_compatibility_indication, compat);
+                assert!(h.progressive_source_flag);
+                assert!(!h.interlaced_source_flag);
+                assert!(h.non_packed_constraint_flag);
+                assert!(h.frame_only_constraint_flag);
+                assert_eq!(h.level_idc, level_idc);
+                assert!(!h.temporal_layer_subset_flag);
+                assert!(h.temporal_id_min.is_none());
+                assert!(h.temporal_id_max.is_none());
+            }
+            other => panic!("expected HevcVideo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hevc_video_descriptor_with_temporal_layer_subset() {
+        let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 120];
+        // temporal_layer_subset_flag=1, still=0, 24h=1, rest 0.
+        body.push(0b1010_0000);
+        // temporal_id_min = 1, temporal_id_max = 4.
+        body.push(1 << 5);
+        body.push(4 << 5);
+        let block = tlv(0x38, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::HevcVideo(h) => {
+                assert!(h.temporal_layer_subset_flag);
+                assert!(h.hevc_24hr_picture_present_flag);
+                assert_eq!(h.temporal_id_min, Some(1));
+                assert_eq!(h.temporal_id_max, Some(4));
+            }
+            other => panic!("expected HevcVideo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_descriptors_helper_collects_all() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x05, b"HDMV"));
+        block.extend_from_slice(&tlv(0x0A, &[b'e', b'n', b'g', 0x00]));
+        block.extend_from_slice(&tlv(0xFF, &[]));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].tag, 0x05);
+        assert_eq!(v[1].tag, 0x0A);
+        assert_eq!(v[2].tag, 0xFF);
+        assert!(matches!(v[2].body, DescriptorBody::Raw));
+        assert!(v[2].data.is_empty());
+    }
+}

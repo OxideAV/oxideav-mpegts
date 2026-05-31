@@ -25,6 +25,7 @@
 //! `section_length` counts the bytes AFTER the section_length field
 //! itself, INCLUDING the CRC trailer.
 
+use crate::descriptor::{iter_descriptors, DescriptorIter};
 use crate::TsError;
 
 /// PAT table_id per §2.4.4.3.
@@ -96,6 +97,14 @@ pub struct PmtStream {
     pub descriptors: Vec<u8>,
 }
 
+impl PmtStream {
+    /// Iterate per-elementary-stream descriptors as typed TLV records.
+    /// See [`crate::descriptor::iter_descriptors`].
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
 /// Parsed Program Map Table for one program.
 #[derive(Debug, Default, Clone)]
 pub struct ProgramMapTable {
@@ -115,6 +124,13 @@ pub struct ProgramMapTable {
 }
 
 impl ProgramMapTable {
+    /// Iterate the program-wide descriptors carried in `program_info`
+    /// as typed TLV records. See
+    /// [`crate::descriptor::iter_descriptors`].
+    pub fn iter_program_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.program_info)
+    }
+
     /// Parse a single PMT section. The slice must run from
     /// `table_id` through the CRC trailer.
     pub fn parse(section: &[u8]) -> Result<Self, TsError> {
@@ -504,6 +520,52 @@ mod tests {
         payload.extend_from_slice(&section);
         let s = iter_sections(&payload).next().expect("section");
         assert_eq!(s, section);
+    }
+
+    #[test]
+    fn pmt_per_stream_descriptors_decode_iso639() {
+        // ES descriptor block: an ISO-639 language descriptor with two
+        // entries — eng/0, jpn/2.
+        let es_descr: &[u8] = &[0x0A, 0x08, b'e', b'n', b'g', 0x00, b'j', b'p', b'n', 0x02];
+        let section = build_pmt_section(1, 0, 0x100, &[], &[(0x81, 0x1100, es_descr)]);
+        let pmt = ProgramMapTable::parse(&section).unwrap();
+        assert_eq!(pmt.streams.len(), 1);
+        let descriptors: Vec<_> = pmt.streams[0]
+            .iter_descriptors()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].tag, 0x0A);
+        match &descriptors[0].body {
+            crate::descriptor::DescriptorBody::Iso639Language(langs) => {
+                assert_eq!(langs.len(), 2);
+                assert_eq!(&langs[0].language, b"eng");
+                assert_eq!(&langs[1].language, b"jpn");
+                assert_eq!(langs[1].audio_type, 2);
+            }
+            other => panic!("expected Iso639Language, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pmt_program_info_descriptors_decode_registration() {
+        // program_info: registration descriptor with format_identifier=HDMV.
+        let program_info: &[u8] = &[0x05, 0x04, b'H', b'D', b'M', b'V'];
+        let section = build_pmt_section(1, 0, 0x100, program_info, &[(0x1B, 0x1011, &[])]);
+        let pmt = ProgramMapTable::parse(&section).unwrap();
+        let descriptors: Vec<_> = pmt
+            .iter_program_descriptors()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(descriptors.len(), 1);
+        match &descriptors[0].body {
+            crate::descriptor::DescriptorBody::Registration {
+                format_identifier, ..
+            } => {
+                assert_eq!(format_identifier, b"HDMV");
+            }
+            other => panic!("expected Registration, got {other:?}"),
+        }
     }
 
     #[test]
