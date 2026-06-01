@@ -58,7 +58,8 @@ pub mod registry;
 
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
-    Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor, Iso639Language,
+    DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor,
+    Iso639Language, MaximumBitrateDescriptor, StdDescriptor, SystemClockDescriptor,
     VideoStreamDescriptor,
 };
 pub use error::TsError;

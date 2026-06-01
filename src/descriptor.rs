@@ -27,8 +27,12 @@
 //! | `0x02` | video_stream_descriptor (§2.6.2)  | [`DescriptorBody::VideoStream`]              |
 //! | `0x03` | audio_stream_descriptor (§2.6.4)  | [`DescriptorBody::AudioStream`]              |
 //! | `0x05` | registration_descriptor (§2.6.8)  | [`DescriptorBody::Registration`]             |
+//! | `0x06` | data_stream_alignment_descriptor (§2.6.10) | [`DescriptorBody::DataStreamAlignment`] |
 //! | `0x09` | CA_descriptor (§2.6.16)           | [`DescriptorBody::Ca`]                       |
 //! | `0x0A` | ISO_639_language_descriptor (§2.6.18) | [`DescriptorBody::Iso639Language`]       |
+//! | `0x0B` | system_clock_descriptor (§2.6.20) | [`DescriptorBody::SystemClock`]              |
+//! | `0x0E` | maximum_bitrate_descriptor (§2.6.26) | [`DescriptorBody::MaximumBitrate`]        |
+//! | `0x11` | STD_descriptor (§2.6.32)          | [`DescriptorBody::Std`]                      |
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
 //!
@@ -63,10 +67,18 @@ pub enum DescriptorBody<'a> {
         format_identifier: [u8; 4],
         additional_identification_info: &'a [u8],
     },
+    /// `0x06` data_stream_alignment_descriptor (§2.6.10).
+    DataStreamAlignment(DataStreamAlignmentDescriptor),
     /// `0x09` CA_descriptor (§2.6.16) — Conditional Access PID + system.
     Ca(CaDescriptor<'a>),
     /// `0x0A` ISO_639_language_descriptor (§2.6.18).
     Iso639Language(Vec<Iso639Language>),
+    /// `0x0B` system_clock_descriptor (§2.6.20).
+    SystemClock(SystemClockDescriptor),
+    /// `0x0E` maximum_bitrate_descriptor (§2.6.26).
+    MaximumBitrate(MaximumBitrateDescriptor),
+    /// `0x11` STD_descriptor (§2.6.32).
+    Std(StdDescriptor),
     /// `0x28` AVC_video_descriptor (§2.6.64).
     AvcVideo(AvcVideoDescriptor),
     /// `0x38` HEVC_video_descriptor (Amd. 3 §2.6.95).
@@ -148,6 +160,77 @@ pub struct AvcVideoDescriptor {
     /// `frame_packing_SEI_not_present_flag` (introduced in
     /// Amendment 1).
     pub frame_packing_sei_not_present_flag: bool,
+}
+
+/// data_stream_alignment_descriptor body (§2.6.10 Table 2-46).
+///
+/// `alignment_type` semantics depend on whether the referenced ES is
+/// video (Table 2-47) or audio (Table 2-48):
+///
+/// | Value | Video                       | Audio       |
+/// |-------|-----------------------------|-------------|
+/// | 0x00  | Reserved                    | Reserved    |
+/// | 0x01  | Slice, or video access unit | Sync word   |
+/// | 0x02  | Video access unit           | (Reserved)  |
+/// | 0x03  | GOP, or SEQ                 | (Reserved)  |
+/// | 0x04  | SEQ                         | (Reserved)  |
+/// | 0x05..0xFF | Reserved               | Reserved    |
+///
+/// The descriptor itself doesn't carry the video/audio distinction; the
+/// caller selects the table based on the enclosing PMT entry's
+/// `stream_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataStreamAlignmentDescriptor {
+    /// Raw 8-bit `alignment_type` byte (Tables 2-47 / 2-48).
+    pub alignment_type: u8,
+}
+
+/// system_clock_descriptor body (§2.6.20 Table 2-54).
+///
+/// `clock_accuracy_integer × 10^(-clock_accuracy_exponent)` gives the
+/// fractional frequency accuracy of the program clock in parts per
+/// million (§2.6.21). When `clock_accuracy_integer == 0` the spec
+/// defines the accuracy as 30 ppm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemClockDescriptor {
+    /// `external_clock_reference_indicator` — when `true`, the clock
+    /// is derived from an external frequency reference at the decoder.
+    pub external_clock_reference: bool,
+    /// 6-bit `clock_accuracy_integer`.
+    pub clock_accuracy_integer: u8,
+    /// 3-bit `clock_accuracy_exponent`.
+    pub clock_accuracy_exponent: u8,
+}
+
+/// maximum_bitrate_descriptor body (§2.6.26 Table 2-57).
+///
+/// `maximum_bitrate` is a 22-bit field in units of 50 bytes/s (§2.6.27).
+/// Multiply by 50 to get bytes/s, or by 400 to get bits/s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaximumBitrateDescriptor {
+    /// Raw 22-bit `maximum_bitrate` value (units of 50 bytes/s).
+    pub maximum_bitrate: u32,
+}
+
+impl MaximumBitrateDescriptor {
+    /// Convert to bits/s. `maximum_bitrate` units are 50 bytes/s, i.e.
+    /// 400 bits/s, so the conversion is a multiply by 400 (which fits
+    /// in `u64` for the full 22-bit range).
+    pub fn bits_per_second(self) -> u64 {
+        (self.maximum_bitrate as u64) * 400
+    }
+}
+
+/// STD_descriptor body (§2.6.32 Table 2-60).
+///
+/// When `leak_valid_flag == true`, the transfer of data from buffer
+/// MBn to EBn in the T-STD uses the leak method defined in §2.4.2.3;
+/// when `false`, the transfer uses the `vbv_delay` method (provided
+/// the per-frame `vbv_delay` is not `0xFFFF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdDescriptor {
+    /// `leak_valid_flag` — 1 bit.
+    pub leak_valid_flag: bool,
 }
 
 /// HEVC_video_descriptor body (Amd. 3 §2.6.95 Table 2-96).
@@ -250,8 +333,12 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x02 => decode_video_stream(data).unwrap_or(DescriptorBody::Raw),
         0x03 => decode_audio_stream(data).unwrap_or(DescriptorBody::Raw),
         0x05 => decode_registration(data).unwrap_or(DescriptorBody::Raw),
+        0x06 => decode_data_stream_alignment(data).unwrap_or(DescriptorBody::Raw),
         0x09 => decode_ca(data).unwrap_or(DescriptorBody::Raw),
         0x0A => decode_iso639_language(data).unwrap_or(DescriptorBody::Raw),
+        0x0B => decode_system_clock(data).unwrap_or(DescriptorBody::Raw),
+        0x0E => decode_maximum_bitrate(data).unwrap_or(DescriptorBody::Raw),
+        0x11 => decode_std(data).unwrap_or(DescriptorBody::Raw),
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
@@ -346,6 +433,59 @@ fn decode_iso639_language(data: &[u8]) -> Option<DescriptorBody<'_>> {
         });
     }
     Some(DescriptorBody::Iso639Language(langs))
+}
+
+fn decode_data_stream_alignment(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    if data.is_empty() {
+        return None;
+    }
+    Some(DescriptorBody::DataStreamAlignment(
+        DataStreamAlignmentDescriptor {
+            alignment_type: data[0],
+        },
+    ))
+}
+
+fn decode_system_clock(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Two-byte payload: byte 0 = external_clock_reference_indicator (1)
+    //                            | reserved (1) | clock_accuracy_integer (6);
+    //                  byte 1 = clock_accuracy_exponent (3) | reserved (5).
+    if data.len() < 2 {
+        return None;
+    }
+    let b0 = data[0];
+    let b1 = data[1];
+    let external_clock_reference = (b0 & 0b1000_0000) != 0;
+    let clock_accuracy_integer = b0 & 0b0011_1111;
+    let clock_accuracy_exponent = (b1 >> 5) & 0b0000_0111;
+    Some(DescriptorBody::SystemClock(SystemClockDescriptor {
+        external_clock_reference,
+        clock_accuracy_integer,
+        clock_accuracy_exponent,
+    }))
+}
+
+fn decode_maximum_bitrate(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Three-byte payload: 2 reserved bits then 22-bit maximum_bitrate
+    // (big-endian, MSBs in byte 0 after the reserved nibble).
+    if data.len() < 3 {
+        return None;
+    }
+    let maximum_bitrate =
+        (((data[0] & 0b0011_1111) as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
+    Some(DescriptorBody::MaximumBitrate(MaximumBitrateDescriptor {
+        maximum_bitrate,
+    }))
+}
+
+fn decode_std(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // One-byte payload: 7 reserved bits then 1-bit leak_valid_flag.
+    if data.is_empty() {
+        return None;
+    }
+    Some(DescriptorBody::Std(StdDescriptor {
+        leak_valid_flag: (data[0] & 0b0000_0001) != 0,
+    }))
 }
 
 fn decode_avc_video(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -699,6 +839,120 @@ mod tests {
                 assert_eq!(h.temporal_id_max, Some(4));
             }
             other => panic!("expected HevcVideo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_stream_alignment_video_access_unit() {
+        // alignment_type = 0x02 = "video access unit" per Table 2-47.
+        let block = tlv(0x06, &[0x02]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::DataStreamAlignment(a) => {
+                assert_eq!(a.alignment_type, 0x02);
+            }
+            other => panic!("expected DataStreamAlignment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_stream_alignment_empty_body_falls_back_to_raw() {
+        let block = tlv(0x06, &[]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn system_clock_descriptor_external_ref_off() {
+        // external=0, reserved=1, clock_accuracy_integer=0b00_1010 (=10);
+        // clock_accuracy_exponent=0b011 (=3), reserved=0b00000.
+        let b0 = 0b0100_1010u8;
+        let b1 = 0b0110_0000u8;
+        let block = tlv(0x0B, &[b0, b1]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::SystemClock(s) => {
+                assert!(!s.external_clock_reference);
+                assert_eq!(s.clock_accuracy_integer, 10);
+                assert_eq!(s.clock_accuracy_exponent, 3);
+            }
+            other => panic!("expected SystemClock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_clock_descriptor_external_ref_on() {
+        // external=1, reserved=0, clock_accuracy_integer=0b00_0000;
+        // clock_accuracy_exponent=0b000.
+        let block = tlv(0x0B, &[0b1000_0000, 0b0000_0000]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::SystemClock(s) => {
+                assert!(s.external_clock_reference);
+                assert_eq!(s.clock_accuracy_integer, 0);
+                assert_eq!(s.clock_accuracy_exponent, 0);
+            }
+            other => panic!("expected SystemClock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maximum_bitrate_descriptor_typical() {
+        // maximum_bitrate = 0x12_3456 (1_193_046 × 50 B/s = 59_652_300 B/s).
+        // Encode: 2 reserved bits then 22 bits big-endian.
+        // 0x12_3456 = 0b00_010010_00110100_01010110.
+        let b0 = 0b1100_0000 | 0b0001_0010; // 2 reserved (set to 1) | top 6 bits
+        let block = tlv(0x0E, &[b0, 0x34, 0x56]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::MaximumBitrate(m) => {
+                assert_eq!(m.maximum_bitrate, 0x12_3456);
+                // 0x12_3456 × 400 = 477_218_400 bits/s
+                assert_eq!(m.bits_per_second(), 0x12_3456u64 * 400);
+            }
+            other => panic!("expected MaximumBitrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maximum_bitrate_descriptor_zero_bitrate() {
+        // All-zero except the reserved high bits (set to 1 per spec).
+        let block = tlv(0x0E, &[0b1100_0000, 0x00, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::MaximumBitrate(m) => {
+                assert_eq!(m.maximum_bitrate, 0);
+                assert_eq!(m.bits_per_second(), 0);
+            }
+            other => panic!("expected MaximumBitrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maximum_bitrate_descriptor_short_body_falls_back_to_raw() {
+        let block = tlv(0x0E, &[0xC0, 0x00]); // only 2 bytes
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn std_descriptor_leak_valid_set() {
+        // 7 reserved bits high, leak_valid_flag = 1.
+        let block = tlv(0x11, &[0b1111_1111]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Std(s) => assert!(s.leak_valid_flag),
+            other => panic!("expected Std, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn std_descriptor_leak_valid_unset() {
+        let block = tlv(0x11, &[0b1111_1110]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Std(s) => assert!(!s.leak_valid_flag),
+            other => panic!("expected Std, got {other:?}"),
         }
     }
 
