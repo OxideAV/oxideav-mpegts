@@ -24,6 +24,13 @@
 //! - Stream-type → ESID helpers in [`stream_type`] mapping the BD-
 //!   relevant constants (`0x1B AVC`, `0x24 HEVC`, `0x81 AC-3`,
 //!   `0x82 DTS`, `0x90 PGS`, etc.) to a richer enum.
+//! - PCR jitter and discontinuity tracking
+//!   ([`clock::PcrTracker`], [`clock::ContinuityTracker`]) —
+//!   per-PCR-PID 27 MHz clock recovery, instantaneous bitrate
+//!   estimate, time-base discontinuity classification (signalled vs.
+//!   tolerance-exceeded), plus per-PID continuity-counter
+//!   classification (continuous / duplicate / no-payload /
+//!   dropped / discontinuity).
 //!
 //! The crate ships **no decoders** — every payload byte stays as a
 //! `&[u8]` slice. A downstream pipeline (e.g. `oxideav-cli`'s
@@ -34,14 +41,13 @@
 //!
 //! - PSIP / DVB SI tables beyond PAT + PMT (no SDT, NIT, EIT).
 //! - Conditional Access (CA) descriptors / scrambling.
-//! - Live-stream PCR-anchored clock recovery — callers that need
-//!   wall-clock timing use PES PTS/DTS directly.
 //! - Re-multiplexing — this is a demux-only crate. The MKV writer
 //!   in `oxideav-mkv` owns the output side.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod clock;
 pub mod descriptor;
 pub mod error;
 pub mod packet;
@@ -56,6 +62,10 @@ pub mod muxer;
 #[cfg(feature = "registry")]
 pub mod registry;
 
+pub use clock::{
+    ContinuityEvent, ContinuityTracker, DiscontinuityReason, Pcr, PcrEvent, PcrTracker,
+    PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ,
+};
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
     DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor,

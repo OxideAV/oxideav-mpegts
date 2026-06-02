@@ -22,6 +22,7 @@ language-tagged tracks and chapter marks.
 | `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / AVC / HEVC / data-stream-alignment / system-clock / maximum-bitrate / STD. |
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. |
 | `stream_type`    | `stream_type` byte → BD-relevant codec class enum.                          |
+| `clock`          | Per-PCR-PID 27 MHz clock recovery + per-PID continuity-counter classification (§2.4.2.2 / §2.4.3.3 / §2.4.3.5). |
 
 No decoders. No re-multiplexing. Every payload byte stays as a
 borrowed slice unless reassembly forces a copy.
@@ -32,6 +33,24 @@ inside a PMT into typed [`Descriptor`] records (TLV envelope + a
 decoded body for the most common tags). Unrecognised tags surface as
 `DescriptorBody::Raw` so downstream callers still see the payload
 bytes verbatim.
+
+`PcrTracker` consumes one adaptation field per packet on the
+configured `PCR_PID` and emits `PcrEvent::Sample { pcr, jitter_27mhz,
+bitrate_bps }` for normal flow or
+`PcrEvent::Discontinuity { reason }` when either (a) the adaptation
+field carries `discontinuity_indicator = 1` (§2.4.3.5) or (b) the
+observed PCR jump exceeds the configured tolerance window. Jitter is
+the signed residual in 27 MHz ticks between the observed PCR delta
+and the delta predicted by the previous pair's bitrate. Default
+window is 100 ms — well above the ±500 ns spec tolerance but tight
+enough to catch a clean time-base reset that didn't bother to set the
+indicator.
+
+`ContinuityTracker` is a sibling observer for the 4-bit
+`continuity_counter` per §2.4.3.3 — emits `Continuous` / `Duplicate`
+/ `NoPayload` / `Dropped { gap }` / `Discontinuity`. Duplicate-cap
+enforcement (max one repeat per CC) is built in: a second identical
+CC reads as a drop, not a second duplicate.
 
 ## License
 

@@ -11,6 +11,14 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `clock` module — per-PCR-PID PCR recovery, time-base discontinuity
+  detection (signalled via `discontinuity_indicator` per §2.4.3.5 *or*
+  detected by an unsignalled PCR jump beyond a configurable jitter
+  window), and per-sample jitter / instantaneous-bitrate readings.
+  Sibling `ContinuityTracker` classifies each TS packet on a PID
+  against §2.4.3.3 (continuous / spec-permitted duplicate / no-payload
+  carrier / dropped / signalled discontinuity), enforcing the
+  one-duplicate-per-CC cap.
 - `descriptor` module — generic ISO/IEC 13818-1 §2.6 TLV walker plus
   typed decoders for `registration` (0x05), `ISO_639_language` (0x0A),
   `CA` (0x09), `video_stream` (0x02), `audio_stream` (0x03),
