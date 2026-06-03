@@ -20,7 +20,14 @@
 //!   per-stream `descriptor` payloads.
 //! - PES packet reassembler ([`pes::PesReassembler`]) — joins TS
 //!   payloads across packets per-PID, yields complete PES packets
-//!   once the next start-indicator arrives or the stream ends.
+//!   once the next start-indicator arrives or the stream ends. The
+//!   resulting [`pes::PesPacket`] decodes every Table 2-17 optional
+//!   header field — `PES_scrambling_control` / `PES_priority` /
+//!   `data_alignment_indicator` / `copyright` / `original_or_copy` on
+//!   flags1, plus the flag-gated bodies ESCR (27 MHz tick), `ES_rate`
+//!   (50 bytes/s units), `DSM_trick_mode` (raw 8-bit byte),
+//!   `additional_copy_info`, `previous_PES_packet_CRC`, and a
+//!   `PES_extension`-present flag.
 //! - Stream-type → ESID helpers in [`stream_type`] mapping the BD-
 //!   relevant constants (`0x1B AVC`, `0x24 HEVC`, `0x81 AC-3`,
 //!   `0x82 DTS`, `0x90 PGS`, etc.) to a richer enum.

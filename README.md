@@ -20,7 +20,7 @@ language-tagged tracks and chapter marks.
 | `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field (PCR + OPCR + splice_countdown + transport_private_data + adaptation_field_extension with ltw / piecewise_rate / seamless_splice), payload. |
 | `psi`            | PAT (Program Association Table) + PMT (Program Map Table) sections.         |
 | `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / AVC / HEVC / data-stream-alignment / system-clock / maximum-bitrate / STD. |
-| `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. |
+| `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. Decodes every Table 2-17 optional header field: PES_scrambling_control / PES_priority / data_alignment_indicator / copyright / original_or_copy on flags1, plus the flag-gated bodies ESCR (42-bit 27 MHz tick), ES_rate (50 bytes/s units), DSM_trick_mode (raw 8-bit), additional_copy_info, previous_PES_packet_CRC, and a PES_extension-present flag. |
 | `stream_type`    | `stream_type` byte → BD-relevant codec class enum.                          |
 | `clock`          | Per-PCR-PID 27 MHz clock recovery + per-PID continuity-counter classification (§2.4.2.2 / §2.4.3.3 / §2.4.3.5). |
 

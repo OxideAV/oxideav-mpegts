@@ -11,6 +11,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `PesPacket` now surfaces every optional PES-header field defined in
+  ISO/IEC 13818-1 §2.4.3.7 / Table 2-17 beyond PTS+DTS: the five
+  flags1 bits (`pes_scrambling_control`, `pes_priority`,
+  `data_alignment_indicator`, `copyright`, `original_or_copy`) plus
+  the flag-gated bodies `escr_27mhz` (42-bit ESCR_base × 300 +
+  ESCR_extension), `es_rate_50bps` (22-bit ES_rate), `dsm_trick_mode`
+  (raw 8-bit byte), `additional_copy_info` (7-bit), and
+  `previous_pes_packet_crc` (16-bit). The PES_extension_flag is
+  preserved as a `pes_extension_present` bool; its sub-fields stay
+  inside the `PES_header_data_length` budget and are skipped past
+  with the rest of the optional area. A truncated optional body
+  (e.g. `PTS_DTS_flags = 0b11` but `PES_header_data_length = 5`)
+  surfaces as `TsError::Truncated`.
 - `clock` module — per-PCR-PID PCR recovery, time-base discontinuity
   detection (signalled via `discontinuity_indicator` per §2.4.3.5 *or*
   detected by an unsignalled PCR jump beyond a configurable jitter
