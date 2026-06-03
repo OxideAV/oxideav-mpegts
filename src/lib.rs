@@ -74,7 +74,8 @@ pub use descriptor::{
 };
 pub use error::TsError;
 pub use packet::{
-    iter_packets, AdaptationField, TsPacket, TsPacketIter, TS_PACKET_LEN, TS_SYNC_BYTE,
+    iter_packets, AdaptationField, AdaptationFieldExtension, TsPacket, TsPacketIter, TS_PACKET_LEN,
+    TS_SYNC_BYTE,
 };
 pub use pes::{PesPacket, PesReassembler};
 pub use psi::{

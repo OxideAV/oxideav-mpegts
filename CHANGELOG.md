@@ -32,3 +32,12 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 - `ProgramMapTable::iter_program_descriptors` and
   `PmtStream::iter_descriptors` convenience accessors that walk the
   PMT's program-info / per-ES descriptor blocks.
+- `AdaptationField` now decodes every optional field in §2.4.3.4 /
+  Table 2-6 beyond PCR: `opcr_base` / `opcr_extension` (OPCR coded
+  identically to PCR), signed `splice_countdown`, `transport_private_data`
+  (length-prefixed byte slice), and an `adaptation_field_extension`
+  body with `ltw_valid_flag` + `ltw_offset`, 22-bit `piecewise_rate`,
+  and 33-bit `dts_next_au` with 4-bit `splice_type` from the
+  seamless-splice sub-field. Reserved padding inside the extension is
+  silently skipped; a truncated extension surfaces as
+  `TsError::Truncated`.

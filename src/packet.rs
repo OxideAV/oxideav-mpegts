@@ -19,9 +19,17 @@
 //!            elementary_stream_priority_indicator | PCR_flag | OPCR_flag |
 //!            splicing_point_flag | transport_private_data_flag |
 //!            adaptation_field_extension_flag
-//! optional PCR (48 bits = 33-bit base + 6 reserved + 9-bit extension)
-//! optional OPCR (48 bits)
-//! ...
+//! optional PCR  (48 bits = 33-bit base + 6 reserved + 9-bit extension)
+//! optional OPCR (48 bits, coded like PCR)
+//! optional splice_countdown (8, tcimsbf)
+//! optional transport_private_data: length (8) + N data bytes
+//! optional adaptation_field_extension:
+//!     length (8)
+//!     ltw_flag (1) | piecewise_rate_flag (1) | seamless_splice_flag (1) | reserved (5)
+//!     if ltw_flag: ltw_valid_flag (1) | ltw_offset (15)
+//!     if piecewise_rate_flag: reserved (2) | piecewise_rate (22)
+//!     if seamless_splice_flag: splice_type (4) | DTS_next_AU (3 × 15-bit pieces
+//!         interleaved with marker bits, 5 bytes total)
 //! stuffing bytes (0xFF)
 //! ```
 
@@ -62,9 +70,53 @@ pub struct AdaptationField<'a> {
     /// 9-bit `program_clock_reference_extension`, when
     /// [`Self::pcr_flag`].
     pub pcr_extension: Option<u16>,
+    /// 33-bit `original_program_clock_reference_base`, when
+    /// [`Self::opcr_flag`].
+    pub opcr_base: Option<u64>,
+    /// 9-bit `original_program_clock_reference_extension`, when
+    /// [`Self::opcr_flag`].
+    pub opcr_extension: Option<u16>,
+    /// Signed 8-bit `splice_countdown` (§2.4.3.5), present when
+    /// [`Self::splicing_point_flag`].
+    pub splice_countdown: Option<i8>,
+    /// `private_data_byte` slice, when
+    /// [`Self::transport_private_data_flag`]. Length equals the
+    /// `transport_private_data_length` byte on the wire.
+    pub transport_private_data: Option<&'a [u8]>,
+    /// Decoded adaptation field extension body, when
+    /// [`Self::adaptation_field_extension_flag`].
+    pub adaptation_field_extension: Option<AdaptationFieldExtension>,
     /// Raw adaptation-field bytes including the
     /// `adaptation_field_length` byte itself.
     pub raw: &'a [u8],
+}
+
+/// Parsed `adaptation_field_extension` body (§2.4.3.5, Table 2-6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdaptationFieldExtension {
+    /// Value of the `adaptation_field_extension_length` byte (count of
+    /// bytes after it, including reserved padding).
+    pub length: u8,
+    /// `ltw_flag`.
+    pub ltw_flag: bool,
+    /// `piecewise_rate_flag`.
+    pub piecewise_rate_flag: bool,
+    /// `seamless_splice_flag`.
+    pub seamless_splice_flag: bool,
+    /// `ltw_valid_flag`, when [`Self::ltw_flag`].
+    pub ltw_valid_flag: Option<bool>,
+    /// 15-bit `ltw_offset`, when [`Self::ltw_flag`]. Meaningful only if
+    /// `ltw_valid_flag == Some(true)` per §2.4.3.5.
+    pub ltw_offset: Option<u16>,
+    /// 22-bit `piecewise_rate` (units of 50 bytes/s · 8 bits/byte ÷ R
+    /// per §2.4.3.5), when [`Self::piecewise_rate_flag`].
+    pub piecewise_rate: Option<u32>,
+    /// 4-bit `splice_type` (§2.4.3.5 / Tables 2-7..2-16), when
+    /// [`Self::seamless_splice_flag`].
+    pub splice_type: Option<u8>,
+    /// 33-bit `DTS_next_AU` (90 kHz units), when
+    /// [`Self::seamless_splice_flag`].
+    pub dts_next_au: Option<u64>,
 }
 
 /// A parsed 188-byte TS packet.
@@ -195,6 +247,11 @@ fn parse_adaptation_field(raw: &[u8]) -> Result<AdaptationField<'_>, TsError> {
             adaptation_field_extension_flag: false,
             pcr_base: None,
             pcr_extension: None,
+            opcr_base: None,
+            opcr_extension: None,
+            splice_countdown: None,
+            transport_private_data: None,
+            adaptation_field_extension: None,
             raw,
         });
     }
@@ -216,35 +273,81 @@ fn parse_adaptation_field(raw: &[u8]) -> Result<AdaptationField<'_>, TsError> {
     let adaptation_field_extension_flag = (flags & 0b0000_0001) != 0;
 
     let mut cursor = 2usize;
-    let mut pcr_base = None;
-    let mut pcr_extension = None;
-    if pcr_flag {
-        if cursor + 6 > raw.len() {
+
+    // PCR (§2.4.3.5).
+    let (pcr_base, pcr_extension) = if pcr_flag {
+        let (b, e) = parse_clock_reference(raw, cursor, "TS adaptation_field PCR")?;
+        cursor += 6;
+        (Some(b), Some(e))
+    } else {
+        (None, None)
+    };
+
+    // OPCR (§2.4.3.5) — same wire shape as PCR.
+    let (opcr_base, opcr_extension) = if opcr_flag {
+        let (b, e) = parse_clock_reference(raw, cursor, "TS adaptation_field OPCR")?;
+        cursor += 6;
+        (Some(b), Some(e))
+    } else {
+        (None, None)
+    };
+
+    // splice_countdown — single signed byte (§2.4.3.5).
+    let splice_countdown = if splicing_point_flag {
+        if cursor + 1 > raw.len() {
             return Err(TsError::Truncated {
-                what: "TS adaptation_field PCR",
+                what: "TS adaptation_field splice_countdown",
                 have: raw.len() - cursor,
-                need: 6,
+                need: 1,
             });
         }
-        let p = &raw[cursor..cursor + 6];
-        // 33-bit PCR base, MSB-first across bytes 0..4 + top bit of
-        // byte 4.
-        let base: u64 = ((p[0] as u64) << 25)
-            | ((p[1] as u64) << 17)
-            | ((p[2] as u64) << 9)
-            | ((p[3] as u64) << 1)
-            | (((p[4] >> 7) & 0b1) as u64);
-        // 9-bit extension: bottom bit of byte 4 + byte 5.
-        let ext: u16 = (((p[4] & 0b0000_0001) as u16) << 8) | (p[5] as u16);
-        pcr_base = Some(base);
-        pcr_extension = Some(ext);
-        cursor += 6;
-    }
+        let v = raw[cursor] as i8;
+        cursor += 1;
+        Some(v)
+    } else {
+        None
+    };
 
-    // We expose `pcr_base`/`pcr_extension` and the raw AF bytes; the
-    // remaining optional fields (OPCR, splice countdown, private data,
-    // extension) are accessible to callers via `raw` but not unpacked
-    // here. `cursor` movement above is only used to validate PCR fit.
+    // transport_private_data — 8-bit length + N bytes (§2.4.3.5).
+    let transport_private_data = if transport_private_data_flag {
+        if cursor + 1 > raw.len() {
+            return Err(TsError::Truncated {
+                what: "TS adaptation_field transport_private_data_length",
+                have: raw.len() - cursor,
+                need: 1,
+            });
+        }
+        let n = raw[cursor] as usize;
+        cursor += 1;
+        let end = cursor.checked_add(n).ok_or(TsError::Truncated {
+            what: "TS adaptation_field private_data",
+            have: raw.len() - cursor,
+            need: n,
+        })?;
+        if end > raw.len() {
+            return Err(TsError::Truncated {
+                what: "TS adaptation_field private_data",
+                have: raw.len() - cursor,
+                need: n,
+            });
+        }
+        let slice = &raw[cursor..end];
+        cursor = end;
+        Some(slice)
+    } else {
+        None
+    };
+
+    // adaptation_field_extension — variable length, with optional ltw /
+    // piecewise_rate / seamless_splice sub-fields (§2.4.3.5).
+    let adaptation_field_extension = if adaptation_field_extension_flag {
+        Some(parse_extension(raw, &mut cursor)?)
+    } else {
+        None
+    };
+
+    // Trailing bytes (up to raw.len()) are stuffing_byte (0xFF) per
+    // Table 2-6 — silently accepted.
     let _ = cursor;
 
     Ok(AdaptationField {
@@ -259,7 +362,155 @@ fn parse_adaptation_field(raw: &[u8]) -> Result<AdaptationField<'_>, TsError> {
         adaptation_field_extension_flag,
         pcr_base,
         pcr_extension,
+        opcr_base,
+        opcr_extension,
+        splice_countdown,
+        transport_private_data,
+        adaptation_field_extension,
         raw,
+    })
+}
+
+/// Decode a 6-byte program_clock_reference (33-bit base + 6 reserved +
+/// 9-bit extension) at `raw[cursor..]`.
+fn parse_clock_reference(
+    raw: &[u8],
+    cursor: usize,
+    what: &'static str,
+) -> Result<(u64, u16), TsError> {
+    if cursor + 6 > raw.len() {
+        return Err(TsError::Truncated {
+            what,
+            have: raw.len() - cursor,
+            need: 6,
+        });
+    }
+    let p = &raw[cursor..cursor + 6];
+    let base: u64 = ((p[0] as u64) << 25)
+        | ((p[1] as u64) << 17)
+        | ((p[2] as u64) << 9)
+        | ((p[3] as u64) << 1)
+        | (((p[4] >> 7) & 0b1) as u64);
+    let ext: u16 = (((p[4] & 0b0000_0001) as u16) << 8) | (p[5] as u16);
+    Ok((base, ext))
+}
+
+fn parse_extension(raw: &[u8], cursor: &mut usize) -> Result<AdaptationFieldExtension, TsError> {
+    if *cursor + 1 > raw.len() {
+        return Err(TsError::Truncated {
+            what: "TS adaptation_field_extension_length",
+            have: raw.len() - *cursor,
+            need: 1,
+        });
+    }
+    let ext_len = raw[*cursor] as usize;
+    *cursor += 1;
+    let ext_end = cursor.checked_add(ext_len).ok_or(TsError::Truncated {
+        what: "TS adaptation_field_extension body",
+        have: raw.len() - *cursor,
+        need: ext_len,
+    })?;
+    if ext_end > raw.len() {
+        return Err(TsError::Truncated {
+            what: "TS adaptation_field_extension body",
+            have: raw.len() - *cursor,
+            need: ext_len,
+        });
+    }
+    // The flag byte counts toward ext_len; need at least 1.
+    if ext_len < 1 {
+        // Spec-permitted zero-length extension: just yield the header
+        // sentinel; everything below stays defaulted.
+        return Ok(AdaptationFieldExtension {
+            length: 0,
+            ..Default::default()
+        });
+    }
+    let flags = raw[*cursor];
+    *cursor += 1;
+    let body_end = ext_end; // hard ceiling for the sub-fields below.
+    let ltw_flag = (flags & 0b1000_0000) != 0;
+    let piecewise_rate_flag = (flags & 0b0100_0000) != 0;
+    let seamless_splice_flag = (flags & 0b0010_0000) != 0;
+
+    let (ltw_valid_flag, ltw_offset) = if ltw_flag {
+        if *cursor + 2 > body_end {
+            return Err(TsError::Truncated {
+                what: "TS adaptation_field ltw",
+                have: body_end - *cursor,
+                need: 2,
+            });
+        }
+        let b0 = raw[*cursor];
+        let b1 = raw[*cursor + 1];
+        *cursor += 2;
+        let valid = (b0 & 0b1000_0000) != 0;
+        let offset = (((b0 & 0b0111_1111) as u16) << 8) | (b1 as u16);
+        (Some(valid), Some(offset))
+    } else {
+        (None, None)
+    };
+
+    let piecewise_rate = if piecewise_rate_flag {
+        if *cursor + 3 > body_end {
+            return Err(TsError::Truncated {
+                what: "TS adaptation_field piecewise_rate",
+                have: body_end - *cursor,
+                need: 3,
+            });
+        }
+        let p0 = raw[*cursor] & 0b0011_1111;
+        let p1 = raw[*cursor + 1];
+        let p2 = raw[*cursor + 2];
+        *cursor += 3;
+        Some(((p0 as u32) << 16) | ((p1 as u32) << 8) | (p2 as u32))
+    } else {
+        None
+    };
+
+    let (splice_type, dts_next_au) = if seamless_splice_flag {
+        if *cursor + 5 > body_end {
+            return Err(TsError::Truncated {
+                what: "TS adaptation_field seamless_splice",
+                have: body_end - *cursor,
+                need: 5,
+            });
+        }
+        // Layout: splice_type (4) | DTS[32..30] (3) | marker (1)
+        //         DTS[29..22] (8)
+        //         DTS[21..15] (7) | marker (1)
+        //         DTS[14..7]  (8)
+        //         DTS[6..0]   (7) | marker (1)
+        let b0 = raw[*cursor];
+        let b1 = raw[*cursor + 1];
+        let b2 = raw[*cursor + 2];
+        let b3 = raw[*cursor + 3];
+        let b4 = raw[*cursor + 4];
+        *cursor += 5;
+        let stype = (b0 >> 4) & 0b1111;
+        let dts: u64 = (((b0 >> 1) & 0b0000_0111) as u64) << 30
+            | (b1 as u64) << 22
+            | (((b2 >> 1) & 0b0111_1111) as u64) << 15
+            | (b3 as u64) << 7
+            | (((b4 >> 1) & 0b0111_1111) as u64);
+        (Some(stype), Some(dts))
+    } else {
+        (None, None)
+    };
+
+    // Reserved padding fills the rest of the extension body — skip it.
+    *cursor = body_end;
+
+    Ok(AdaptationFieldExtension {
+        length: ext_len as u8,
+        ltw_flag,
+        piecewise_rate_flag,
+        seamless_splice_flag,
+        ltw_valid_flag,
+        ltw_offset,
+        piecewise_rate,
+        splice_type,
+        dts_next_au,
     })
 }
 
@@ -438,5 +689,224 @@ mod tests {
         let mut it = iter_packets(&buf);
         assert!(it.next().unwrap().is_ok());
         assert!(it.next().is_none());
+    }
+
+    /// Encode a 6-byte program_clock_reference (33-bit base + 6 reserved
+    /// ones + 9-bit extension) per §2.4.3.5.
+    fn encode_clock_reference(base: u64, ext: u16) -> [u8; 6] {
+        let b0 = ((base >> 25) & 0xFF) as u8;
+        let b1 = ((base >> 17) & 0xFF) as u8;
+        let b2 = ((base >> 9) & 0xFF) as u8;
+        let b3 = ((base >> 1) & 0xFF) as u8;
+        let b4 = (((base & 0b1) as u8) << 7) | 0b0111_1110 | (((ext >> 8) & 0b1) as u8);
+        let b5 = (ext & 0xFF) as u8;
+        [b0, b1, b2, b3, b4, b5]
+    }
+
+    /// Wrap a custom adaptation-field payload (everything after the
+    /// flags byte) into a 188-byte TS packet whose AF_control = 0b11.
+    fn ts_packet_with_af(af_flags: u8, af_tail: &[u8]) -> Vec<u8> {
+        // af_len counts the flags byte + tail.
+        let af_len = (1 + af_tail.len()) as u8;
+        let header = [0x47, 0x01, 0x00, 0b0011_0000];
+        let mut tail = Vec::new();
+        tail.push(af_len);
+        tail.push(af_flags);
+        tail.extend_from_slice(af_tail);
+        make_packet(header, &tail)
+    }
+
+    #[test]
+    fn af_opcr_unpacked() {
+        // PCR + OPCR — same wire shape, different base/ext values.
+        let pcr_base: u64 = 0x0_0000_0001;
+        let pcr_ext: u16 = 0x000;
+        let opcr_base: u64 = 0x1_FEDC_BA98;
+        let opcr_ext: u16 = 0x1FE;
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&encode_clock_reference(pcr_base, pcr_ext));
+        tail.extend_from_slice(&encode_clock_reference(opcr_base, opcr_ext));
+        // flags: PCR + OPCR.
+        let bytes = ts_packet_with_af(0b0001_1000, &tail);
+        let pkt = TsPacket::parse(&bytes).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert_eq!(af.pcr_base, Some(pcr_base));
+        assert_eq!(af.pcr_extension, Some(pcr_ext));
+        assert_eq!(af.opcr_base, Some(opcr_base));
+        assert_eq!(af.opcr_extension, Some(opcr_ext));
+    }
+
+    #[test]
+    fn af_splice_countdown_signed() {
+        // splicing_point_flag only — single signed byte.
+        let bytes = ts_packet_with_af(0b0000_0100, &[(-3i8) as u8]);
+        let pkt = TsPacket::parse(&bytes).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert!(af.splicing_point_flag);
+        assert_eq!(af.splice_countdown, Some(-3));
+    }
+
+    #[test]
+    fn af_transport_private_data() {
+        // transport_private_data_flag — 1-byte length + payload.
+        let payload: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let mut tail = Vec::new();
+        tail.push(payload.len() as u8);
+        tail.extend_from_slice(payload);
+        let bytes = ts_packet_with_af(0b0000_0010, &tail);
+        let pkt = TsPacket::parse(&bytes).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert!(af.transport_private_data_flag);
+        assert_eq!(af.transport_private_data, Some(payload));
+    }
+
+    #[test]
+    fn af_extension_with_ltw_and_piecewise_rate() {
+        // Extension: ltw_flag + piecewise_rate_flag, no seamless_splice.
+        // ltw_valid_flag=1, ltw_offset=0x1234. piecewise_rate=0x2A_3B4C.
+        // ext_len = flags(1) + ltw(2) + piecewise(3) = 6.
+        let ltw_offset: u16 = 0x1234;
+        let b0 = 0b1000_0000 | ((ltw_offset >> 8) & 0x7F) as u8;
+        let b1 = (ltw_offset & 0xFF) as u8;
+        let pwr: u32 = 0x2A_3B4C;
+        let p0 = ((pwr >> 16) & 0x3F) as u8 | 0b1100_0000; // reserved=11
+        let p1 = ((pwr >> 8) & 0xFF) as u8;
+        let p2 = (pwr & 0xFF) as u8;
+        let tail = vec![
+            6,           // adaptation_field_extension_length
+            0b1100_0000, // ltw + piecewise, no seamless
+            b0,
+            b1,
+            p0,
+            p1,
+            p2,
+        ];
+        // flag = adaptation_field_extension_flag only.
+        let bytes = ts_packet_with_af(0b0000_0001, &tail);
+        let pkt = TsPacket::parse(&bytes).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        let ext = af.adaptation_field_extension.expect("ext");
+        assert_eq!(ext.length, 6);
+        assert!(ext.ltw_flag);
+        assert!(ext.piecewise_rate_flag);
+        assert!(!ext.seamless_splice_flag);
+        assert_eq!(ext.ltw_valid_flag, Some(true));
+        assert_eq!(ext.ltw_offset, Some(0x1234));
+        assert_eq!(ext.piecewise_rate, Some(0x2A_3B4C));
+        assert_eq!(ext.splice_type, None);
+        assert_eq!(ext.dts_next_au, None);
+    }
+
+    #[test]
+    fn af_extension_seamless_splice_dts() {
+        // seamless_splice only. splice_type = 5, DTS_next_AU = some
+        // 33-bit value. ext_len = flags(1) + seamless(5) = 6.
+        let dts: u64 = 0x1_2345_6789;
+        let splice_type: u8 = 5;
+        let b0 = (splice_type << 4) | (((dts >> 30) & 0b0111) as u8) << 1 | 0b1;
+        let b1 = ((dts >> 22) & 0xFF) as u8;
+        let b2 = (((dts >> 15) & 0b0111_1111) as u8) << 1 | 0b1;
+        let b3 = ((dts >> 7) & 0xFF) as u8;
+        let b4 = (((dts & 0b0111_1111) as u8) << 1) | 0b1;
+        let mut tail = Vec::new();
+        tail.push(6); // ext_len
+        tail.push(0b0010_0000); // seamless_splice only
+        tail.extend_from_slice(&[b0, b1, b2, b3, b4]);
+        let bytes = ts_packet_with_af(0b0000_0001, &tail);
+        let pkt = TsPacket::parse(&bytes).unwrap();
+        let ext = pkt
+            .adaptation_field
+            .unwrap()
+            .adaptation_field_extension
+            .expect("ext");
+        assert!(ext.seamless_splice_flag);
+        assert_eq!(ext.splice_type, Some(splice_type));
+        assert_eq!(ext.dts_next_au, Some(dts));
+    }
+
+    #[test]
+    fn af_extension_with_reserved_padding_is_accepted() {
+        // ext_len = 4: flags(1) + ltw(2) + 1 byte of reserved padding.
+        // Parser must not error and must skip the padding.
+        let ltw_offset: u16 = 0x0ABC;
+        let b0 = ((ltw_offset >> 8) & 0x7F) as u8; // ltw_valid=0
+        let b1 = (ltw_offset & 0xFF) as u8;
+        let tail = vec![
+            4,           // ext_len includes flags + ltw + padding
+            0b1000_0000, // ltw only
+            b0,
+            b1,
+            0xFF, // reserved padding
+        ];
+        let bytes = ts_packet_with_af(0b0000_0001, &tail);
+        let pkt = TsPacket::parse(&bytes).unwrap();
+        let ext = pkt
+            .adaptation_field
+            .unwrap()
+            .adaptation_field_extension
+            .expect("ext");
+        assert_eq!(ext.length, 4);
+        assert!(ext.ltw_flag);
+        assert_eq!(ext.ltw_valid_flag, Some(false));
+        assert_eq!(ext.ltw_offset, Some(0x0ABC));
+    }
+
+    #[test]
+    fn af_all_optional_subfields_together() {
+        // Every flag set; the AF carries PCR + OPCR + splice_countdown +
+        // 2-byte transport_private_data + a minimal extension with
+        // ltw_flag only. Verifies cursor ordering through the §2.4.3.4
+        // production.
+        let pcr_base: u64 = 100;
+        let pcr_ext: u16 = 50;
+        let opcr_base: u64 = 200;
+        let opcr_ext: u16 = 60;
+        let priv_data: &[u8] = &[0xAB, 0xCD];
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&encode_clock_reference(pcr_base, pcr_ext));
+        tail.extend_from_slice(&encode_clock_reference(opcr_base, opcr_ext));
+        tail.push(7i8 as u8); // splice_countdown
+        tail.push(priv_data.len() as u8); // transport_private_data_length
+        tail.extend_from_slice(priv_data);
+        // Extension: ext_len = flags(1) + ltw(2) = 3, ltw_valid=0,
+        // ltw_offset = 0.
+        tail.push(3);
+        tail.push(0b1000_0000);
+        tail.push(0x00);
+        tail.push(0x00);
+        let bytes = ts_packet_with_af(0b0001_1111, &tail);
+        let pkt = TsPacket::parse(&bytes).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert_eq!(af.pcr_base, Some(pcr_base));
+        assert_eq!(af.opcr_base, Some(opcr_base));
+        assert_eq!(af.opcr_extension, Some(opcr_ext));
+        assert_eq!(af.splice_countdown, Some(7));
+        assert_eq!(af.transport_private_data, Some(priv_data));
+        let ext = af.adaptation_field_extension.expect("ext");
+        assert_eq!(ext.length, 3);
+        assert_eq!(ext.ltw_valid_flag, Some(false));
+        assert_eq!(ext.ltw_offset, Some(0));
+    }
+
+    #[test]
+    fn af_extension_truncated_body_errors() {
+        // ext_len claims 5 but only flags + 1 byte present in AF.
+        let tail = vec![
+            5,           // ext_len
+            0b1000_0000, // ltw_flag set
+            0x00,        // only one byte where ltw needs two
+        ];
+        let af_len = (1 + tail.len()) as u8;
+        let header = [0x47, 0x01, 0x00, 0b0011_0000];
+        let mut packet_tail = Vec::new();
+        packet_tail.push(af_len);
+        packet_tail.push(0b0000_0001);
+        packet_tail.extend_from_slice(&tail);
+        let bytes = make_packet(header, &packet_tail);
+        let err = TsPacket::parse(&bytes).unwrap_err();
+        match err {
+            TsError::Truncated { .. } => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
     }
 }

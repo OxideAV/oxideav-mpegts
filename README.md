@@ -17,7 +17,7 @@ language-tagged tracks and chapter marks.
 
 | Module           | What it parses                                                              |
 |------------------|-----------------------------------------------------------------------------|
-| `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field, payload.      |
+| `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field (PCR + OPCR + splice_countdown + transport_private_data + adaptation_field_extension with ltw / piecewise_rate / seamless_splice), payload. |
 | `psi`            | PAT (Program Association Table) + PMT (Program Map Table) sections.         |
 | `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / AVC / HEVC / data-stream-alignment / system-clock / maximum-bitrate / STD. |
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. |

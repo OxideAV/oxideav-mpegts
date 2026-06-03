@@ -539,6 +539,11 @@ mod tests {
             adaptation_field_extension_flag: false,
             pcr_base: Some(base),
             pcr_extension: Some(ext),
+            opcr_base: None,
+            opcr_extension: None,
+            splice_countdown: None,
+            transport_private_data: None,
+            adaptation_field_extension: None,
             raw: &[],
         }
     }
@@ -556,6 +561,11 @@ mod tests {
             adaptation_field_extension_flag: false,
             pcr_base: None,
             pcr_extension: None,
+            opcr_base: None,
+            opcr_extension: None,
+            splice_countdown: None,
+            transport_private_data: None,
+            adaptation_field_extension: None,
             raw: &[],
         }
     }
