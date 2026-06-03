@@ -86,7 +86,9 @@ pub use packet::{
 };
 pub use pes::{PesPacket, PesReassembler};
 pub use psi::{
-    iter_sections, mpeg2_crc32, PmtStream, ProgramAssociationTable, ProgramMapTable, SectionIter,
+    iter_sections, mpeg2_crc32, ConditionalAccessTable, PmtStream, ProgramAssociationTable,
+    ProgramMapTable, PsiSectionAssembler, SectionIter, CAT_PID, CAT_TABLE_ID, MAX_PSI_SECTION_LEN,
+    PAT_PID, PAT_TABLE_ID, PMT_TABLE_ID,
 };
 pub use stream_type::StreamType;
 

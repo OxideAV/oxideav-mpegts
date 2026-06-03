@@ -30,14 +30,26 @@ use crate::TsError;
 
 /// PAT table_id per §2.4.4.3.
 pub const PAT_TABLE_ID: u8 = 0x00;
+/// CAT table_id per §2.4.4.6 (Table 2-26).
+pub const CAT_TABLE_ID: u8 = 0x01;
 /// PMT table_id per §2.4.4.8.
 pub const PMT_TABLE_ID: u8 = 0x02;
+
+/// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
+pub const PAT_PID: u16 = 0x0000;
+/// PID reserved for the Conditional Access Table per §2.4.4.6 / Table 2-3.
+pub const CAT_PID: u16 = 0x0001;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
 const SECTION_HEADER_LEN: usize = 8;
 /// Length of the CRC-32 trailer.
 const SECTION_CRC_LEN: usize = 4;
+/// Upper bound on a single PSI section per §2.4.4: 3 header bytes
+/// (table_id + section_length wrappers) plus `section_length` ≤ 0x3FD
+/// (1021). For private sections this rises to 4096 — kept conservative
+/// here since the assembler is sized for ITU-T-defined PSI tables.
+pub const MAX_PSI_SECTION_LEN: usize = 3 + 0x3FD;
 
 /// Parsed Program Association Table.
 #[derive(Debug, Default, Clone)]
@@ -197,6 +209,291 @@ impl ProgramMapTable {
             program_info,
             streams,
         })
+    }
+}
+
+/// Parsed Conditional Access Table per §2.4.4.6 / Table 2-27.
+///
+/// The CAT carries the program-wide CA descriptor block — one or more
+/// CA_descriptors (§2.6.16) keyed by `CA_system_ID` that point at the
+/// EMM PIDs. The CAT is signalled on the fixed PID `CAT_PID` and uses
+/// `table_id == CAT_TABLE_ID`. Like PAT and PMT it may be segmented
+/// across multiple sections, all of which share `table_id_extension`
+/// (reserved; not used to identify a CAT).
+#[derive(Debug, Default, Clone)]
+pub struct ConditionalAccessTable {
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// `current_next_indicator`.
+    pub current_next_indicator: bool,
+    /// `section_number`.
+    pub section_number: u8,
+    /// `last_section_number`.
+    pub last_section_number: u8,
+    /// Raw bytes of the descriptor() loop carried in the CAT body —
+    /// walk with [`Self::iter_descriptors`] to get typed CA entries.
+    pub descriptors: Vec<u8>,
+}
+
+impl ConditionalAccessTable {
+    /// Parse a single CAT section. The slice must run from `table_id`
+    /// through the CRC trailer (i.e. the pointer_field has already
+    /// been skipped).
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let (hdr, body) = parse_section_header(section, CAT_TABLE_ID)?;
+        Ok(Self {
+            version_number: hdr.version_number,
+            current_next_indicator: hdr.current_next_indicator,
+            section_number: hdr.section_number,
+            last_section_number: hdr.last_section_number,
+            descriptors: body.to_vec(),
+        })
+    }
+
+    /// Walk the carried descriptor() loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Per-PID PSI section reassembler — joins TS payloads carrying the
+/// same `table_id` across multiple 188-byte TS packets per §2.4.4.
+///
+/// Real PMTs that carry many ES_descriptors (e.g. an HEVC + multi-
+/// language audio + multi-language PGS Blu-ray title) routinely run
+/// past one TS packet's ~184-byte payload budget. The spec carries
+/// the overflow into the next same-PID packet whose
+/// `payload_unit_start_indicator == 0`; the assembler concatenates
+/// those continuation payloads onto the in-flight section until
+/// `3 + section_length` bytes have been collected, then yields the
+/// completed section as a borrow over the internal buffer.
+///
+/// Wire rules enforced (§2.4.4 / §2.4.4.1):
+///
+/// * A PUSI=1 TS payload starts with a `pointer_field`. The bytes
+///   from the byte immediately following `pointer_field` for
+///   `pointer_field` bytes complete the previous in-flight section,
+///   then the next section begins. A `pointer_field == 0` means the
+///   first section starts immediately after the pointer.
+/// * A PUSI=0 TS payload contains continuation bytes for the section
+///   in flight at the end of the previous same-PID packet.
+/// * `0xFF` table_id terminates section iteration inside a single TS
+///   payload (stuffing bytes after a section).
+/// * The 4-bit `continuity_counter` advances by +1 (mod 16) between
+///   payload-carrying same-PID packets. A skipped count (per
+///   §2.4.3.3) discards the in-flight buffer rather than blindly
+///   concatenating misordered bytes — the next PUSI=1 packet rebuilds
+///   from scratch.
+///
+/// The assembler is `table_id`-agnostic — it yields raw section bytes
+/// and leaves CRC verification + table parsing to the caller (the
+/// `Parse::parse` methods on [`ProgramAssociationTable`],
+/// [`ProgramMapTable`], and [`ConditionalAccessTable`] each verify
+/// CRC-32/MPEG-2 themselves). Sections that exceed
+/// [`MAX_PSI_SECTION_LEN`] are dropped with [`TsError::SectionLengthOverrun`].
+#[derive(Debug, Default)]
+pub struct PsiSectionAssembler {
+    /// Bytes of the section being assembled, including the 3-byte
+    /// length-bearing header (table_id + 12-bit section_length).
+    in_flight: Vec<u8>,
+    /// Total length of `in_flight` once complete (= 3 + section_length).
+    /// `None` until the first 3 bytes have been collected.
+    target_len: Option<usize>,
+    /// Last `continuity_counter` observed for the assembler's PID.
+    /// `None` until the first TS packet has been fed. Used to detect a
+    /// CC skip that invalidates the in-flight buffer.
+    last_cc: Option<u8>,
+}
+
+impl PsiSectionAssembler {
+    /// Create an empty assembler.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop any in-flight section bytes — used when the caller knows
+    /// the underlying PID just signalled a `discontinuity_indicator`
+    /// (§2.4.3.5) or the input stream restarted.
+    pub fn reset(&mut self) {
+        self.in_flight.clear();
+        self.target_len = None;
+        self.last_cc = None;
+    }
+
+    /// Feed one TS-packet payload to the assembler.
+    ///
+    /// * `payload` is the TS packet's payload bytes (after the
+    ///   adaptation field has been stripped) — the same byte slice
+    ///   `iter_sections` would consume on a single-payload section.
+    /// * `pusi` is the value of the TS packet's
+    ///   `payload_unit_start_indicator`.
+    /// * `continuity_counter` is the 4-bit field from the TS packet's
+    ///   byte-3 low nibble — used to detect a dropped same-PID packet
+    ///   that would corrupt the in-flight section if blindly
+    ///   concatenated.
+    ///
+    /// Returns every complete section gathered by this call (a single
+    /// payload can carry many short sections, or finish off one
+    /// section and start another). Each yielded `Vec<u8>` runs from
+    /// `table_id` through the CRC trailer — exactly what
+    /// [`ProgramAssociationTable::parse`] /
+    /// [`ProgramMapTable::parse`] / [`ConditionalAccessTable::parse`]
+    /// expect.
+    pub fn feed(
+        &mut self,
+        payload: &[u8],
+        pusi: bool,
+        continuity_counter: u8,
+    ) -> Result<Vec<Vec<u8>>, TsError> {
+        // CC continuity check — the 4-bit field wraps mod 16. A skip
+        // means we missed a same-PID payload; the in-flight section
+        // is no longer trustable, so drop it and resume on the next
+        // PUSI=1 packet.
+        let cc = continuity_counter & 0x0F;
+        if let Some(prev) = self.last_cc {
+            let expected = (prev + 1) & 0x0F;
+            if cc != expected {
+                // CC skip — discard buffer.
+                self.in_flight.clear();
+                self.target_len = None;
+            }
+        }
+        self.last_cc = Some(cc);
+
+        let mut out = Vec::new();
+        let mut rest: &[u8] = payload;
+
+        if pusi {
+            // pointer_field = first byte of the payload (§2.4.4.1).
+            if rest.is_empty() {
+                return Ok(out);
+            }
+            let ptr = rest[0] as usize;
+            rest = &rest[1..];
+            if ptr > rest.len() {
+                // Pointer overruns the payload — corrupt header, drop
+                // whatever was in flight and stop.
+                self.in_flight.clear();
+                self.target_len = None;
+                return Ok(out);
+            }
+            let (tail_of_prev, after_ptr) = rest.split_at(ptr);
+            // `tail_of_prev` finishes the previous in-flight section
+            // (when there was one). It may be padded with 0xFF
+            // stuffing if no continuation was due — both cases share
+            // the same "extend then check completion" path.
+            if !self.in_flight.is_empty() || self.target_len.is_some() {
+                if let Some(section) = self.extend_in_flight(tail_of_prev)? {
+                    out.push(section);
+                }
+                // If the in-flight section isn't done after consuming
+                // `tail_of_prev`, drop it: a PUSI=1 packet promises a
+                // fresh section is about to begin, so the previous
+                // section can't be straddled further into this
+                // packet.
+                self.in_flight.clear();
+                self.target_len = None;
+            }
+            rest = after_ptr;
+        } else if self.target_len.is_none() {
+            // PUSI=0 with nothing in flight — payload bytes belong to
+            // a section that started before we attached. Skip.
+            return Ok(out);
+        } else {
+            // PUSI=0 continuation — every payload byte feeds the
+            // in-flight section.
+            if let Some(section) = self.extend_in_flight(rest)? {
+                out.push(section);
+            }
+            return Ok(out);
+        }
+
+        // After pointer_field handling, `rest` points at one-or-more
+        // freshly-starting sections. Each begins with a 3-byte
+        // length-bearing header; 0xFF is a stuffing terminator.
+        while !rest.is_empty() {
+            if rest[0] == 0xFF {
+                // Stuffing — rest of payload is filler.
+                break;
+            }
+            if rest.len() < 3 {
+                // Header straddles into the next TS packet — buffer
+                // what we have and wait for the continuation.
+                self.in_flight.extend_from_slice(rest);
+                self.target_len = None;
+                break;
+            }
+            let section_length =
+                ((((rest[1] & 0b0000_1111) as usize) << 8) | (rest[2] as usize)) & 0x0FFF;
+            let total = 3 + section_length;
+            if total > MAX_PSI_SECTION_LEN {
+                self.in_flight.clear();
+                self.target_len = None;
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: section_length,
+                    have: rest.len() - 3,
+                });
+            }
+            if rest.len() >= total {
+                // Section fits entirely within this payload — emit
+                // and advance.
+                out.push(rest[..total].to_vec());
+                rest = &rest[total..];
+            } else {
+                // Section straddles into next TS packet — buffer.
+                self.in_flight.clear();
+                self.in_flight.extend_from_slice(rest);
+                self.target_len = Some(total);
+                break;
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Extend the in-flight section with `bytes`. If the section
+    /// completes, return it (and clear the buffer). Returns `Ok(None)`
+    /// when more bytes are still needed.
+    fn extend_in_flight(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, TsError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        // If we don't yet have a target_len, we're still gathering the
+        // 3-byte length-bearing header.
+        if self.target_len.is_none() {
+            let want = 3usize.saturating_sub(self.in_flight.len());
+            let take = want.min(bytes.len());
+            self.in_flight.extend_from_slice(&bytes[..take]);
+            if self.in_flight.len() < 3 {
+                return Ok(None);
+            }
+            let section_length = ((((self.in_flight[1] & 0b0000_1111) as usize) << 8)
+                | (self.in_flight[2] as usize))
+                & 0x0FFF;
+            let total = 3 + section_length;
+            if total > MAX_PSI_SECTION_LEN {
+                self.in_flight.clear();
+                self.target_len = None;
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: section_length,
+                    have: bytes.len() - take,
+                });
+            }
+            self.target_len = Some(total);
+            // Recurse on the remainder past the header bytes.
+            return self.extend_in_flight(&bytes[take..]);
+        }
+        let target = self.target_len.expect("checked above");
+        let want = target.saturating_sub(self.in_flight.len());
+        let take = want.min(bytes.len());
+        self.in_flight.extend_from_slice(&bytes[..take]);
+        if self.in_flight.len() < target {
+            return Ok(None);
+        }
+        // Section complete.
+        let done = std::mem::take(&mut self.in_flight);
+        self.target_len = None;
+        Ok(Some(done))
     }
 }
 
@@ -574,5 +871,295 @@ mod tests {
         let pat = ProgramAssociationTable::parse(&section).unwrap();
         assert_eq!(pat.programs[0], (0, 0x10));
         assert_eq!(pat.programs[1], (1, 0x100));
+    }
+
+    /// Build a CAT section carrying `descriptors` as its body.
+    /// Section bytes run from table_id through CRC.
+    fn build_cat_section(version: u8, descriptors: &[u8]) -> Vec<u8> {
+        let section_length = 5 + descriptors.len() + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(CAT_TABLE_ID);
+        let len_hi = 0b1011_0000 | ((section_length >> 8) & 0x0F) as u8;
+        s.push(len_hi);
+        s.push((section_length & 0xFF) as u8);
+        // reserved (18 bits high padding) -> for CAT, table_id_extension
+        // is the 16 reserved bits of bytes 3..5 — encode as 0xFFFF.
+        s.push(0xFF);
+        s.push(0xFF);
+        // reserved | version | current_next.
+        s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
+        s.push(0);
+        s.push(0);
+        s.extend_from_slice(descriptors);
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    #[test]
+    fn cat_round_trip_single_ca_descriptor() {
+        // CA_descriptor (tag 0x09): CA_system_ID=0x0500, CA_PID=0x0123,
+        // private_data=0xCA 0xFE.
+        let ca_descr: &[u8] = &[0x09, 0x06, 0x05, 0x00, 0xE1, 0x23, 0xCA, 0xFE];
+        let section = build_cat_section(3, ca_descr);
+        let cat = ConditionalAccessTable::parse(&section).unwrap();
+        assert_eq!(cat.version_number, 3);
+        assert!(cat.current_next_indicator);
+        let descrs: Vec<_> = cat.iter_descriptors().collect::<Result<_, _>>().unwrap();
+        assert_eq!(descrs.len(), 1);
+        match &descrs[0].body {
+            crate::descriptor::DescriptorBody::Ca(ca) => {
+                assert_eq!(ca.ca_system_id, 0x0500);
+                assert_eq!(ca.ca_pid, 0x0123);
+                assert_eq!(ca.private_data, &[0xCA, 0xFE]);
+            }
+            other => panic!("expected CA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cat_rejects_wrong_table_id() {
+        // Build a PAT-shaped section and parse it as CAT — table_id
+        // mismatch must surface as an error.
+        let section = build_pat_section(1, 0, &[(1, 0x100)]);
+        let err = ConditionalAccessTable::parse(&section).unwrap_err();
+        match err {
+            TsError::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Build a synthetic TS packet carrying `payload` with the given
+    /// PUSI bit and continuity counter. Used to drive
+    /// `PsiSectionAssembler` without going through the full
+    /// `TsPacket::parse` path.
+    fn fake_ts_payload(payload: &[u8], _pusi: bool, _cc: u8) -> Vec<u8> {
+        // The assembler receives the already-extracted TS payload,
+        // not the wire bytes — so this helper just hands back the
+        // payload as-is. Kept for symmetry with the test layout.
+        payload.to_vec()
+    }
+
+    #[test]
+    fn assembler_single_packet_section() {
+        // A short PAT fits in one TS payload — the assembler must
+        // emit it on a single feed() call.
+        let section = build_pat_section(7, 0, &[(1, 0x100)]);
+        let mut payload = vec![0u8]; // pointer_field = 0
+        payload.extend_from_slice(&section);
+        // Pad with stuffing so the payload looks like a real 184-byte
+        // TS data area.
+        payload.resize(184, 0xFF);
+        let mut asm = PsiSectionAssembler::new();
+        let out = asm
+            .feed(&fake_ts_payload(&payload, true, 0), true, 0)
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], section);
+        let pat = ProgramAssociationTable::parse(&out[0]).unwrap();
+        assert_eq!(pat.programs, vec![(1, 0x100)]);
+    }
+
+    #[test]
+    fn assembler_section_spans_two_ts_packets() {
+        // Build a PMT large enough to overflow one TS payload — use
+        // many ES_descriptors per stream entry to inflate ES_info.
+        let stuff_descr = vec![0u8; 100]; // raw 100-byte descriptor blob
+        let mut descr_block = vec![];
+        descr_block.push(0xC0); // user-private tag → DescriptorBody::Raw
+        descr_block.push(stuff_descr.len() as u8);
+        descr_block.extend_from_slice(&stuff_descr);
+        let section = build_pmt_section(
+            1,
+            0,
+            0x100,
+            &[],
+            &[(0x1B, 0x1011, &descr_block), (0x81, 0x1100, &descr_block)],
+        );
+        assert!(
+            section.len() > 184,
+            "section ({} bytes) must exceed a single TS payload to exercise the assembler",
+            section.len()
+        );
+
+        // First TS payload: pointer_field=0, then first 183 bytes of
+        // section. The TS packet has a 184-byte payload (no
+        // adaptation_field), pointer_field eats one byte, leaving 183
+        // bytes of section.
+        let mut p0 = vec![0u8]; // pointer_field
+        p0.extend_from_slice(&section[..183]);
+        // Second TS payload: continuation = rest of section, plus
+        // stuffing to fill 184 bytes.
+        let mut p1 = Vec::new();
+        p1.extend_from_slice(&section[183..]);
+        p1.resize(184, 0xFF);
+
+        let mut asm = PsiSectionAssembler::new();
+        let out0 = asm.feed(&p0, true, 5).unwrap();
+        assert!(
+            out0.is_empty(),
+            "section straddles two TS packets — first feed must not yield"
+        );
+        let out1 = asm.feed(&p1, false, 6).unwrap();
+        assert_eq!(out1.len(), 1, "second feed must complete the section");
+        assert_eq!(out1[0], section);
+        let pmt = ProgramMapTable::parse(&out1[0]).unwrap();
+        assert_eq!(pmt.streams.len(), 2);
+    }
+
+    #[test]
+    fn assembler_section_spans_three_ts_packets() {
+        // Stuff a single PMT so it needs three TS payloads. Pad the
+        // program_info area with two ~250-byte raw descriptor blobs;
+        // each TLV uses an 8-bit length so the upper bound per blob
+        // is 255 + 2 header bytes.
+        let payload_chunk = vec![0xABu8; 250];
+        let mut descr_block: Vec<u8> = Vec::new();
+        for tag in [0xC0u8, 0xC1] {
+            descr_block.push(tag);
+            descr_block.push(payload_chunk.len() as u8);
+            descr_block.extend_from_slice(&payload_chunk);
+        }
+        let section = build_pmt_section(1, 0, 0x100, &descr_block, &[(0x1B, 0x1011, &[])]);
+        assert!(
+            section.len() > 2 * 184,
+            "need >2 TS payloads worth, got {} bytes",
+            section.len()
+        );
+
+        // Slice into three chunks. First payload carries 183 section
+        // bytes (after pointer_field=0); the next two carry up to 184
+        // continuation bytes each.
+        let mut p0 = vec![0u8];
+        p0.extend_from_slice(&section[..183]);
+        let p1 = section[183..183 + 184].to_vec();
+        let mut p2 = section[183 + 184..].to_vec();
+        p2.resize(184, 0xFF);
+
+        let mut asm = PsiSectionAssembler::new();
+        assert!(asm.feed(&p0, true, 0).unwrap().is_empty());
+        assert!(asm.feed(&p1, false, 1).unwrap().is_empty());
+        let out = asm.feed(&p2, false, 2).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], section);
+    }
+
+    #[test]
+    fn assembler_cc_skip_discards_in_flight_section() {
+        // Begin a section in packet A (CC=4), then jump to CC=8 in
+        // packet B. The assembler must discard the in-flight bytes
+        // rather than concatenate them blindly.
+        let section = build_pat_section(1, 0, &[(1, 0x100), (2, 0x200), (3, 0x300)]);
+        // Make sure the section doesn't fit in one payload, so the
+        // CC skip actually matters.
+        let mut padded = Vec::new();
+        for _ in 0..200 {
+            padded.extend_from_slice(&section);
+        }
+        let big_section = build_pmt_section(
+            1,
+            0,
+            0x100,
+            &[0u8; 200],
+            &[(0x1B, 0x1011, &[]), (0x81, 0x1100, &[])],
+        );
+        let mut p0 = vec![0u8];
+        p0.extend_from_slice(&big_section[..183]);
+
+        let mut asm = PsiSectionAssembler::new();
+        assert!(asm.feed(&p0, true, 0).unwrap().is_empty());
+        // Skip CC from 0 → 2 (expected was 1). Assembler drops the
+        // in-flight buffer.
+        let p1 = vec![0xFFu8; 184];
+        let out = asm.feed(&p1, false, 2).unwrap();
+        assert!(out.is_empty());
+        // Confirm the buffer was actually dropped: feeding the rest
+        // of `big_section` as a continuation now produces no section.
+        let mut p2 = big_section[183..].to_vec();
+        p2.resize(184, 0xFF);
+        let out2 = asm.feed(&p2, false, 3).unwrap();
+        assert!(out2.is_empty(), "CC-skip must have dropped in-flight bytes");
+
+        let _ = padded;
+    }
+
+    #[test]
+    fn assembler_stuffing_terminates_payload() {
+        // A single short section followed by stuffing — assembler
+        // must yield the section and stop at the first 0xFF.
+        let section = build_pat_section(9, 0, &[(1, 0x100)]);
+        let mut payload = vec![0u8]; // pointer_field
+        payload.extend_from_slice(&section);
+        payload.extend_from_slice(&[0xFFu8; 64]);
+        let mut asm = PsiSectionAssembler::new();
+        let out = asm.feed(&payload, true, 0).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], section);
+    }
+
+    #[test]
+    fn assembler_two_sections_same_payload() {
+        // Two short PAT sections packed back-to-back in one PUSI
+        // payload — pointer_field=0 puts the first section
+        // immediately after the pointer.
+        let s0 = build_pat_section(1, 0, &[(1, 0x100)]);
+        let s1 = build_pat_section(2, 0, &[(2, 0x200)]);
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(&s0);
+        payload.extend_from_slice(&s1);
+        payload.resize(184, 0xFF);
+        let mut asm = PsiSectionAssembler::new();
+        let out = asm.feed(&payload, true, 0).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], s0);
+        assert_eq!(out[1], s1);
+    }
+
+    #[test]
+    fn assembler_pointer_field_finishes_prev_section() {
+        // First TS payload starts a section that runs past the
+        // 184-byte data area. Second TS payload has PUSI=1 with
+        // pointer_field = N where N is the remaining bytes of the
+        // previous section; after those N bytes, a new section
+        // begins.
+        //
+        // s0 must overflow one TS payload — build it with a stuffed
+        // PMT body. s1 is the trailing short section.
+        let big_descr = vec![0u8; 200];
+        let s0 = build_pmt_section(1, 0, 0x100, &big_descr, &[(0x1B, 0x1011, &[])]);
+        let s1 = build_pat_section(7, 0, &[(3, 0x300)]);
+        assert!(s0.len() > 184, "s0 must straddle a TS packet boundary");
+        let mut p0 = vec![0u8]; // pointer_field = 0
+        p0.extend_from_slice(&s0[..183]);
+        // p1: pointer_field = remaining s0 bytes, then s1.
+        let remaining = s0.len() - 183;
+        let mut p1 = vec![remaining as u8];
+        p1.extend_from_slice(&s0[183..]);
+        p1.extend_from_slice(&s1);
+        p1.resize(184, 0xFF);
+
+        let mut asm = PsiSectionAssembler::new();
+        let out0 = asm.feed(&p0, true, 0).unwrap();
+        assert!(out0.is_empty());
+        let out1 = asm.feed(&p1, true, 1).unwrap();
+        assert_eq!(out1.len(), 2);
+        assert_eq!(out1[0], s0);
+        assert_eq!(out1[1], s1);
+    }
+
+    #[test]
+    fn assembler_reset_drops_buffer() {
+        let section = build_pmt_section(1, 0, 0x100, &[0u8; 200], &[(0x1B, 0x1011, &[])]);
+        let mut p0 = vec![0u8];
+        p0.extend_from_slice(&section[..183]);
+        let mut asm = PsiSectionAssembler::new();
+        assert!(asm.feed(&p0, true, 0).unwrap().is_empty());
+        asm.reset();
+        // Feeding the continuation now does nothing — the buffer
+        // was wiped.
+        let mut p1 = section[183..].to_vec();
+        p1.resize(184, 0xFF);
+        let out = asm.feed(&p1, false, 1).unwrap();
+        assert!(out.is_empty());
     }
 }

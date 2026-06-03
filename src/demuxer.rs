@@ -12,10 +12,13 @@
 //! * Single-program transport streams (BD `.m2ts`, broadcast TS with
 //!   one program). When a PAT advertises multiple programs the first
 //!   one wins; multi-program selection is a [future hook](#future).
-//! * Single-section PAT / PMT. Real BD `.m2ts` fits both in one TS
-//!   packet; broadcast streams with `last_section_number > 0` would
-//!   need a section-reassembler keyed by `(table_id,
-//!   table_id_extension, section_number)`.
+//! * Multi-TS-packet PAT / PMT via [`crate::PsiSectionAssembler`] —
+//!   sections that overflow the ~184-byte per-TS payload budget
+//!   (common for PMTs with rich descriptor blocks) are reassembled
+//!   across as many same-PID continuation packets as the section
+//!   spans, per §2.4.4. Multi-section tables (`last_section_number >
+//!   0`) still pick the first section — the table-level cross-section
+//!   join is a separate follow-up.
 //! * Per-PID streams. Streams whose [`StreamType`] maps to an audio /
 //!   video / subtitle [`CodecParameters`] surface as
 //!   [`StreamInfo`]s the muxer can write; streams whose type we don't
@@ -37,8 +40,8 @@ use oxideav_core::{
 };
 
 use crate::{
-    iter_sections, PesPacket, PesReassembler, ProgramAssociationTable, ProgramMapTable, StreamType,
-    TsPacket, TS_PACKET_LEN, TS_SYNC_BYTE,
+    PesPacket, PesReassembler, ProgramAssociationTable, ProgramMapTable, PsiSectionAssembler,
+    StreamType, TsPacket, PAT_PID, TS_PACKET_LEN, TS_SYNC_BYTE,
 };
 
 /// Open factory matching `oxideav_core::OpenDemuxerFn`. Registered
@@ -86,15 +89,17 @@ impl std::fmt::Debug for MpegTsDemuxer {
 
 impl MpegTsDemuxer {
     fn new(mut input: Box<dyn ReadSeek>) -> CoreResult<Self> {
-        // Step 1: scan for the first PAT. We read sequentially and
-        // buffer the PAT's payload (handling the rare case where the
-        // section straddles two TS packets via the pointer_field
-        // mechanism is left as a TODO — real BD `.m2ts` always fits
-        // PAT in one TS packet).
+        // Step 1: scan for the first PAT, reassembling its section
+        // across as many same-PID TS packets as the spec permits per
+        // §2.4.4. A PUSI=1 packet starts a fresh section; subsequent
+        // same-PID packets with PUSI=0 continue it. Real BD `.m2ts`
+        // fits the PAT in one TS packet; broadcast TS with many
+        // programs needs the assembler.
         let mut pmt_pid: Option<u16> = None;
         let mut programs_found: Option<ProgramAssociationTable> = None;
         let mut probe_bytes: u64 = 0;
         let mut probe_putback: VecDeque<u8> = VecDeque::new();
+        let mut pat_assembler = PsiSectionAssembler::new();
         loop {
             probe_bytes += TS_PACKET_LEN as u64;
             let buf = match read_one_packet(
@@ -110,31 +115,40 @@ impl MpegTsDemuxer {
                 }
             };
             let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
-            if pkt.pid == 0 && pkt.payload_unit_start {
-                for section in iter_sections(pkt.payload) {
-                    if let Ok(pat) = ProgramAssociationTable::parse(section) {
-                        // First program with `program_number != 0` is
-                        // the one we open; `0` is the network PID.
-                        for (prog, pid) in &pat.programs {
-                            if *prog != 0 {
-                                pmt_pid = Some(*pid);
-                                break;
-                            }
+            if pkt.pid != PAT_PID || pkt.payload.is_empty() {
+                continue;
+            }
+            let sections = pat_assembler
+                .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+                .map_err(map_ts_err)?;
+            for section in &sections {
+                if let Ok(pat) = ProgramAssociationTable::parse(section) {
+                    for (prog, pid) in &pat.programs {
+                        if *prog != 0 {
+                            pmt_pid = Some(*pid);
+                            break;
                         }
-                        programs_found = Some(pat);
+                    }
+                    programs_found = Some(pat);
+                    if pmt_pid.is_some() {
                         break;
                     }
                 }
-                if pmt_pid.is_some() {
-                    break;
-                }
+            }
+            if pmt_pid.is_some() {
+                break;
             }
         }
         let pmt_pid = pmt_pid
             .ok_or_else(|| CoreError::invalid("mpegts: PAT carried no program with a PMT PID"))?;
         let _ = programs_found; // retained for future multi-program selection
 
-        // Step 2: scan for the matching PMT.
+        // Step 2: scan for the matching PMT, again reassembling
+        // multi-TS-packet sections. PMTs with rich descriptor blocks
+        // routinely overflow the ~184-byte single-TS payload budget;
+        // a Blu-ray title's PMT with multi-language PGS + multi-codec
+        // audio is the canonical case.
+        let mut pmt_assembler = PsiSectionAssembler::new();
         let pmt = loop {
             probe_bytes += TS_PACKET_LEN as u64;
             let buf = match read_one_packet(
@@ -150,12 +164,21 @@ impl MpegTsDemuxer {
                 }
             };
             let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
-            if pkt.pid == pmt_pid && pkt.payload_unit_start {
-                if let Some(section) = iter_sections(pkt.payload).next() {
-                    if let Ok(pmt) = ProgramMapTable::parse(section) {
-                        break pmt;
-                    }
+            if pkt.pid != pmt_pid || pkt.payload.is_empty() {
+                continue;
+            }
+            let sections = pmt_assembler
+                .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+                .map_err(map_ts_err)?;
+            let mut got: Option<ProgramMapTable> = None;
+            for section in &sections {
+                if let Ok(pmt) = ProgramMapTable::parse(section) {
+                    got = Some(pmt);
+                    break;
                 }
+            }
+            if let Some(pmt) = got {
+                break pmt;
             }
         };
 
@@ -643,6 +666,160 @@ mod tests {
         // EOF after flush — single packet stream.
         let next = dmx.next_packet();
         assert!(matches!(next, Err(CoreError::Eof)));
+    }
+
+    /// Build a sequence of TS packets carrying `section` on `pid`,
+    /// spanning as many packets as needed. The first packet has
+    /// PUSI=1 + pointer_field=0; subsequent packets have PUSI=0 and
+    /// carry continuation bytes. `cc_start` is the continuity_counter
+    /// for the first packet (subsequent CCs increment mod 16).
+    fn ts_packets_for_section(pid: u16, section: &[u8], cc_start: u8) -> Vec<[u8; TS_PACKET_LEN]> {
+        let mut out = Vec::new();
+        let mut consumed = 0usize;
+        let mut cc = cc_start & 0x0F;
+        let mut first = true;
+        while consumed < section.len() {
+            let mut pkt = [0u8; TS_PACKET_LEN];
+            pkt[0] = TS_SYNC_BYTE;
+            let pusi_bit = if first { 0b0100_0000 } else { 0 };
+            pkt[1] = pusi_bit | ((pid >> 8) as u8 & 0b0001_1111);
+            pkt[2] = pid as u8;
+            pkt[3] = 0b0001_0000 | cc;
+            let mut off = 4;
+            if first {
+                pkt[off] = 0; // pointer_field = 0
+                off += 1;
+                first = false;
+            }
+            let room = TS_PACKET_LEN - off;
+            let take = room.min(section.len() - consumed);
+            pkt[off..off + take].copy_from_slice(&section[consumed..consumed + take]);
+            // Pad remainder with 0xFF stuffing.
+            for b in &mut pkt[off + take..] {
+                *b = 0xFF;
+            }
+            consumed += take;
+            cc = (cc + 1) & 0x0F;
+            out.push(pkt);
+        }
+        out
+    }
+
+    #[test]
+    fn demux_handles_pmt_spanning_two_ts_packets() {
+        // PSI CRC-32/MPEG-2 — local copy.
+        fn crc32_mpeg2(data: &[u8]) -> u32 {
+            let mut c: u32 = 0xFFFF_FFFF;
+            for &b in data {
+                c ^= (b as u32) << 24;
+                for _ in 0..8 {
+                    c = if c & 0x8000_0000 != 0 {
+                        (c << 1) ^ 0x04C1_1DB7
+                    } else {
+                        c << 1
+                    };
+                }
+            }
+            c
+        }
+        // PAT — same as before.
+        let mut pat = vec![
+            0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,
+        ];
+        let pat_crc = crc32_mpeg2(&pat);
+        pat.extend_from_slice(&pat_crc.to_be_bytes());
+
+        // PMT: PCR_PID=0x101, program_info empty, one AVC stream on
+        // 0x101 with a 200-byte ES_info descriptor blob (user-private
+        // tag 0xC0). Section size: 3 + (5 header + 4 PCR/PI hdr + 5
+        // stream hdr + 202 descr + 4 CRC) = ~223 bytes, which
+        // overflows a single 184-byte TS payload.
+        let descr: Vec<u8> = {
+            let mut d = vec![0xC0u8, 200u8]; // tag + length
+            d.extend(std::iter::repeat(0xAA).take(200));
+            d
+        };
+        let es_info_len = descr.len() as u16; // = 202
+        let section_body_len = 4 + 5 + descr.len(); // PCR/PI(4) + stream hdr(5) + descr
+        let section_length = 5 + section_body_len + 4; // 5 = rest of common header, +4 CRC
+        let mut pmt = vec![
+            0x02,
+            (0xB0 | ((section_length >> 8) & 0x0F) as u8),
+            (section_length & 0xFF) as u8,
+            0x00,
+            0x01,
+            0xC1,
+            0x00,
+            0x00,
+            0xE1,
+            0x01, // PCR_PID = 0x101
+            0xF0,
+            0x00, // program_info_length = 0
+            0x1B, // stream_type AVC
+            0xE1,
+            0x01, // elementary_pid = 0x101
+            (0xF0 | ((es_info_len >> 8) & 0x0F) as u8),
+            (es_info_len & 0xFF) as u8,
+        ];
+        pmt.extend_from_slice(&descr);
+        let pmt_crc = crc32_mpeg2(&pmt);
+        pmt.extend_from_slice(&pmt_crc.to_be_bytes());
+        assert!(
+            pmt.len() > 184,
+            "PMT must overflow a single TS payload to exercise the assembler"
+        );
+
+        // PES — short, fits in one TS packet.
+        fn encode_pts(pts: u64, marker_nibble: u8) -> [u8; 5] {
+            let mut b = [0u8; 5];
+            b[0] = (marker_nibble << 4) | (((pts >> 29) & 0x0E) as u8) | 1;
+            b[1] = ((pts >> 22) & 0xFF) as u8;
+            b[2] = (((pts >> 14) & 0xFE) as u8) | 1;
+            b[3] = ((pts >> 7) & 0xFF) as u8;
+            b[4] = (((pts << 1) & 0xFE) as u8) | 1;
+            b
+        }
+        let pts_bytes = encode_pts(7777, 0b0010);
+        let pes_payload = b"spans-pmt";
+        let opt_hdr_len: u8 = 5;
+        let pes_packet_length: u16 = 3 + opt_hdr_len as u16 + pes_payload.len() as u16;
+        let mut pes = vec![
+            0x00,
+            0x00,
+            0x01,
+            0xE0,
+            (pes_packet_length >> 8) as u8,
+            pes_packet_length as u8,
+            0b1000_0000,
+            0b1000_0000,
+            opt_hdr_len,
+        ];
+        pes.extend_from_slice(&pts_bytes);
+        pes.extend_from_slice(pes_payload);
+
+        let mut buf = Vec::new();
+        for p in ts_packets_for_section(0x0000, &pat, 0) {
+            buf.extend_from_slice(&p);
+        }
+        for p in ts_packets_for_section(0x0100, &pmt, 0) {
+            buf.extend_from_slice(&p);
+        }
+        // PES on PID 0x101.
+        let mut pes_pkt = [0u8; TS_PACKET_LEN];
+        pes_pkt[0] = TS_SYNC_BYTE;
+        pes_pkt[1] = 0b0100_0000 | ((0x0101 >> 8) as u8 & 0b0001_1111);
+        pes_pkt[2] = 0x01;
+        pes_pkt[3] = 0b0001_0000;
+        let take = (TS_PACKET_LEN - 4).min(pes.len());
+        pes_pkt[4..4 + take].copy_from_slice(&pes[..take]);
+        buf.extend_from_slice(&pes_pkt);
+
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open with multi-TS-packet PMT");
+        assert_eq!(dmx.streams().len(), 1);
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h264");
+        let pkt = dmx.next_packet().expect("first PES across multi-PMT path");
+        assert_eq!(pkt.pts, Some(7777));
     }
 
     #[test]

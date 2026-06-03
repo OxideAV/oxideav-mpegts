@@ -11,6 +11,33 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `PsiSectionAssembler` — per-PID stateful reassembler that joins a
+  PSI section across multiple 188-byte TS packets per ISO/IEC 13818-1
+  §2.4.4. Feeds on `(payload, pusi, continuity_counter)` tuples and
+  yields complete `Vec<u8>` sections that run from `table_id` through
+  the CRC trailer (the same shape every `Parse::parse` consumes).
+  Enforces: §2.4.4.1 `pointer_field` semantics (PUSI=1 finishes the
+  previous in-flight section, then starts new ones), §2.4.4 stuffing
+  byte termination (`0xFF` table_id ends iteration within one
+  payload), §2.4.4 1024-byte cap (`MAX_PSI_SECTION_LEN`), §2.4.3.3
+  CC-skip detection (an unexpected continuity_counter discards the
+  in-flight buffer rather than concatenating misordered bytes), and
+  back-to-back sections in a single payload. The demuxer's PAT and
+  PMT discovery loops now drive a `PsiSectionAssembler` each, so a
+  PMT whose descriptor block exceeds the ~184-byte single-TS payload
+  budget (common with multi-language PGS + multi-codec audio + a
+  rich registration descriptor) is reassembled correctly across as
+  many continuation packets as the section spans.
+- `ConditionalAccessTable` — parser for §2.4.4.6 / Table 2-27 (CAT,
+  `table_id == 0x01` on PID `0x0001`). Exposes
+  `version_number` / `current_next_indicator` /
+  `section_number` / `last_section_number` plus the carried
+  descriptor() loop via `iter_descriptors`, which lifts CA_descriptor
+  entries (tag 0x09) into the existing typed
+  `DescriptorBody::Ca { ca_system_id, ca_pid, private_data }` shape.
+- `CAT_TABLE_ID` (0x01), `PAT_PID` (0x0000), `CAT_PID` (0x0001) and
+  `MAX_PSI_SECTION_LEN` constants — every fixed value §2.4.4 wires
+  to a normative PID or upper bound is now a named export.
 - `PesPacket` now surfaces every optional PES-header field defined in
   ISO/IEC 13818-1 §2.4.3.7 / Table 2-17 beyond PTS+DTS: the five
   flags1 bits (`pes_scrambling_control`, `pes_priority`,

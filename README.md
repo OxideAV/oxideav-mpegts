@@ -18,7 +18,7 @@ language-tagged tracks and chapter marks.
 | Module           | What it parses                                                              |
 |------------------|-----------------------------------------------------------------------------|
 | `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field (PCR + OPCR + splice_countdown + transport_private_data + adaptation_field_extension with ltw / piecewise_rate / seamless_splice), payload. |
-| `psi`            | PAT (Program Association Table) + PMT (Program Map Table) sections.         |
+| `psi`            | PAT + PMT + CAT (Conditional Access Table, §2.4.4.6) section parsers, plus `PsiSectionAssembler` — per-PID reassembler that joins long sections across multiple 188-byte TS packets (§2.4.4 pointer_field + PUSI continuation). Handles up-to-1024-byte sections, stuffing terminators, CC-skip detection, and back-to-back sections in one payload. |
 | `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / AVC / HEVC / data-stream-alignment / system-clock / maximum-bitrate / STD. |
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. Decodes every Table 2-17 optional header field: PES_scrambling_control / PES_priority / data_alignment_indicator / copyright / original_or_copy on flags1, plus the flag-gated bodies ESCR (42-bit 27 MHz tick), ES_rate (50 bytes/s units), DSM_trick_mode (raw 8-bit), additional_copy_info, previous_PES_packet_CRC, and a PES_extension-present flag. |
 | `stream_type`    | `stream_type` byte → BD-relevant codec class enum.                          |
@@ -32,7 +32,21 @@ borrowed slice unless reassembly forces a copy.
 inside a PMT into typed [`Descriptor`] records (TLV envelope + a
 decoded body for the most common tags). Unrecognised tags surface as
 `DescriptorBody::Raw` so downstream callers still see the payload
-bytes verbatim.
+bytes verbatim. `ConditionalAccessTable::iter_descriptors` exposes
+the same view over a CAT's CA_descriptor block.
+
+`PsiSectionAssembler` is the building block that turns a stream of
+TS-packet payloads on a single PSI PID into a stream of complete
+sections. The §2.4.4 wire rules are enforced in one place: a PUSI=1
+TS payload begins with a `pointer_field` that completes whatever
+section was in flight; a PUSI=0 payload contributes continuation
+bytes; `0xFF` table_id terminates iteration inside a single payload;
+and a `continuity_counter` skip discards the in-flight buffer rather
+than concatenating misordered bytes. The demuxer's PAT and PMT
+discovery loops both drive an assembler so a PMT with rich descriptor
+blocks (multi-language PGS + multi-codec audio + HEVC + … ) can grow
+past the ~184-byte single-TS payload budget without losing the
+trailing streams.
 
 `PcrTracker` consumes one adaptation field per packet on the
 configured `PCR_PID` and emits `PcrEvent::Sample { pcr, jitter_27mhz,
