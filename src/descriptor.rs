@@ -31,6 +31,7 @@
 //! | `0x09` | CA_descriptor (§2.6.16)           | [`DescriptorBody::Ca`]                       |
 //! | `0x0A` | ISO_639_language_descriptor (§2.6.18) | [`DescriptorBody::Iso639Language`]       |
 //! | `0x0B` | system_clock_descriptor (§2.6.20) | [`DescriptorBody::SystemClock`]              |
+//! | `0x0D` | copyright_descriptor (§2.6.24)    | [`DescriptorBody::Copyright`]                |
 //! | `0x0E` | maximum_bitrate_descriptor (§2.6.26) | [`DescriptorBody::MaximumBitrate`]        |
 //! | `0x10` | smoothing_buffer_descriptor (§2.6.30) | [`DescriptorBody::SmoothingBuffer`]      |
 //! | `0x11` | STD_descriptor (§2.6.32)          | [`DescriptorBody::Std`]                      |
@@ -76,6 +77,8 @@ pub enum DescriptorBody<'a> {
     Iso639Language(Vec<Iso639Language>),
     /// `0x0B` system_clock_descriptor (§2.6.20).
     SystemClock(SystemClockDescriptor),
+    /// `0x0D` copyright_descriptor (§2.6.24).
+    Copyright(CopyrightDescriptor<'a>),
     /// `0x0E` maximum_bitrate_descriptor (§2.6.26).
     MaximumBitrate(MaximumBitrateDescriptor),
     /// `0x10` smoothing_buffer_descriptor (§2.6.30).
@@ -203,6 +206,25 @@ pub struct SystemClockDescriptor {
     pub clock_accuracy_integer: u8,
     /// 3-bit `clock_accuracy_exponent`.
     pub clock_accuracy_exponent: u8,
+}
+
+/// copyright_descriptor body (§2.6.24 Table 2-56).
+///
+/// Surfaces the 32-bit `copyright_identifier` issued by the §2.9
+/// Registration Authority plus the trailing `additional_copyright_info`
+/// bytes. Per §2.6.25 the meaning of those trailing bytes is scoped to
+/// the assignee of the `copyright_identifier` and stays opaque to this
+/// crate. A descriptor body shorter than 4 bytes (the fixed
+/// `copyright_identifier` field) falls back to
+/// [`DescriptorBody::Raw`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyrightDescriptor<'a> {
+    /// 32-bit `copyright_identifier` value obtained from the §2.9
+    /// Registration Authority.
+    pub copyright_identifier: u32,
+    /// `additional_copyright_info` — descriptor bytes after the
+    /// fixed-size identifier. May be empty.
+    pub additional_copyright_info: &'a [u8],
 }
 
 /// maximum_bitrate_descriptor body (§2.6.26 Table 2-57).
@@ -390,6 +412,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x09 => decode_ca(data).unwrap_or(DescriptorBody::Raw),
         0x0A => decode_iso639_language(data).unwrap_or(DescriptorBody::Raw),
         0x0B => decode_system_clock(data).unwrap_or(DescriptorBody::Raw),
+        0x0D => decode_copyright(data).unwrap_or(DescriptorBody::Raw),
         0x0E => decode_maximum_bitrate(data).unwrap_or(DescriptorBody::Raw),
         0x10 => decode_smoothing_buffer(data).unwrap_or(DescriptorBody::Raw),
         0x11 => decode_std(data).unwrap_or(DescriptorBody::Raw),
@@ -516,6 +539,19 @@ fn decode_system_clock(data: &[u8]) -> Option<DescriptorBody<'_>> {
         external_clock_reference,
         clock_accuracy_integer,
         clock_accuracy_exponent,
+    }))
+}
+
+fn decode_copyright(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Table 2-56: 32-bit copyright_identifier (big-endian) followed by
+    // zero or more additional_copyright_info bytes.
+    if data.len() < 4 {
+        return None;
+    }
+    let copyright_identifier = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    Some(DescriptorBody::Copyright(CopyrightDescriptor {
+        copyright_identifier,
+        additional_copyright_info: &data[4..],
     }))
 }
 
@@ -1147,6 +1183,98 @@ mod tests {
             DescriptorBody::Std(s) => assert!(s.leak_valid_flag),
             other => panic!("expected Std, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn copyright_descriptor_identifier_only_no_trailer() {
+        // `copyright_identifier` = 0x4953'4243 ("ISBC" — illustrative
+        // four-byte FOURCC). No trailing additional_copyright_info.
+        let body = [0x49, 0x53, 0x42, 0x43];
+        let block = tlv(0x0D, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Copyright(c) => {
+                assert_eq!(c.copyright_identifier, 0x4953_4243);
+                assert!(c.additional_copyright_info.is_empty());
+            }
+            other => panic!("expected Copyright, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copyright_descriptor_with_trailing_info() {
+        // 4-byte identifier + 5 trailing bytes that the assignee
+        // defines per §2.6.25. The parser surfaces them verbatim.
+        let body = [0x00, 0x00, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+        let block = tlv(0x0D, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Copyright(c) => {
+                assert_eq!(c.copyright_identifier, 0x0000_0001);
+                assert_eq!(c.additional_copyright_info, &[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+            }
+            other => panic!("expected Copyright, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copyright_descriptor_short_body_falls_back_to_raw() {
+        // Three bytes — one short of the mandatory 32-bit identifier.
+        let block = tlv(0x0D, &[0xAA, 0xBB, 0xCC]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn copyright_descriptor_zero_body_falls_back_to_raw() {
+        // descriptor_length == 0 — still legal per §2.6 generic TLV
+        // framing but doesn't satisfy the copyright_descriptor's
+        // 4-byte minimum, so the typed body falls back to Raw.
+        let block = tlv(0x0D, &[]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert!(d.data.is_empty());
+    }
+
+    #[test]
+    fn copyright_descriptor_in_pmt_program_info_alongside_other_tags() {
+        // A realistic PMT program_info block: ISO-639 language +
+        // copyright + smoothing-buffer. Each is a TLV; iter_descriptors
+        // walks them in order and surfaces the typed Copyright body
+        // mid-list without disturbing the surrounding decoders.
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x0A, &[b'e', b'n', b'g', 0x00]));
+        let cid: u32 = 0x4953_524E; // ISRN — another four-byte FOURCC
+        let trailer = [0x12, 0x34];
+        let mut copy_body = Vec::new();
+        copy_body.extend_from_slice(&cid.to_be_bytes());
+        copy_body.extend_from_slice(&trailer);
+        block.extend_from_slice(&tlv(0x0D, &copy_body));
+        let leak: u32 = 0x0001_0000;
+        let size: u32 = 0x0000_4000;
+        let sb_body = [
+            ((leak >> 16) as u8) & 0b0011_1111,
+            (leak >> 8) as u8,
+            leak as u8,
+            ((size >> 16) as u8) & 0b0011_1111,
+            (size >> 8) as u8,
+            size as u8,
+        ];
+        block.extend_from_slice(&tlv(0x10, &sb_body));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].tag, 0x0A);
+        assert_eq!(v[1].tag, 0x0D);
+        match &v[1].body {
+            DescriptorBody::Copyright(c) => {
+                assert_eq!(c.copyright_identifier, cid);
+                assert_eq!(c.additional_copyright_info, &trailer);
+            }
+            other => panic!("expected Copyright, got {other:?}"),
+        }
+        assert_eq!(v[2].tag, 0x10);
+        assert!(matches!(v[2].body, DescriptorBody::SmoothingBuffer(_)));
     }
 
     #[test]

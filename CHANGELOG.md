@@ -11,6 +11,16 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `CopyrightDescriptor` — typed view of the §2.6.24
+  copyright_descriptor (tag `0x0D`, Table 2-56). Surfaces the 32-bit
+  `copyright_identifier` (issued by the §2.9 Registration Authority)
+  plus the trailing `additional_copyright_info` byte slice (whose
+  semantics are scoped to the assignee of the identifier per §2.6.25
+  and stay opaque to this crate). Bodies shorter than the 4-byte
+  fixed identifier fall back to `DescriptorBody::Raw`. Wired through
+  `PmtStream::iter_descriptors` and
+  `ProgramMapTable::iter_program_descriptors` alongside the existing
+  tag set.
 - `SmoothingBufferDescriptor` — typed view of the §2.6.30
   smoothing_buffer_descriptor (tag `0x10`, Table 2-59). Surfaces the
   raw 22-bit `sb_leak_rate` and `sb_size` fields plus convenience
