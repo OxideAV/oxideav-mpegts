@@ -11,6 +11,18 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `SmoothingBufferDescriptor` — typed view of the §2.6.30
+  smoothing_buffer_descriptor (tag `0x10`, Table 2-59). Surfaces the
+  raw 22-bit `sb_leak_rate` and `sb_size` fields plus convenience
+  helpers `leak_rate_bits_per_second` (× 400 — same as
+  `maximum_bitrate_descriptor`'s units), `leak_rate_bytes_per_second`
+  (× 50), and `buffer_size_bytes` (identity, since `sb_size` is
+  already in bytes per §2.6.31). Bodies shorter than the six-byte
+  fixed payload fall back to `DescriptorBody::Raw`; reserved bits on
+  the two header bytes are ignored on the read path so a non-zero
+  reservation doesn't corrupt the parse. Wired through
+  `PmtStream::iter_descriptors` and `ProgramMapTable::iter_program_descriptors`
+  alongside the existing tag set.
 - `PsiSectionAssembler` — per-PID stateful reassembler that joins a
   PSI section across multiple 188-byte TS packets per ISO/IEC 13818-1
   §2.4.4. Feeds on `(payload, pusi, continuity_counter)` tuples and

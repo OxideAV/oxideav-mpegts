@@ -76,8 +76,8 @@ pub use clock::{
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
     DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor,
-    Iso639Language, MaximumBitrateDescriptor, StdDescriptor, SystemClockDescriptor,
-    VideoStreamDescriptor,
+    Iso639Language, MaximumBitrateDescriptor, SmoothingBufferDescriptor, StdDescriptor,
+    SystemClockDescriptor, VideoStreamDescriptor,
 };
 pub use error::TsError;
 pub use packet::{

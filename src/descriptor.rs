@@ -32,6 +32,7 @@
 //! | `0x0A` | ISO_639_language_descriptor (§2.6.18) | [`DescriptorBody::Iso639Language`]       |
 //! | `0x0B` | system_clock_descriptor (§2.6.20) | [`DescriptorBody::SystemClock`]              |
 //! | `0x0E` | maximum_bitrate_descriptor (§2.6.26) | [`DescriptorBody::MaximumBitrate`]        |
+//! | `0x10` | smoothing_buffer_descriptor (§2.6.30) | [`DescriptorBody::SmoothingBuffer`]      |
 //! | `0x11` | STD_descriptor (§2.6.32)          | [`DescriptorBody::Std`]                      |
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
@@ -77,6 +78,8 @@ pub enum DescriptorBody<'a> {
     SystemClock(SystemClockDescriptor),
     /// `0x0E` maximum_bitrate_descriptor (§2.6.26).
     MaximumBitrate(MaximumBitrateDescriptor),
+    /// `0x10` smoothing_buffer_descriptor (§2.6.30).
+    SmoothingBuffer(SmoothingBufferDescriptor),
     /// `0x11` STD_descriptor (§2.6.32).
     Std(StdDescriptor),
     /// `0x28` AVC_video_descriptor (§2.6.64).
@@ -221,6 +224,56 @@ impl MaximumBitrateDescriptor {
     }
 }
 
+/// smoothing_buffer_descriptor body (§2.6.30 Table 2-59).
+///
+/// Optional PMT descriptor that declares the size of a smoothing
+/// buffer SBn and the rate at which bytes leak out of it for the
+/// program element(s) the descriptor refers to. Per §2.6.31:
+///
+/// * `sb_leak_rate` is a 22-bit value in units of 400 bits/s — i.e.
+///   multiply by 400 to recover bits/s (multiply by 50 to recover
+///   bytes/s).
+/// * `sb_size` is a 22-bit value in units of 1 byte and gives the
+///   capacity of SBn directly.
+///
+/// On the wire (§2.6.30 Table 2-59) the body is exactly 6 bytes:
+/// two reserved bits then the 22-bit leak rate, then two reserved
+/// bits then the 22-bit buffer size, both big-endian. The descriptor
+/// is only defined inside a PMT or Program Stream Map; an SBn that
+/// would overflow is a spec violation, not something this typed view
+/// enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmoothingBufferDescriptor {
+    /// Raw 22-bit `sb_leak_rate` value (units of 400 bits/s — i.e.
+    /// the same 50 bytes/s units as `maximum_bitrate_descriptor`).
+    pub sb_leak_rate: u32,
+    /// Raw 22-bit `sb_size` value (units of 1 byte; this is the
+    /// buffer capacity in bytes already).
+    pub sb_size: u32,
+}
+
+impl SmoothingBufferDescriptor {
+    /// Convert `sb_leak_rate` to bits per second. The wire field is in
+    /// units of 400 bits/s, so the conversion is a multiply by 400
+    /// (fits in `u64` for the full 22-bit range).
+    pub fn leak_rate_bits_per_second(self) -> u64 {
+        (self.sb_leak_rate as u64) * 400
+    }
+
+    /// Convert `sb_leak_rate` to bytes per second (the same 50 bytes/s
+    /// quanta `maximum_bitrate_descriptor` uses).
+    pub fn leak_rate_bytes_per_second(self) -> u64 {
+        (self.sb_leak_rate as u64) * 50
+    }
+
+    /// `sb_size` in bytes — the field's wire units are already 1 byte
+    /// per count, so this is just a widened copy for symmetry with the
+    /// leak-rate helpers.
+    pub fn buffer_size_bytes(self) -> u64 {
+        self.sb_size as u64
+    }
+}
+
 /// STD_descriptor body (§2.6.32 Table 2-60).
 ///
 /// When `leak_valid_flag == true`, the transfer of data from buffer
@@ -338,6 +391,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x0A => decode_iso639_language(data).unwrap_or(DescriptorBody::Raw),
         0x0B => decode_system_clock(data).unwrap_or(DescriptorBody::Raw),
         0x0E => decode_maximum_bitrate(data).unwrap_or(DescriptorBody::Raw),
+        0x10 => decode_smoothing_buffer(data).unwrap_or(DescriptorBody::Raw),
         0x11 => decode_std(data).unwrap_or(DescriptorBody::Raw),
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
@@ -475,6 +529,28 @@ fn decode_maximum_bitrate(data: &[u8]) -> Option<DescriptorBody<'_>> {
         (((data[0] & 0b0011_1111) as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
     Some(DescriptorBody::MaximumBitrate(MaximumBitrateDescriptor {
         maximum_bitrate,
+    }))
+}
+
+fn decode_smoothing_buffer(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Six-byte payload (Table 2-59):
+    //   byte 0: 2 reserved bits | top 6 bits of sb_leak_rate
+    //   byte 1: middle 8 bits of sb_leak_rate
+    //   byte 2: low 8 bits of sb_leak_rate
+    //   byte 3: 2 reserved bits | top 6 bits of sb_size
+    //   byte 4: middle 8 bits of sb_size
+    //   byte 5: low 8 bits of sb_size
+    // Both fields are big-endian; both are 22-bit unsigned.
+    if data.len() < 6 {
+        return None;
+    }
+    let sb_leak_rate =
+        (((data[0] & 0b0011_1111) as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
+    let sb_size =
+        (((data[3] & 0b0011_1111) as u32) << 16) | ((data[4] as u32) << 8) | (data[5] as u32);
+    Some(DescriptorBody::SmoothingBuffer(SmoothingBufferDescriptor {
+        sb_leak_rate,
+        sb_size,
     }))
 }
 
@@ -952,6 +1028,123 @@ mod tests {
         let d = iter_descriptors(&block).next().unwrap().unwrap();
         match &d.body {
             DescriptorBody::Std(s) => assert!(!s.leak_valid_flag),
+            other => panic!("expected Std, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smoothing_buffer_descriptor_typical_values() {
+        // sb_leak_rate = 0x09_C400 = 640_000 (units of 400 bits/s →
+        //   256 Mbit/s, units of 50 bytes/s → 32 MB/s).
+        // sb_size      = 0x00_C000 = 49_152 bytes (= 48 KiB).
+        // Reserved bits set to 1 (per spec they are reserved-for-future-
+        // use; our parser must ignore them on the read path).
+        let leak: u32 = 0x09_C400;
+        let size: u32 = 0x00_C000;
+        let body = [
+            0b1100_0000 | ((leak >> 16) as u8 & 0b0011_1111),
+            (leak >> 8) as u8,
+            leak as u8,
+            0b1100_0000 | ((size >> 16) as u8 & 0b0011_1111),
+            (size >> 8) as u8,
+            size as u8,
+        ];
+        let block = tlv(0x10, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::SmoothingBuffer(sb) => {
+                assert_eq!(sb.sb_leak_rate, leak);
+                assert_eq!(sb.sb_size, size);
+                // 640_000 × 400 = 256_000_000 bits/s
+                assert_eq!(sb.leak_rate_bits_per_second(), 256_000_000);
+                // 640_000 × 50 = 32_000_000 bytes/s
+                assert_eq!(sb.leak_rate_bytes_per_second(), 32_000_000);
+                assert_eq!(sb.buffer_size_bytes(), 49_152);
+            }
+            other => panic!("expected SmoothingBuffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smoothing_buffer_descriptor_zero_fields() {
+        // All-zero leak rate and size; reserved bits left at 0 too —
+        // both should still parse, since the reserved bits are ignored.
+        let block = tlv(0x10, &[0u8; 6]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::SmoothingBuffer(sb) => {
+                assert_eq!(sb.sb_leak_rate, 0);
+                assert_eq!(sb.sb_size, 0);
+                assert_eq!(sb.leak_rate_bits_per_second(), 0);
+                assert_eq!(sb.buffer_size_bytes(), 0);
+            }
+            other => panic!("expected SmoothingBuffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smoothing_buffer_descriptor_max_22bit_fields() {
+        // Both fields at their 22-bit ceilings (0x3F_FFFF). Confirms
+        // that the parser masks off reserved bits correctly and that
+        // the rate conversion stays inside `u64`.
+        let max22: u32 = 0x003F_FFFF;
+        let body = [0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8];
+        let block = tlv(0x10, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::SmoothingBuffer(sb) => {
+                assert_eq!(sb.sb_leak_rate, max22);
+                assert_eq!(sb.sb_size, max22);
+                assert_eq!(sb.leak_rate_bits_per_second(), (max22 as u64) * 400);
+                assert_eq!(sb.buffer_size_bytes(), max22 as u64);
+            }
+            other => panic!("expected SmoothingBuffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn smoothing_buffer_descriptor_short_body_falls_back_to_raw() {
+        // Five bytes is one short of the 6-byte payload.
+        let block = tlv(0x10, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data.len(), 5);
+    }
+
+    #[test]
+    fn smoothing_buffer_descriptor_lives_in_pmt_program_info() {
+        // A PMT's program_info block may carry a smoothing buffer
+        // descriptor alongside an ISO-639 language descriptor; check
+        // that `iter_descriptors` walks both and surfaces the typed
+        // smoothing-buffer body in mid-list.
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x0A, &[b'f', b'r', b'a', 0x00]));
+        let leak: u32 = 0x0001_0000; // 65_536 × 400 = 26_214_400 bits/s
+        let size: u32 = 0x0000_4000; // 16 KiB
+        let sb_body = [
+            ((leak >> 16) as u8) & 0b0011_1111,
+            (leak >> 8) as u8,
+            leak as u8,
+            ((size >> 16) as u8) & 0b0011_1111,
+            (size >> 8) as u8,
+            size as u8,
+        ];
+        block.extend_from_slice(&tlv(0x10, &sb_body));
+        block.extend_from_slice(&tlv(0x11, &[0b1111_1111]));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].tag, 0x0A);
+        assert_eq!(v[1].tag, 0x10);
+        match &v[1].body {
+            DescriptorBody::SmoothingBuffer(sb) => {
+                assert_eq!(sb.sb_leak_rate, leak);
+                assert_eq!(sb.sb_size, size);
+            }
+            other => panic!("expected SmoothingBuffer, got {other:?}"),
+        }
+        assert_eq!(v[2].tag, 0x11);
+        match &v[2].body {
+            DescriptorBody::Std(s) => assert!(s.leak_valid_flag),
             other => panic!("expected Std, got {other:?}"),
         }
     }
