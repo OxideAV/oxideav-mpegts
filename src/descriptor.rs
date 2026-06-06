@@ -26,6 +26,7 @@
 //! |--------|-----------------------------------|-----------------------------------------------|
 //! | `0x02` | video_stream_descriptor (§2.6.2)  | [`DescriptorBody::VideoStream`]              |
 //! | `0x03` | audio_stream_descriptor (§2.6.4)  | [`DescriptorBody::AudioStream`]              |
+//! | `0x04` | hierarchy_descriptor (§2.6.6)     | [`DescriptorBody::Hierarchy`]                |
 //! | `0x05` | registration_descriptor (§2.6.8)  | [`DescriptorBody::Registration`]             |
 //! | `0x06` | data_stream_alignment_descriptor (§2.6.10) | [`DescriptorBody::DataStreamAlignment`] |
 //! | `0x09` | CA_descriptor (§2.6.16)           | [`DescriptorBody::Ca`]                       |
@@ -62,6 +63,10 @@ pub enum DescriptorBody<'a> {
     VideoStream(VideoStreamDescriptor),
     /// `0x03` audio_stream_descriptor (§2.6.4).
     AudioStream(AudioStreamDescriptor),
+    /// `0x04` hierarchy_descriptor (§2.6.6) — links one program element
+    /// to its embedded base layer for hierarchically-coded video / audio
+    /// / private streams (Table 2-43).
+    Hierarchy(HierarchyDescriptor),
     /// `0x05` registration_descriptor (§2.6.8). `format_identifier` is
     /// a 4-byte ASCII code (e.g. `b"HDMV"` on Blu-ray) plus optional
     /// additional bytes whose semantics are scoped to the FOURCC.
@@ -126,6 +131,120 @@ pub struct AudioStreamDescriptor {
     pub layer: u8,
     /// `variable_rate_audio_indicator`.
     pub variable_rate_audio_indicator: bool,
+}
+
+/// hierarchy_descriptor body (§2.6.6 Table 2-43).
+///
+/// The descriptor labels one PMT entry as a layer in a hierarchically
+/// coded program — most commonly a video stream split into a base layer
+/// plus one or more enhancement layers (spatial / SNR / temporal /
+/// data-partitioning scalability per ITU-T H.262 | ISO/IEC 13818-2),
+/// but the framing also covers ISO/IEC 13818-3 audio extensions and
+/// 13818-1 private streams.
+///
+/// Wire payload (Table 2-43): exactly four bytes, two reserved bits
+/// then six payload bits in each. `hierarchy_layer_index` is a unique
+/// 6-bit index for this layer within the program;
+/// `hierarchy_embedded_layer_index` points at the layer this one
+/// depends on (undefined when `hierarchy_type == HierarchyType::BaseLayer`
+/// per §2.6.7); `hierarchy_channel` is the intended transmission
+/// channel rank — lower values are the more robust channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HierarchyDescriptor {
+    /// Typed `hierarchy_type` (Table 2-44). The wire value is preserved
+    /// in the [`HierarchyType::Reserved`] / [`HierarchyType::Unknown`]
+    /// variants for callers that need the raw nibble.
+    pub hierarchy_type: HierarchyType,
+    /// 6-bit `hierarchy_layer_index` — unique index of this layer in
+    /// the program's hierarchy table.
+    pub hierarchy_layer_index: u8,
+    /// 6-bit `hierarchy_embedded_layer_index` — index of the layer this
+    /// one is built on top of. Per §2.6.7 the value is **undefined**
+    /// when `hierarchy_type == HierarchyType::BaseLayer`; callers should
+    /// ignore it in that case rather than relying on the raw bits.
+    pub hierarchy_embedded_layer_index: u8,
+    /// 6-bit `hierarchy_channel` — the transmission channel number this
+    /// layer is intended to be carried on. The most robust channel is
+    /// the lowest value (§2.6.7).
+    pub hierarchy_channel: u8,
+}
+
+/// `hierarchy_type` values per Table 2-44.
+///
+/// The wire field is 4 bits; values 0 and 8..14 are reserved by the
+/// spec and surface as [`HierarchyType::Reserved`] preserving the raw
+/// nibble. Values outside the 0..=15 range cannot appear on the wire
+/// (the field is only four bits) but the parser still surfaces them as
+/// [`HierarchyType::Unknown`] for defensive coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyType {
+    /// `1` — ITU-T Rec. H.262 | ISO/IEC 13818-2 spatial scalability.
+    Mpeg2SpatialScalability,
+    /// `2` — ITU-T Rec. H.262 | ISO/IEC 13818-2 SNR scalability.
+    Mpeg2SnrScalability,
+    /// `3` — ITU-T Rec. H.262 | ISO/IEC 13818-2 temporal scalability.
+    Mpeg2TemporalScalability,
+    /// `4` — ITU-T Rec. H.262 | ISO/IEC 13818-2 data partitioning.
+    Mpeg2DataPartitioning,
+    /// `5` — ISO/IEC 13818-3 extension bitstream.
+    Mpeg2AudioExtension,
+    /// `6` — ITU-T Rec. H.222.0 | ISO/IEC 13818-1 private stream.
+    PrivateStream,
+    /// `7` — ITU-T Rec. H.262 | ISO/IEC 13818-2 multi-view profile.
+    Mpeg2MultiviewProfile,
+    /// `15` — Base layer; per §2.6.7 the embedded-layer-index field is
+    /// undefined when this variant is set.
+    BaseLayer,
+    /// `0` and `8..=14` — reserved by Table 2-44. The raw 4-bit nibble
+    /// is preserved verbatim.
+    Reserved(u8),
+    /// Out-of-range value (cannot occur on a conformant 4-bit wire
+    /// field; surfaces here only if a future caller constructs the
+    /// struct directly).
+    Unknown(u8),
+}
+
+impl HierarchyType {
+    /// Decode a 4-bit `hierarchy_type` nibble (only the low four bits
+    /// are examined; the high four bits, if any, are ignored).
+    pub fn from_nibble(value: u8) -> Self {
+        match value & 0x0F {
+            1 => HierarchyType::Mpeg2SpatialScalability,
+            2 => HierarchyType::Mpeg2SnrScalability,
+            3 => HierarchyType::Mpeg2TemporalScalability,
+            4 => HierarchyType::Mpeg2DataPartitioning,
+            5 => HierarchyType::Mpeg2AudioExtension,
+            6 => HierarchyType::PrivateStream,
+            7 => HierarchyType::Mpeg2MultiviewProfile,
+            15 => HierarchyType::BaseLayer,
+            other => HierarchyType::Reserved(other),
+        }
+    }
+
+    /// Raw 4-bit value as it would appear on the wire. For
+    /// [`HierarchyType::Unknown`] the stored value is returned verbatim
+    /// (and may exceed 0xF, indicating an internally-constructed
+    /// non-wire value).
+    pub fn as_nibble(self) -> u8 {
+        match self {
+            HierarchyType::Mpeg2SpatialScalability => 1,
+            HierarchyType::Mpeg2SnrScalability => 2,
+            HierarchyType::Mpeg2TemporalScalability => 3,
+            HierarchyType::Mpeg2DataPartitioning => 4,
+            HierarchyType::Mpeg2AudioExtension => 5,
+            HierarchyType::PrivateStream => 6,
+            HierarchyType::Mpeg2MultiviewProfile => 7,
+            HierarchyType::BaseLayer => 15,
+            HierarchyType::Reserved(v) => v & 0x0F,
+            HierarchyType::Unknown(v) => v,
+        }
+    }
+
+    /// `true` when this variant is the §2.6.7 base layer; the
+    /// `hierarchy_embedded_layer_index` field is undefined in that case.
+    pub fn is_base_layer(self) -> bool {
+        matches!(self, HierarchyType::BaseLayer)
+    }
 }
 
 /// CA_descriptor body (§2.6.16 Table 2-50).
@@ -407,6 +526,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
     match tag {
         0x02 => decode_video_stream(data).unwrap_or(DescriptorBody::Raw),
         0x03 => decode_audio_stream(data).unwrap_or(DescriptorBody::Raw),
+        0x04 => decode_hierarchy(data).unwrap_or(DescriptorBody::Raw),
         0x05 => decode_registration(data).unwrap_or(DescriptorBody::Raw),
         0x06 => decode_data_stream_alignment(data).unwrap_or(DescriptorBody::Raw),
         0x09 => decode_ca(data).unwrap_or(DescriptorBody::Raw),
@@ -468,6 +588,27 @@ fn decode_audio_stream(data: &[u8]) -> Option<DescriptorBody<'_>> {
         id,
         layer,
         variable_rate_audio_indicator,
+    }))
+}
+
+fn decode_hierarchy(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Table 2-43: four bytes total. Each carries two reserved high bits
+    // then a six-bit payload field. Byte 0 differs — the high nibble is
+    // reserved and the low nibble is the hierarchy_type. All four
+    // reserved chunks are ignored on the read path per §2.6 generic
+    // forwards-compatibility rules.
+    if data.len() < 4 {
+        return None;
+    }
+    let hierarchy_type = HierarchyType::from_nibble(data[0]);
+    let hierarchy_layer_index = data[1] & 0b0011_1111;
+    let hierarchy_embedded_layer_index = data[2] & 0b0011_1111;
+    let hierarchy_channel = data[3] & 0b0011_1111;
+    Some(DescriptorBody::Hierarchy(HierarchyDescriptor {
+        hierarchy_type,
+        hierarchy_layer_index,
+        hierarchy_embedded_layer_index,
+        hierarchy_channel,
     }))
 }
 
@@ -1275,6 +1416,183 @@ mod tests {
         }
         assert_eq!(v[2].tag, 0x10);
         assert!(matches!(v[2].body, DescriptorBody::SmoothingBuffer(_)));
+    }
+
+    #[test]
+    fn hierarchy_descriptor_spatial_scalability_layer() {
+        // hierarchy_type = 1 (spatial scalability), layer_index = 5,
+        // embedded_layer_index = 15, channel = 0 (most robust).
+        // Reserved bits set to 1 so the parser must mask them off.
+        let body = [
+            0b1111_0001,      // reserved=1111 | hierarchy_type=0001
+            0b1100_0000 | 5,  // reserved=11 | layer_index=000101
+            0b1100_0000 | 15, // reserved=11 | embedded_layer_index=001111
+            0b1100_0000,      // reserved=11 | hierarchy_channel=000000
+        ];
+        let block = tlv(0x04, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Hierarchy(h) => {
+                assert_eq!(h.hierarchy_type, HierarchyType::Mpeg2SpatialScalability);
+                assert_eq!(h.hierarchy_type.as_nibble(), 1);
+                assert!(!h.hierarchy_type.is_base_layer());
+                assert_eq!(h.hierarchy_layer_index, 5);
+                assert_eq!(h.hierarchy_embedded_layer_index, 15);
+                assert_eq!(h.hierarchy_channel, 0);
+            }
+            other => panic!("expected Hierarchy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hierarchy_descriptor_base_layer_marker() {
+        // hierarchy_type = 15 (base layer). Per §2.6.7 the
+        // embedded_layer_index is undefined; the parser still surfaces
+        // whatever the wire bytes carry, and `is_base_layer` reports
+        // `true` so the caller knows to disregard it.
+        let body = [
+            0b0000_1111, // reserved=0000 | hierarchy_type=1111
+            0b0000_0001, // layer_index = 1
+            0b0011_1111, // embedded_layer_index = 0x3F (undefined per §2.6.7)
+            0b0000_0010, // hierarchy_channel = 2
+        ];
+        let block = tlv(0x04, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Hierarchy(h) => {
+                assert_eq!(h.hierarchy_type, HierarchyType::BaseLayer);
+                assert!(h.hierarchy_type.is_base_layer());
+                assert_eq!(h.hierarchy_layer_index, 1);
+                assert_eq!(h.hierarchy_embedded_layer_index, 0x3F);
+                assert_eq!(h.hierarchy_channel, 2);
+            }
+            other => panic!("expected Hierarchy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hierarchy_descriptor_all_typed_variants_round_trip() {
+        // Walk every Table 2-44 mapping that has a named variant: 1..7
+        // and 15. Confirm `from_nibble` round-trips through `as_nibble`
+        // for each.
+        let mapped = [
+            (1u8, HierarchyType::Mpeg2SpatialScalability),
+            (2, HierarchyType::Mpeg2SnrScalability),
+            (3, HierarchyType::Mpeg2TemporalScalability),
+            (4, HierarchyType::Mpeg2DataPartitioning),
+            (5, HierarchyType::Mpeg2AudioExtension),
+            (6, HierarchyType::PrivateStream),
+            (7, HierarchyType::Mpeg2MultiviewProfile),
+            (15, HierarchyType::BaseLayer),
+        ];
+        for (raw, expected) in mapped {
+            let decoded = HierarchyType::from_nibble(raw);
+            assert_eq!(decoded, expected, "wire nibble {raw}");
+            assert_eq!(decoded.as_nibble(), raw, "round-trip for {raw}");
+        }
+        assert!(HierarchyType::BaseLayer.is_base_layer());
+        // None of the non-base mappings flip `is_base_layer`.
+        for (_, t) in mapped[..7].iter().copied() {
+            assert!(!t.is_base_layer());
+        }
+    }
+
+    #[test]
+    fn hierarchy_descriptor_reserved_values_preserve_raw_nibble() {
+        // Values 0 and 8..=14 are reserved per Table 2-44. The parser
+        // must keep them round-trippable so a caller can tell which
+        // reserved nibble showed up on the wire.
+        for raw in [0u8, 8, 9, 10, 11, 12, 13, 14] {
+            let decoded = HierarchyType::from_nibble(raw);
+            assert_eq!(decoded, HierarchyType::Reserved(raw));
+            assert_eq!(decoded.as_nibble(), raw);
+            assert!(!decoded.is_base_layer());
+        }
+        // The Unknown variant is only reachable when callers build a
+        // value directly; `as_nibble` preserves whatever they stored.
+        assert_eq!(HierarchyType::Unknown(0xAB).as_nibble(), 0xAB);
+    }
+
+    #[test]
+    fn hierarchy_descriptor_high_nibble_ignored_in_type_byte() {
+        // The high four bits of byte 0 are reserved. Whatever value they
+        // carry, the parser must mask them off before consulting
+        // Table 2-44.
+        let body = [0b1010_0011, 0, 0, 0]; // high nibble = 1010 → ignore
+        let block = tlv(0x04, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Hierarchy(h) => {
+                assert_eq!(h.hierarchy_type, HierarchyType::Mpeg2TemporalScalability);
+            }
+            other => panic!("expected Hierarchy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hierarchy_descriptor_short_body_falls_back_to_raw() {
+        // Three bytes — one short of the four-byte Table 2-43 payload.
+        let block = tlv(0x04, &[0x0F, 0xC0, 0xC0]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &[0x0F, 0xC0, 0xC0]);
+    }
+
+    #[test]
+    fn hierarchy_descriptor_max_6bit_index_fields() {
+        // Layer / embedded-layer / channel each saturated at the 6-bit
+        // ceiling (0x3F). Reserved high bits left at 1 to verify the
+        // mask. hierarchy_type = 2 (SNR scalability).
+        let body = [
+            0b0000_0010, // reserved=0 | hierarchy_type=0010
+            0xFF,        // reserved=11 | layer_index=111111 = 63
+            0xFF,        // reserved=11 | embedded_layer_index=111111 = 63
+            0xFF,        // reserved=11 | hierarchy_channel=111111 = 63
+        ];
+        let block = tlv(0x04, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Hierarchy(h) => {
+                assert_eq!(h.hierarchy_type, HierarchyType::Mpeg2SnrScalability);
+                assert_eq!(h.hierarchy_layer_index, 0x3F);
+                assert_eq!(h.hierarchy_embedded_layer_index, 0x3F);
+                assert_eq!(h.hierarchy_channel, 0x3F);
+            }
+            other => panic!("expected Hierarchy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hierarchy_descriptor_in_pmt_es_info_alongside_other_tags() {
+        // Realistic ES_info block on an enhancement-layer PMT entry:
+        // ISO-639 language + hierarchy + max-bitrate. The hierarchy
+        // descriptor lands mid-list and surfaces its typed body without
+        // disturbing neighbours.
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x0A, &[b'e', b'n', b'g', 0x00]));
+        let h_body = [
+            0b0000_0001, // hierarchy_type = spatial scalability
+            0b0000_0010, // layer_index = 2
+            0b0000_0000, // embedded_layer_index = 0 (base)
+            0b0000_0001, // hierarchy_channel = 1
+        ];
+        block.extend_from_slice(&tlv(0x04, &h_body));
+        block.extend_from_slice(&tlv(0x0E, &[0b1100_0000, 0x00, 0x64]));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].tag, 0x0A);
+        assert_eq!(v[1].tag, 0x04);
+        match &v[1].body {
+            DescriptorBody::Hierarchy(h) => {
+                assert_eq!(h.hierarchy_type, HierarchyType::Mpeg2SpatialScalability);
+                assert_eq!(h.hierarchy_layer_index, 2);
+                assert_eq!(h.hierarchy_embedded_layer_index, 0);
+                assert_eq!(h.hierarchy_channel, 1);
+            }
+            other => panic!("expected Hierarchy, got {other:?}"),
+        }
+        assert_eq!(v[2].tag, 0x0E);
+        assert!(matches!(v[2].body, DescriptorBody::MaximumBitrate(_)));
     }
 
     #[test]

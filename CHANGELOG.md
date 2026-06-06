@@ -11,6 +11,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `HierarchyDescriptor` + `HierarchyType` — typed view of the §2.6.6
+  hierarchy_descriptor (tag `0x04`, Table 2-43). Surfaces the
+  four-byte body — `hierarchy_type` (Table 2-44, full 8-variant
+  mapping for the 1..7 + 15 named values plus `Reserved(u8)` for the
+  Table 2-44 `0` / `8..=14` reserved range), `hierarchy_layer_index`,
+  `hierarchy_embedded_layer_index` (undefined per §2.6.7 when the
+  type is `BaseLayer` — `HierarchyType::is_base_layer()` flags that
+  case), and `hierarchy_channel`. Reserved bits on every byte are
+  masked off on the read path so a non-zero reservation doesn't
+  corrupt the parse; bodies shorter than four bytes fall back to
+  `DescriptorBody::Raw`. Wired through `PmtStream::iter_descriptors`
+  and `ProgramMapTable::iter_program_descriptors` alongside the
+  existing tag set.
 - `CopyrightDescriptor` — typed view of the §2.6.24
   copyright_descriptor (tag `0x0D`, Table 2-56). Surfaces the 32-bit
   `copyright_identifier` (issued by the §2.9 Registration Authority)
