@@ -32,6 +32,7 @@
 //! | `0x09` | CA_descriptor (§2.6.16)           | [`DescriptorBody::Ca`]                       |
 //! | `0x0A` | ISO_639_language_descriptor (§2.6.18) | [`DescriptorBody::Iso639Language`]       |
 //! | `0x0B` | system_clock_descriptor (§2.6.20) | [`DescriptorBody::SystemClock`]              |
+//! | `0x0C` | multiplex_buffer_utilization_descriptor (§2.6.22) | [`DescriptorBody::MultiplexBufferUtilization`] |
 //! | `0x0D` | copyright_descriptor (§2.6.24)    | [`DescriptorBody::Copyright`]                |
 //! | `0x0E` | maximum_bitrate_descriptor (§2.6.26) | [`DescriptorBody::MaximumBitrate`]        |
 //! | `0x10` | smoothing_buffer_descriptor (§2.6.30) | [`DescriptorBody::SmoothingBuffer`]      |
@@ -82,6 +83,8 @@ pub enum DescriptorBody<'a> {
     Iso639Language(Vec<Iso639Language>),
     /// `0x0B` system_clock_descriptor (§2.6.20).
     SystemClock(SystemClockDescriptor),
+    /// `0x0C` multiplex_buffer_utilization_descriptor (§2.6.22).
+    MultiplexBufferUtilization(MultiplexBufferUtilizationDescriptor),
     /// `0x0D` copyright_descriptor (§2.6.24).
     Copyright(CopyrightDescriptor<'a>),
     /// `0x0E` maximum_bitrate_descriptor (§2.6.26).
@@ -427,6 +430,52 @@ pub struct StdDescriptor {
     pub leak_valid_flag: bool,
 }
 
+/// multiplex_buffer_utilization_descriptor body (§2.6.22 Table 2-55).
+///
+/// An optional PMT descriptor that bounds the LTW (legal time window)
+/// offset values a re-multiplexer can expect to see for the program
+/// element(s) the descriptor refers to. Per §2.6.23:
+///
+/// * `bound_valid_flag = 0` marks the two bound fields as undefined —
+///   callers must ignore them in that case.
+/// * `bound_valid_flag = 1` makes both bounds valid. Each bound is in
+///   units of `(27 MHz / 300) = 90 kHz` clock periods (the LTW_offset
+///   unit defined in §2.4.3.4) and bounds the value any future
+///   `ltw_offset` field would carry on this stream until the next
+///   occurrence of this descriptor.
+///
+/// On the wire the body is exactly 4 bytes:
+///
+/// ```text
+/// byte 0: bound_valid_flag (1) | LTW_offset_lower_bound bits 14..8  (7)
+/// byte 1: LTW_offset_lower_bound bits 7..0                          (8)
+/// byte 2: reserved          (1) | LTW_offset_upper_bound bits 14..8 (7)
+/// byte 3: LTW_offset_upper_bound bits 7..0                          (8)
+/// ```
+///
+/// **Spec note.** The §2.6.22 Table 2-55 syntax row labels
+/// `LTW_offset_upper_bound` as a 14-bit field, but the surrounding
+/// semantic text (§2.6.23) describes it as a 15-bit field — the same
+/// width as the adaptation-field `ltw_offset` in §2.4.3.4 / Table 2-7.
+/// Together with the fixed reserved bit before the upper bound, the
+/// 15-bit width is the only width that lets the body sum to a clean
+/// four-byte boundary (`1 + 15 + 1 + 15 = 32`). This parser follows the
+/// 15-bit reading because it matches both the semantic text and the
+/// adaptation-field source field; a future spec corrigendum is the
+/// expected path to close the typo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiplexBufferUtilizationDescriptor {
+    /// `bound_valid_flag` — when `false`, the two bound fields are
+    /// undefined and callers should ignore them.
+    pub bound_valid_flag: bool,
+    /// Raw 15-bit `LTW_offset_lower_bound` value (units of 90 kHz clock
+    /// periods). Meaningful only when `bound_valid_flag == true`.
+    pub ltw_offset_lower_bound: u16,
+    /// Raw 15-bit `LTW_offset_upper_bound` value (units of 90 kHz clock
+    /// periods). Meaningful only when `bound_valid_flag == true`.
+    pub ltw_offset_upper_bound: u16,
+}
+
 /// HEVC_video_descriptor body (Amd. 3 §2.6.95 Table 2-96).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HevcVideoDescriptor {
@@ -532,6 +581,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x09 => decode_ca(data).unwrap_or(DescriptorBody::Raw),
         0x0A => decode_iso639_language(data).unwrap_or(DescriptorBody::Raw),
         0x0B => decode_system_clock(data).unwrap_or(DescriptorBody::Raw),
+        0x0C => decode_multiplex_buffer_utilization(data).unwrap_or(DescriptorBody::Raw),
         0x0D => decode_copyright(data).unwrap_or(DescriptorBody::Raw),
         0x0E => decode_maximum_bitrate(data).unwrap_or(DescriptorBody::Raw),
         0x10 => decode_smoothing_buffer(data).unwrap_or(DescriptorBody::Raw),
@@ -681,6 +731,31 @@ fn decode_system_clock(data: &[u8]) -> Option<DescriptorBody<'_>> {
         clock_accuracy_integer,
         clock_accuracy_exponent,
     }))
+}
+
+fn decode_multiplex_buffer_utilization(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Four-byte payload (Table 2-55, with the §2.6.23 15-bit-upper-bound
+    // reading documented on the struct):
+    //   byte 0: bound_valid_flag (1) | LTW_offset_lower_bound bits 14..8 (7)
+    //   byte 1: LTW_offset_lower_bound bits 7..0                         (8)
+    //   byte 2: reserved          (1) | LTW_offset_upper_bound bits 14..8 (7)
+    //   byte 3: LTW_offset_upper_bound bits 7..0                         (8)
+    // Both bounds are big-endian 15-bit unsigneds packed against the LSB
+    // of their leading byte. Reserved bits in byte 2 are ignored on the
+    // read path per §2.6 forwards-compatibility.
+    if data.len() < 4 {
+        return None;
+    }
+    let bound_valid_flag = (data[0] & 0b1000_0000) != 0;
+    let ltw_offset_lower_bound = (((data[0] & 0b0111_1111) as u16) << 8) | (data[1] as u16);
+    let ltw_offset_upper_bound = (((data[2] & 0b0111_1111) as u16) << 8) | (data[3] as u16);
+    Some(DescriptorBody::MultiplexBufferUtilization(
+        MultiplexBufferUtilizationDescriptor {
+            bound_valid_flag,
+            ltw_offset_lower_bound,
+            ltw_offset_upper_bound,
+        },
+    ))
 }
 
 fn decode_copyright(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -1593,6 +1668,133 @@ mod tests {
         }
         assert_eq!(v[2].tag, 0x0E);
         assert!(matches!(v[2].body, DescriptorBody::MaximumBitrate(_)));
+    }
+
+    #[test]
+    fn multiplex_buffer_utilization_descriptor_bounds_valid() {
+        // bound_valid=1; pick two distinct 15-bit values that exercise
+        // both halves of each bound. The 7-bit-then-8-bit packing means
+        // byte 0 carries bits 14..8 of the lower bound (high 7 bits)
+        // and byte 1 carries bits 7..0 (low 8 bits); same for byte 2/3.
+        let lower: u16 = 0x1234; // 15-bit clean (top bit 0)
+        let upper: u16 = 0x5678; // 15-bit clean (top bit 0)
+        let body = [
+            0x80 | ((lower >> 8) as u8 & 0x7F),
+            lower as u8,
+            (upper >> 8) as u8 & 0x7F,
+            upper as u8,
+        ];
+        let block = tlv(0x0C, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::MultiplexBufferUtilization(m) => {
+                assert!(m.bound_valid_flag);
+                assert_eq!(m.ltw_offset_lower_bound, lower);
+                assert_eq!(m.ltw_offset_upper_bound, upper);
+            }
+            other => panic!("expected MultiplexBufferUtilization, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiplex_buffer_utilization_descriptor_bounds_invalid() {
+        // bound_valid=0 -- bound fields are still surfaced verbatim per
+        // §2.6.23 ("undefined when flag = 0"), but the caller is expected
+        // to discard them. We still verify the parser doesn't crash on a
+        // populated body.
+        let body = [0x7F, 0xFF, 0x7F, 0xFF];
+        let block = tlv(0x0C, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::MultiplexBufferUtilization(m) => {
+                assert!(!m.bound_valid_flag);
+                assert_eq!(m.ltw_offset_lower_bound, 0x7FFF);
+                assert_eq!(m.ltw_offset_upper_bound, 0x7FFF);
+            }
+            other => panic!("expected MultiplexBufferUtilization, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiplex_buffer_utilization_descriptor_short_body_falls_back_to_raw() {
+        // Three bytes — one short of the four-byte Table 2-55 payload.
+        let block = tlv(0x0C, &[0xA0, 0x00, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &[0xA0, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn multiplex_buffer_utilization_descriptor_reserved_bit_ignored_on_read() {
+        // The reserved bit at byte 2 MSB is ignored. Set bound_valid=1 +
+        // a clean lower bound, and flip the reserved bit both ways on
+        // the upper-bound byte — the upper bound must read the same.
+        let lower = 0x0000u16;
+        let upper = 0x0001u16; // smallest non-zero value
+        let with_reserved_zero = [0x80, 0x00, (upper >> 8) as u8, upper as u8];
+        let with_reserved_one = [0x80, 0x00, ((upper >> 8) as u8) | 0x80, upper as u8];
+        let block0 = tlv(0x0C, &with_reserved_zero);
+        let block1 = tlv(0x0C, &with_reserved_one);
+        let d0 = iter_descriptors(&block0).next().unwrap().unwrap();
+        let d1 = iter_descriptors(&block1).next().unwrap().unwrap();
+        let unwrap = |b: &DescriptorBody<'_>| match b {
+            DescriptorBody::MultiplexBufferUtilization(m) => *m,
+            other => panic!("expected MultiplexBufferUtilization, got {other:?}"),
+        };
+        let m0 = unwrap(&d0.body);
+        let m1 = unwrap(&d1.body);
+        assert_eq!(m0.ltw_offset_lower_bound, lower);
+        assert_eq!(m0.ltw_offset_upper_bound, upper);
+        assert_eq!(m0, m1);
+    }
+
+    #[test]
+    fn multiplex_buffer_utilization_descriptor_max_15bit_bounds() {
+        // Saturate both bounds at the 15-bit ceiling (0x7FFF), with
+        // bound_valid=1.
+        // byte 0: 1 | 0x7F            = 0xFF
+        // byte 1: 0xFF                = 0xFF
+        // byte 2: reserved=1 | 0x7F   = 0xFF
+        // byte 3: 0xFF                = 0xFF
+        let body = [0xFF, 0xFF, 0xFF, 0xFF];
+        let block = tlv(0x0C, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::MultiplexBufferUtilization(m) => {
+                assert!(m.bound_valid_flag);
+                assert_eq!(m.ltw_offset_lower_bound, 0x7FFF);
+                assert_eq!(m.ltw_offset_upper_bound, 0x7FFF);
+            }
+            other => panic!("expected MultiplexBufferUtilization, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiplex_buffer_utilization_descriptor_in_es_info_list() {
+        // Realistic PMT ES_info block: language + smoothing-buffer +
+        // multiplex-buffer-utilization. The 0x0C descriptor lands at the
+        // end and decodes alongside neighbours without disturbing them.
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x0A, &[b'e', b'n', b'g', 0x00]));
+        // smoothing_buffer: leak_rate = 0x010203, sb_size = 0x040506
+        block.extend_from_slice(&tlv(0x10, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]));
+        // multiplex_buffer_utilization: bound_valid=1, lower=0x0100, upper=0x0200
+        // byte 0 = 0x80 | (0x0100 >> 8) = 0x81 ; byte 1 = 0x00
+        // byte 2 = (0x0200 >> 8) = 0x02 ; byte 3 = 0x00
+        block.extend_from_slice(&tlv(0x0C, &[0x81, 0x00, 0x02, 0x00]));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].tag, 0x0A);
+        assert_eq!(v[1].tag, 0x10);
+        assert_eq!(v[2].tag, 0x0C);
+        match &v[2].body {
+            DescriptorBody::MultiplexBufferUtilization(m) => {
+                assert!(m.bound_valid_flag);
+                assert_eq!(m.ltw_offset_lower_bound, 0x0100);
+                assert_eq!(m.ltw_offset_upper_bound, 0x0200);
+            }
+            other => panic!("expected MultiplexBufferUtilization, got {other:?}"),
+        }
     }
 
     #[test]

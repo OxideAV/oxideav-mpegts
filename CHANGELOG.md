@@ -11,6 +11,21 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `MultiplexBufferUtilizationDescriptor` — typed view of the §2.6.22
+  multiplex_buffer_utilization_descriptor (tag `0x0C`, Table 2-55).
+  Surfaces the four-byte body as `bound_valid_flag`,
+  `ltw_offset_lower_bound`, and `ltw_offset_upper_bound`. Both bounds
+  are 15-bit values in units of 90 kHz clock periods (the LTW_offset
+  unit defined in §2.4.3.4). Reserved bits on byte 2 are ignored on
+  the read path so a non-zero reservation doesn't corrupt the parse;
+  bodies shorter than four bytes fall back to `DescriptorBody::Raw`.
+  Wired through `PmtStream::iter_descriptors` and
+  `ProgramMapTable::iter_program_descriptors` alongside the existing
+  tag set. The 15-bit upper-bound width follows the §2.6.23 semantic
+  text (which describes the field as 15-bit) and the adaptation-field
+  `ltw_offset` width in §2.4.3.4; the Table 2-55 syntax row's 14-bit
+  label leaves the body summing to 31 bits, which can't terminate on
+  a clean byte boundary, so the 15-bit reading is the consistent one.
 - `HierarchyDescriptor` + `HierarchyType` — typed view of the §2.6.6
   hierarchy_descriptor (tag `0x04`, Table 2-43). Surfaces the
   four-byte body — `hierarchy_type` (Table 2-44, full 8-variant
