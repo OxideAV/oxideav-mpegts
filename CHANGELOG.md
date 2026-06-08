@@ -11,6 +11,17 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `IbpDescriptor` — typed view of the §2.6.34 IBP_descriptor (tag
+  `0x12`, Table 2-61). Surfaces the two-byte body as `closed_gop_flag`,
+  `identical_gop_flag`, and the 14-bit `max_gop_length` (big-endian,
+  packed against the LSB of the leading byte). Spec §2.6.35 forbids
+  `max_gop_length == 0`; the parser still surfaces the value rather
+  than dropping it, and exposes the well-formed predicate via
+  `IbpDescriptor::is_well_formed` so callers can detect malformed
+  streams. Bodies shorter than the two-byte fixed payload fall back
+  to `DescriptorBody::Raw`. Wired through `PmtStream::iter_descriptors`
+  and `ProgramMapTable::iter_program_descriptors` alongside the
+  existing tag set.
 - `MultiplexBufferUtilizationDescriptor` — typed view of the §2.6.22
   multiplex_buffer_utilization_descriptor (tag `0x0C`, Table 2-55).
   Surfaces the four-byte body as `bound_valid_flag`,

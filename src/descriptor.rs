@@ -37,6 +37,7 @@
 //! | `0x0E` | maximum_bitrate_descriptor (§2.6.26) | [`DescriptorBody::MaximumBitrate`]        |
 //! | `0x10` | smoothing_buffer_descriptor (§2.6.30) | [`DescriptorBody::SmoothingBuffer`]      |
 //! | `0x11` | STD_descriptor (§2.6.32)          | [`DescriptorBody::Std`]                      |
+//! | `0x12` | IBP_descriptor (§2.6.34)          | [`DescriptorBody::Ibp`]                      |
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
 //!
@@ -93,6 +94,9 @@ pub enum DescriptorBody<'a> {
     SmoothingBuffer(SmoothingBufferDescriptor),
     /// `0x11` STD_descriptor (§2.6.32).
     Std(StdDescriptor),
+    /// `0x12` IBP_descriptor (§2.6.34) — GOP-structure hints for the
+    /// associated video elementary stream (Table 2-61).
+    Ibp(IbpDescriptor),
     /// `0x28` AVC_video_descriptor (§2.6.64).
     AvcVideo(AvcVideoDescriptor),
     /// `0x38` HEVC_video_descriptor (Amd. 3 §2.6.95).
@@ -476,6 +480,54 @@ pub struct MultiplexBufferUtilizationDescriptor {
     pub ltw_offset_upper_bound: u16,
 }
 
+/// IBP_descriptor body (§2.6.34 Table 2-61).
+///
+/// Optional PMT-resident descriptor that summarises the GOP structure
+/// of the associated video elementary stream. Two boolean hints plus a
+/// 14-bit GOP-length cap let a downstream consumer pre-allocate
+/// reorder buffers and seek-index slots without first scanning the
+/// elementary stream.
+///
+/// On the wire the body is exactly 2 bytes:
+///
+/// ```text
+/// byte 0: closed_gop_flag    (1)
+///       | identical_gop_flag (1)
+///       | max_gop_length bits 13..8 (6)
+/// byte 1: max_gop_length bits 7..0   (8)
+/// ```
+///
+/// Per §2.6.35:
+///
+/// * `closed_gop_flag = 1` — a GOP header is encoded before every
+///   I-frame and every such GOP carries `closed_gop = 1`.
+/// * `identical_gop_flag = 1` — the picture-type sequence between any
+///   two I-pictures is identical throughout the stream (except possibly
+///   for pictures up to the second I-picture).
+/// * `max_gop_length` — maximum number of coded pictures between any
+///   two consecutive I-pictures in the sequence. The value `0` is
+///   forbidden by the spec; [`Self::is_well_formed`] flags that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IbpDescriptor {
+    /// `closed_gop_flag` (1 bit).
+    pub closed_gop_flag: bool,
+    /// `identical_gop_flag` (1 bit).
+    pub identical_gop_flag: bool,
+    /// `max_gop_length` (14 bits). Spec forbids `0`; see
+    /// [`Self::is_well_formed`].
+    pub max_gop_length: u16,
+}
+
+impl IbpDescriptor {
+    /// `true` when `max_gop_length` carries a spec-legal non-zero value.
+    /// `false` flags the §2.6.35 "value of 0 is forbidden" condition,
+    /// which the parser still surfaces so callers can detect malformed
+    /// streams rather than silently substituting a sentinel.
+    pub fn is_well_formed(self) -> bool {
+        self.max_gop_length != 0
+    }
+}
+
 /// HEVC_video_descriptor body (Amd. 3 §2.6.95 Table 2-96).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HevcVideoDescriptor {
@@ -586,6 +638,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x0E => decode_maximum_bitrate(data).unwrap_or(DescriptorBody::Raw),
         0x10 => decode_smoothing_buffer(data).unwrap_or(DescriptorBody::Raw),
         0x11 => decode_std(data).unwrap_or(DescriptorBody::Raw),
+        0x12 => decode_ibp(data).unwrap_or(DescriptorBody::Raw),
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
@@ -813,6 +866,28 @@ fn decode_std(data: &[u8]) -> Option<DescriptorBody<'_>> {
     }
     Some(DescriptorBody::Std(StdDescriptor {
         leak_valid_flag: (data[0] & 0b0000_0001) != 0,
+    }))
+}
+
+fn decode_ibp(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Two-byte payload (Table 2-61):
+    //   byte 0: closed_gop_flag    (1)
+    //         | identical_gop_flag (1)
+    //         | max_gop_length bits 13..8 (6)
+    //   byte 1: max_gop_length bits 7..0 (8)
+    // max_gop_length is a big-endian 14-bit unsigned; spec §2.6.35
+    // forbids the value 0 but the parser still surfaces it so callers
+    // can detect malformed streams via IbpDescriptor::is_well_formed.
+    if data.len() < 2 {
+        return None;
+    }
+    let closed_gop_flag = (data[0] & 0b1000_0000) != 0;
+    let identical_gop_flag = (data[0] & 0b0100_0000) != 0;
+    let max_gop_length = (((data[0] & 0b0011_1111) as u16) << 8) | (data[1] as u16);
+    Some(DescriptorBody::Ibp(IbpDescriptor {
+        closed_gop_flag,
+        identical_gop_flag,
+        max_gop_length,
     }))
 }
 
@@ -1810,5 +1885,131 @@ mod tests {
         assert_eq!(v[2].tag, 0xFF);
         assert!(matches!(v[2].body, DescriptorBody::Raw));
         assert!(v[2].data.is_empty());
+    }
+
+    #[test]
+    fn ibp_descriptor_all_flags_set_max_length() {
+        // closed=1, identical=1, max_gop_length = 0x3FFF (largest 14-bit).
+        // byte 0: 1 | 1 | 0x3F          = 0xFF
+        // byte 1: 0xFF                  = 0xFF
+        let block = tlv(0x12, &[0xFF, 0xFF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x12);
+        match &d.body {
+            DescriptorBody::Ibp(ibp) => {
+                assert!(ibp.closed_gop_flag);
+                assert!(ibp.identical_gop_flag);
+                assert_eq!(ibp.max_gop_length, 0x3FFF);
+                assert!(ibp.is_well_formed());
+            }
+            other => panic!("expected Ibp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ibp_descriptor_flags_clear_typical_length() {
+        // closed=0, identical=0, max_gop_length = 15 (typical IBP GOP of 15).
+        // byte 0: 0 | 0 | 0x00          = 0x00
+        // byte 1: 0x0F                  = 0x0F
+        let block = tlv(0x12, &[0x00, 0x0F]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Ibp(ibp) => {
+                assert!(!ibp.closed_gop_flag);
+                assert!(!ibp.identical_gop_flag);
+                assert_eq!(ibp.max_gop_length, 15);
+                assert!(ibp.is_well_formed());
+            }
+            other => panic!("expected Ibp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ibp_descriptor_closed_only_mid_length() {
+        // closed=1, identical=0, max_gop_length = 0x012C (300).
+        // byte 0: 1 | 0 | (0x012C >> 8 = 0x01)  = 0x81
+        // byte 1: 0x2C                           = 0x2C
+        let block = tlv(0x12, &[0x81, 0x2C]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Ibp(ibp) => {
+                assert!(ibp.closed_gop_flag);
+                assert!(!ibp.identical_gop_flag);
+                assert_eq!(ibp.max_gop_length, 0x012C);
+            }
+            other => panic!("expected Ibp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ibp_descriptor_identical_only_mid_length() {
+        // closed=0, identical=1, max_gop_length = 0x002A (42).
+        // byte 0: 0 | 1 | 0x00          = 0x40
+        // byte 1: 0x2A                  = 0x2A
+        let block = tlv(0x12, &[0x40, 0x2A]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Ibp(ibp) => {
+                assert!(!ibp.closed_gop_flag);
+                assert!(ibp.identical_gop_flag);
+                assert_eq!(ibp.max_gop_length, 42);
+            }
+            other => panic!("expected Ibp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ibp_descriptor_forbidden_zero_max_gop_length_flagged() {
+        // Spec §2.6.35 forbids max_gop_length = 0; parser still surfaces
+        // the value so callers can detect malformed streams.
+        let block = tlv(0x12, &[0x00, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::Ibp(ibp) => {
+                assert_eq!(ibp.max_gop_length, 0);
+                assert!(!ibp.is_well_formed());
+            }
+            other => panic!("expected Ibp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ibp_descriptor_truncated_falls_back_to_raw() {
+        // 1-byte body — short of the fixed 2-byte payload, so the
+        // typed decoder declines and the generic TLV layer keeps the
+        // raw bytes.
+        let block = tlv(0x12, &[0xFF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x12);
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &[0xFF]);
+    }
+
+    #[test]
+    fn ibp_descriptor_in_es_info_list_with_neighbours() {
+        // Realistic PMT ES_info block carrying language + STD + IBP.
+        // The IBP record lands in the middle and decodes alongside
+        // neighbours without disturbing them.
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x0A, &[b'e', b'n', b'g', 0x00]));
+        // ibp: closed=1, identical=0, max_gop_length=18 (typical
+        // broadcast-MPEG-2 closed-GOP cadence).
+        block.extend_from_slice(&tlv(0x12, &[0x80, 0x12]));
+        // STD: leak_valid_flag=1
+        block.extend_from_slice(&tlv(0x11, &[0x01]));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].tag, 0x0A);
+        assert_eq!(v[1].tag, 0x12);
+        assert_eq!(v[2].tag, 0x11);
+        match &v[1].body {
+            DescriptorBody::Ibp(ibp) => {
+                assert!(ibp.closed_gop_flag);
+                assert!(!ibp.identical_gop_flag);
+                assert_eq!(ibp.max_gop_length, 18);
+                assert!(ibp.is_well_formed());
+            }
+            other => panic!("expected Ibp, got {other:?}"),
+        }
     }
 }
