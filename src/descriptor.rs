@@ -29,6 +29,7 @@
 //! | `0x04` | hierarchy_descriptor (§2.6.6)     | [`DescriptorBody::Hierarchy`]                |
 //! | `0x05` | registration_descriptor (§2.6.8)  | [`DescriptorBody::Registration`]             |
 //! | `0x06` | data_stream_alignment_descriptor (§2.6.10) | [`DescriptorBody::DataStreamAlignment`] |
+//! | `0x07` | target_background_grid_descriptor (§2.6.12) | [`DescriptorBody::TargetBackgroundGrid`] |
 //! | `0x09` | CA_descriptor (§2.6.16)           | [`DescriptorBody::Ca`]                       |
 //! | `0x0A` | ISO_639_language_descriptor (§2.6.18) | [`DescriptorBody::Iso639Language`]       |
 //! | `0x0B` | system_clock_descriptor (§2.6.20) | [`DescriptorBody::SystemClock`]              |
@@ -78,6 +79,11 @@ pub enum DescriptorBody<'a> {
     },
     /// `0x06` data_stream_alignment_descriptor (§2.6.10).
     DataStreamAlignment(DataStreamAlignmentDescriptor),
+    /// `0x07` target_background_grid_descriptor (§2.6.12) — describes a
+    /// grid of unit pixels projected onto the display area, against which
+    /// a paired video_window_descriptor places the stream's window
+    /// (Table 2-49).
+    TargetBackgroundGrid(TargetBackgroundGridDescriptor),
     /// `0x09` CA_descriptor (§2.6.16) — Conditional Access PID + system.
     Ca(CaDescriptor<'a>),
     /// `0x0A` ISO_639_language_descriptor (§2.6.18).
@@ -315,6 +321,44 @@ pub struct AvcVideoDescriptor {
 pub struct DataStreamAlignmentDescriptor {
     /// Raw 8-bit `alignment_type` byte (Tables 2-47 / 2-48).
     pub alignment_type: u8,
+}
+
+/// target_background_grid_descriptor body (§2.6.12 Table 2-49).
+///
+/// Describes a grid of unit pixels projected onto the display area
+/// (e.g. a monitor) for a video stream that is not intended to occupy
+/// the full display. A paired video_window_descriptor (§2.6.14) then
+/// places the stream's window on this grid. Per §2.6.13:
+///
+/// * `horizontal_size` — horizontal size of the target background grid
+///   in pixels.
+/// * `vertical_size` — vertical size of the target background grid in
+///   pixels.
+/// * `aspect_ratio_information` — sample or display aspect ratio of the
+///   grid, encoded per the `aspect_ratio_information` field of
+///   ITU-T Rec. H.262 | ISO/IEC 13818-2 (Table 2-49 cross-reference).
+///   Surfaced as the raw 4-bit code; this crate does not decode the
+///   H.262 table.
+///
+/// On the wire the body is exactly 4 bytes (Table 2-49):
+///
+/// ```text
+/// byte 0: horizontal_size bits 13..6                      (8)
+/// byte 1: horizontal_size bits 5..0 (6) | vertical_size bits 13..12 (2)
+/// byte 2: vertical_size bits 11..4                        (8)
+/// byte 3: vertical_size bits 3..0 (4) | aspect_ratio_information (4)
+/// ```
+///
+/// Both size fields are big-endian 14-bit unsigned values; the table
+/// carries no reserved bits, so all 32 bits are payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetBackgroundGridDescriptor {
+    /// `horizontal_size` (14 bits) — grid width in pixels.
+    pub horizontal_size: u16,
+    /// `vertical_size` (14 bits) — grid height in pixels.
+    pub vertical_size: u16,
+    /// `aspect_ratio_information` (4 bits) — raw H.262 aspect-ratio code.
+    pub aspect_ratio_information: u8,
 }
 
 /// system_clock_descriptor body (§2.6.20 Table 2-54).
@@ -630,6 +674,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x04 => decode_hierarchy(data).unwrap_or(DescriptorBody::Raw),
         0x05 => decode_registration(data).unwrap_or(DescriptorBody::Raw),
         0x06 => decode_data_stream_alignment(data).unwrap_or(DescriptorBody::Raw),
+        0x07 => decode_target_background_grid(data).unwrap_or(DescriptorBody::Raw),
         0x09 => decode_ca(data).unwrap_or(DescriptorBody::Raw),
         0x0A => decode_iso639_language(data).unwrap_or(DescriptorBody::Raw),
         0x0B => decode_system_clock(data).unwrap_or(DescriptorBody::Raw),
@@ -763,6 +808,31 @@ fn decode_data_stream_alignment(data: &[u8]) -> Option<DescriptorBody<'_>> {
     Some(DescriptorBody::DataStreamAlignment(
         DataStreamAlignmentDescriptor {
             alignment_type: data[0],
+        },
+    ))
+}
+
+fn decode_target_background_grid(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Four-byte payload (Table 2-49):
+    //   byte 0: horizontal_size bits 13..6                       (8)
+    //   byte 1: horizontal_size bits 5..0 (6) | vertical_size 13..12 (2)
+    //   byte 2: vertical_size bits 11..4                         (8)
+    //   byte 3: vertical_size bits 3..0 (4) | aspect_ratio_information (4)
+    // Both size fields are big-endian 14-bit unsigneds; the table carries
+    // no reserved bits, so all 32 bits are payload.
+    if data.len() < 4 {
+        return None;
+    }
+    let horizontal_size = ((data[0] as u16) << 6) | ((data[1] >> 2) as u16);
+    let vertical_size = (((data[1] & 0b0000_0011) as u16) << 12)
+        | ((data[2] as u16) << 4)
+        | ((data[3] >> 4) as u16);
+    let aspect_ratio_information = data[3] & 0b0000_1111;
+    Some(DescriptorBody::TargetBackgroundGrid(
+        TargetBackgroundGridDescriptor {
+            horizontal_size,
+            vertical_size,
+            aspect_ratio_information,
         },
     ))
 }
@@ -2010,6 +2080,106 @@ mod tests {
                 assert!(ibp.is_well_formed());
             }
             other => panic!("expected Ibp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_background_grid_descriptor_typical_sd() {
+        // horizontal_size = 720, vertical_size = 576, aspect = 3 (4:3
+        // per H.262 aspect_ratio_information). 720 = 0x2D0, 576 = 0x240.
+        //   byte 0: horizontal[13..6] = 0x2D0 >> 6 = 0x0B          = 0x0B
+        //   byte 1: horizontal[5..0]<<2 | vertical[13..12]
+        //           = (0x2D0 & 0x3F) << 2 | (0x240 >> 12)
+        //           = (0x10) << 2 | 0 = 0x40                       = 0x40
+        //   byte 2: vertical[11..4] = (0x240 >> 4) & 0xFF = 0x24   = 0x24
+        //   byte 3: vertical[3..0]<<4 | aspect = (0x240 & 0xF)<<4 | 3
+        //           = 0x00 | 0x03                                  = 0x03
+        let block = tlv(0x07, &[0x0B, 0x40, 0x24, 0x03]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x07);
+        match &d.body {
+            DescriptorBody::TargetBackgroundGrid(g) => {
+                assert_eq!(g.horizontal_size, 720);
+                assert_eq!(g.vertical_size, 576);
+                assert_eq!(g.aspect_ratio_information, 3);
+            }
+            other => panic!("expected TargetBackgroundGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_background_grid_descriptor_max_fields() {
+        // horizontal_size = 0x3FFF, vertical_size = 0x3FFF, aspect = 0xF
+        // — every payload bit set.
+        //   byte 0: 0x3FFF >> 6 = 0xFF
+        //   byte 1: (0x3FFF & 0x3F) << 2 | (0x3FFF >> 12)
+        //           = (0x3F << 2) | 0x3 = 0xFC | 0x3 = 0xFF
+        //   byte 2: (0x3FFF >> 4) & 0xFF = 0xFF
+        //   byte 3: (0x3FFF & 0xF) << 4 | 0xF = 0xF0 | 0xF = 0xFF
+        let block = tlv(0x07, &[0xFF, 0xFF, 0xFF, 0xFF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::TargetBackgroundGrid(g) => {
+                assert_eq!(g.horizontal_size, 0x3FFF);
+                assert_eq!(g.vertical_size, 0x3FFF);
+                assert_eq!(g.aspect_ratio_information, 0xF);
+            }
+            other => panic!("expected TargetBackgroundGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_background_grid_descriptor_all_zero() {
+        let block = tlv(0x07, &[0x00, 0x00, 0x00, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::TargetBackgroundGrid(g) => {
+                assert_eq!(g.horizontal_size, 0);
+                assert_eq!(g.vertical_size, 0);
+                assert_eq!(g.aspect_ratio_information, 0);
+            }
+            other => panic!("expected TargetBackgroundGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_background_grid_descriptor_short_body_falls_back_to_raw() {
+        // 3-byte body — short of the fixed 4-byte payload, so the typed
+        // decoder declines and the generic TLV layer keeps the raw bytes.
+        let block = tlv(0x07, &[0x0B, 0x40, 0x24]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x07);
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &[0x0B, 0x40, 0x24]);
+    }
+
+    #[test]
+    fn target_background_grid_descriptor_in_es_info_list_with_neighbours() {
+        // Realistic PMT ES_info block: language + target_background_grid
+        // + STD. The grid record lands in the middle and decodes alongside
+        // neighbours without disturbing them. 1920×1080, aspect = 1.
+        // 1920 = 0x780, 1080 = 0x438.
+        //   byte 0: 0x780 >> 6 = 0x1E
+        //   byte 1: (0x780 & 0x3F) << 2 | (0x438 >> 12)
+        //           = (0x00) << 2 | 0 = 0x00
+        //   byte 2: (0x438 >> 4) & 0xFF = 0x43
+        //   byte 3: (0x438 & 0xF) << 4 | 1 = 0x80 | 0x01 = 0x81
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x0A, &[b'e', b'n', b'g', 0x00]));
+        block.extend_from_slice(&tlv(0x07, &[0x1E, 0x00, 0x43, 0x81]));
+        block.extend_from_slice(&tlv(0x11, &[0x01]));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].tag, 0x0A);
+        assert_eq!(v[1].tag, 0x07);
+        assert_eq!(v[2].tag, 0x11);
+        match &v[1].body {
+            DescriptorBody::TargetBackgroundGrid(g) => {
+                assert_eq!(g.horizontal_size, 1920);
+                assert_eq!(g.vertical_size, 1080);
+                assert_eq!(g.aspect_ratio_information, 1);
+            }
+            other => panic!("expected TargetBackgroundGrid, got {other:?}"),
         }
     }
 }

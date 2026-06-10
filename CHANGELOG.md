@@ -11,6 +11,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `TargetBackgroundGridDescriptor` — typed view of the §2.6.12
+  target_background_grid_descriptor (tag `0x07`, Table 2-49). Surfaces
+  the four-byte body as the 14-bit `horizontal_size`, the 14-bit
+  `vertical_size` (both grid dimensions in pixels per §2.6.13), and the
+  4-bit `aspect_ratio_information` (the raw H.262 / ISO/IEC 13818-2
+  aspect-ratio code, which this crate does not further decode). The
+  table carries no reserved bits, so all 32 payload bits are read; both
+  size fields are big-endian and span a byte boundary in the middle of
+  the body. Bodies shorter than four bytes fall back to
+  `DescriptorBody::Raw`. Wired through `PmtStream::iter_descriptors` and
+  `ProgramMapTable::iter_program_descriptors` alongside the existing tag
+  set. A paired §2.6.14 video_window_descriptor (tag `0x08`) is the
+  natural next step to place a stream's window on this grid.
 - `IbpDescriptor` — typed view of the §2.6.34 IBP_descriptor (tag
   `0x12`, Table 2-61). Surfaces the two-byte body as `closed_gop_flag`,
   `identical_gop_flag`, and the 14-bit `max_gop_length` (big-endian,
