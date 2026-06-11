@@ -11,6 +11,27 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `PesExtension` — full decode of the `PES_extension` body (§2.4.3.7,
+  Table 2-17 concluded), replacing the bare
+  `pes_extension_present: bool` on `PesPacket` with
+  `pes_extension: Option<PesExtension>`. All five flag-gated
+  sub-fields are surfaced: the 16-byte `PES_private_data`, the raw
+  `pack_header()` bytes (length-prefixed by `pack_field_length`,
+  carried verbatim without interpretation), the
+  `program_packet_sequence_counter` group
+  (`ProgramPacketSequenceCounter` — 7-bit counter,
+  `MPEG1_MPEG2_identifier`, 6-bit `original_stuff_length`), the
+  P-STD buffer pair (`PStdBuffer` — `scale` + 13-bit `size`, with a
+  `size_bytes()` helper applying the §2.4.3.7 128-vs-1024-byte units
+  rule), and the `PES_extension_flag_2` reserved bytes
+  (`PES_extension_field_length`-prefixed, surfaced verbatim since
+  every body byte is `reserved` in this edition of the spec). Each
+  absent sub-flag maps to `None`; truncation anywhere inside the
+  extension is a `TsError::Truncated` naming the exact field; the
+  three reserved bits in the sub-flag byte are ignored on read. This
+  completes the Table 2-17 optional PES header — every syntax element
+  from the `'10'` marker through the stuffing bytes now has a typed
+  decode.
 - `TargetBackgroundGridDescriptor` — typed view of the §2.6.12
   target_background_grid_descriptor (tag `0x07`, Table 2-49). Surfaces
   the four-byte body as the 14-bit `horizontal_size`, the 14-bit

@@ -111,13 +111,93 @@ pub struct PesPacket {
     pub additional_copy_info: Option<u8>,
     /// 16-bit `previous_PES_packet_CRC` value, when present.
     pub previous_pes_packet_crc: Option<u16>,
-    /// True when the `PES_extension_flag` was set in the header. The
-    /// extension sub-fields aren't surfaced individually but the flag
-    /// is preserved so callers can tell whether the (skipped) body
-    /// was present.
-    pub pes_extension_present: bool,
+    /// Decoded `PES_extension` body, present exactly when the
+    /// `PES_extension_flag` was set in the header (Table 2-17,
+    /// concluded). `pes_extension.is_some()` is the old
+    /// "extension present" signal; the sub-fields are now decoded.
+    pub pes_extension: Option<PesExtension>,
     /// Elementary-stream payload bytes (after the optional PES header).
     pub payload: Vec<u8>,
+}
+
+/// Decoded `PES_extension` body — the flag-gated tail of the optional
+/// PES header per ISO/IEC 13818-1 Table 2-17 (concluded) / §2.4.3.7.
+///
+/// Wire layout when `PES_extension_flag == 1`:
+///
+/// ```text
+/// PES_private_data_flag (1) | pack_header_field_flag (1) |
+/// program_packet_sequence_counter_flag (1) | P-STD_buffer_flag (1) |
+/// reserved (3) | PES_extension_flag_2 (1) |
+/// [PES_private_data (128)] |
+/// [pack_field_length (8) + pack_header()] |
+/// [marker (1) + program_packet_sequence_counter (7) +
+///  marker (1) + MPEG1_MPEG2_identifier (1) + original_stuff_length (6)] |
+/// ['01' (2) + P-STD_buffer_scale (1) + P-STD_buffer_size (13)] |
+/// [marker (1) + PES_extension_field_length (7) + reserved bytes]
+/// ```
+///
+/// Each `Option` field maps to one of the five sub-flags.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PesExtension {
+    /// 16-byte `PES_private_data` (§2.4.3.7: private data that,
+    /// combined with surrounding fields, must not emulate the
+    /// `packet_start_code_prefix`).
+    pub private_data: Option<[u8; 16]>,
+    /// Raw `pack_header()` bytes (an ISO/IEC 11172-1 or Program Stream
+    /// pack header carried verbatim; `pack_field_length` gives its
+    /// size). Always `None` in a conforming Program Stream; this crate
+    /// surfaces the bytes without interpreting them.
+    pub pack_header: Option<Vec<u8>>,
+    /// `program_packet_sequence_counter` group, when present.
+    pub program_packet_sequence_counter: Option<ProgramPacketSequenceCounter>,
+    /// `P-STD_buffer_scale` / `P-STD_buffer_size` pair, when present.
+    pub p_std_buffer: Option<PStdBuffer>,
+    /// Raw bytes of the `PES_extension_flag_2` field — in this edition
+    /// of the spec every one of the `PES_extension_field_length` bytes
+    /// is `reserved`, so they are surfaced verbatim.
+    pub extension_field_2: Option<Vec<u8>>,
+}
+
+/// `program_packet_sequence_counter` group (Table 2-17, concluded) — an
+/// optional 7-bit per-program PES packet counter providing continuity-
+/// counter-like functionality across a Program Stream or ISO/IEC
+/// 11172-1 stream carried in PES packets (§2.4.3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramPacketSequenceCounter {
+    /// 7-bit counter; wraps to 0 past its maximum. No two consecutive
+    /// PES packets in the program multiplex may carry the same value.
+    pub counter: u8,
+    /// `MPEG1_MPEG2_identifier` — `true` when this PES packet carries
+    /// information from an ISO/IEC 11172-1 stream, `false` for a
+    /// Program Stream.
+    pub mpeg1_mpeg2_identifier: bool,
+    /// 6-bit `original_stuff_length` — number of stuffing bytes used
+    /// in the original PES packet header (or original ISO/IEC 11172-1
+    /// packet header).
+    pub original_stuff_length: u8,
+}
+
+/// `P-STD_buffer_scale` + `P-STD_buffer_size` pair (Table 2-17,
+/// concluded). Semantics are only defined when the PES packet is
+/// carried in a Program Stream (§2.4.3.7): the pair sizes the P-STD
+/// input buffer BSn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PStdBuffer {
+    /// `P-STD_buffer_scale` — scaling factor for `size`: `false` ⇒
+    /// units of 128 bytes (required for audio stream_ids), `true` ⇒
+    /// units of 1024 bytes (required for video stream_ids).
+    pub scale: bool,
+    /// 13-bit `P-STD_buffer_size`, in units selected by `scale`.
+    pub size: u16,
+}
+
+impl PStdBuffer {
+    /// Buffer size in bytes: `size * 128` when `scale` is clear,
+    /// `size * 1024` when set (§2.4.3.7).
+    pub fn size_bytes(&self) -> u32 {
+        u32::from(self.size) * if self.scale { 1024 } else { 128 }
+    }
 }
 
 impl PesPacket {
@@ -154,7 +234,7 @@ impl PesPacket {
                 dsm_trick_mode: None,
                 additional_copy_info: None,
                 previous_pes_packet_crc: None,
-                pes_extension_present: false,
+                pes_extension: None,
                 payload: bytes[6..].to_vec(),
             });
         }
@@ -296,9 +376,16 @@ impl PesPacket {
             previous_pes_packet_crc = Some(u16::from_be_bytes([opt[cursor], opt[cursor + 1]]));
             cursor += 2;
         }
-        // pes_extension_flag body: we record only its presence. The
-        // body is bounded by `pes_header_data_length` and the rest is
-        // stuffing — both of which we skip past via `header_end`.
+        // PES_extension body (Table 2-17, concluded). Bounded by
+        // `pes_header_data_length`; anything after it up to
+        // `header_end` is stuffing.
+        let pes_extension = if pes_extension_flag {
+            let (ext, used) = PesExtension::parse(&opt[cursor..])?;
+            cursor += used;
+            Some(ext)
+        } else {
+            None
+        };
         let _ = cursor;
 
         Ok(Self {
@@ -315,9 +402,126 @@ impl PesPacket {
             dsm_trick_mode,
             additional_copy_info,
             previous_pes_packet_crc,
-            pes_extension_present: pes_extension_flag,
+            pes_extension,
             payload: bytes[header_end..].to_vec(),
         })
+    }
+}
+
+impl PesExtension {
+    /// Parse a `PES_extension` body from the head of `b` (the bytes
+    /// remaining in the optional-header area once the earlier
+    /// flag-gated fields have been consumed). Returns the decoded
+    /// extension and the number of bytes it occupied.
+    fn parse(b: &[u8]) -> Result<(Self, usize), TsError> {
+        if b.is_empty() {
+            return Err(TsError::Truncated {
+                what: "PES extension flags",
+                have: 0,
+                need: 1,
+            });
+        }
+        // PES_private_data_flag (1) | pack_header_field_flag (1) |
+        // program_packet_sequence_counter_flag (1) | P-STD_buffer_flag (1) |
+        // reserved (3) | PES_extension_flag_2 (1).
+        let flags = b[0];
+        let private_data_flag = (flags & 0b1000_0000) != 0;
+        let pack_header_field_flag = (flags & 0b0100_0000) != 0;
+        let ppsc_flag = (flags & 0b0010_0000) != 0;
+        let p_std_buffer_flag = (flags & 0b0001_0000) != 0;
+        let extension_flag_2 = (flags & 0b0000_0001) != 0;
+        let mut cursor = 1usize;
+
+        let mut ext = Self::default();
+        if private_data_flag {
+            if b.len() < cursor + 16 {
+                return Err(TsError::Truncated {
+                    what: "PES_private_data",
+                    have: b.len(),
+                    need: cursor + 16,
+                });
+            }
+            let mut pd = [0u8; 16];
+            pd.copy_from_slice(&b[cursor..cursor + 16]);
+            ext.private_data = Some(pd);
+            cursor += 16;
+        }
+        if pack_header_field_flag {
+            if b.len() < cursor + 1 {
+                return Err(TsError::Truncated {
+                    what: "pack_field_length",
+                    have: b.len(),
+                    need: cursor + 1,
+                });
+            }
+            let pack_field_length = b[cursor] as usize;
+            cursor += 1;
+            if b.len() < cursor + pack_field_length {
+                return Err(TsError::Truncated {
+                    what: "pack_header",
+                    have: b.len(),
+                    need: cursor + pack_field_length,
+                });
+            }
+            ext.pack_header = Some(b[cursor..cursor + pack_field_length].to_vec());
+            cursor += pack_field_length;
+        }
+        if ppsc_flag {
+            if b.len() < cursor + 2 {
+                return Err(TsError::Truncated {
+                    what: "program_packet_sequence_counter",
+                    have: b.len(),
+                    need: cursor + 2,
+                });
+            }
+            // marker (1) | program_packet_sequence_counter (7),
+            // marker (1) | MPEG1_MPEG2_identifier (1) |
+            // original_stuff_length (6).
+            ext.program_packet_sequence_counter = Some(ProgramPacketSequenceCounter {
+                counter: b[cursor] & 0x7F,
+                mpeg1_mpeg2_identifier: (b[cursor + 1] & 0b0100_0000) != 0,
+                original_stuff_length: b[cursor + 1] & 0x3F,
+            });
+            cursor += 2;
+        }
+        if p_std_buffer_flag {
+            if b.len() < cursor + 2 {
+                return Err(TsError::Truncated {
+                    what: "P-STD_buffer",
+                    have: b.len(),
+                    need: cursor + 2,
+                });
+            }
+            // '01' (2) | P-STD_buffer_scale (1) | P-STD_buffer_size (13).
+            ext.p_std_buffer = Some(PStdBuffer {
+                scale: (b[cursor] & 0b0010_0000) != 0,
+                size: (u16::from(b[cursor] & 0x1F) << 8) | u16::from(b[cursor + 1]),
+            });
+            cursor += 2;
+        }
+        if extension_flag_2 {
+            if b.len() < cursor + 1 {
+                return Err(TsError::Truncated {
+                    what: "PES_extension_field_length",
+                    have: b.len(),
+                    need: cursor + 1,
+                });
+            }
+            // marker (1) | PES_extension_field_length (7), then that
+            // many reserved bytes (surfaced verbatim).
+            let len = (b[cursor] & 0x7F) as usize;
+            cursor += 1;
+            if b.len() < cursor + len {
+                return Err(TsError::Truncated {
+                    what: "PES_extension_field",
+                    have: b.len(),
+                    need: cursor + len,
+                });
+            }
+            ext.extension_field_2 = Some(b[cursor..cursor + len].to_vec());
+            cursor += len;
+        }
+        Ok((ext, cursor))
     }
 }
 
@@ -773,7 +977,9 @@ mod tests {
         assert_eq!(p.dsm_trick_mode, Some(0b010_00000));
         assert_eq!(p.additional_copy_info, Some(0x42));
         assert_eq!(p.previous_pes_packet_crc, Some(0xCAFE));
-        assert!(p.pes_extension_present);
+        // Extension flag set with an all-zero sub-flag byte ⇒ present
+        // but every sub-field absent.
+        assert_eq!(p.pes_extension, Some(PesExtension::default()));
         assert_eq!(p.payload, payload);
     }
 
@@ -788,11 +994,100 @@ mod tests {
         assert_eq!(p.dsm_trick_mode, None);
         assert_eq!(p.additional_copy_info, None);
         assert_eq!(p.previous_pes_packet_crc, None);
-        assert!(!p.pes_extension_present);
+        assert!(p.pes_extension.is_none());
         // Flag bits in the all-zero flags1 byte we set.
         assert!(!p.pes_priority);
         assert!(!p.copyright);
         assert_eq!(p.pes_scrambling_control, 0);
+    }
+
+    /// Wrap a raw PES_extension body (sub-flag byte + gated fields)
+    /// into a minimal video PES packet whose only optional field is
+    /// the extension.
+    fn build_pes_with_extension(ext_body: &[u8]) -> Vec<u8> {
+        let payload = b"data";
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+        let pes_packet_length: u16 = (3 + ext_body.len() + payload.len()) as u16;
+        v.extend_from_slice(&pes_packet_length.to_be_bytes());
+        v.push(0b1000_0000); // '10' marker, all flags1 clear
+        v.push(0b0000_0001); // only PES_extension_flag set
+        v.push(ext_body.len() as u8);
+        v.extend_from_slice(ext_body);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn parse_pes_extension_every_sub_field() {
+        // Sub-flags: private_data | pack_header | ppsc | P-STD | ext2
+        // (reserved bits set to 1 to prove they're ignored).
+        let mut ext = vec![0b1111_1111u8];
+        let private: [u8; 16] = *b"0123456789ABCDEF";
+        ext.extend_from_slice(&private);
+        // pack_field_length = 3, then 3 opaque pack_header bytes.
+        ext.extend_from_slice(&[3, 0xAA, 0xBB, 0xCC]);
+        // marker|counter=0x55, marker|MPEG1_MPEG2=1|orig_stuff_len=0x21.
+        ext.push(0b1101_0101);
+        ext.push(0b1110_0001);
+        // '01' | scale=1 | size=0x1234 (13-bit).
+        ext.push(0b0111_0010);
+        ext.push(0x34);
+        // marker | PES_extension_field_length=2, then 2 reserved bytes.
+        ext.push(0b1000_0010);
+        ext.extend_from_slice(&[0xDE, 0xAD]);
+
+        let pes = build_pes_with_extension(&ext);
+        let p = PesPacket::parse(&pes).unwrap();
+        let e = p.pes_extension.expect("extension present");
+        assert_eq!(e.private_data, Some(private));
+        assert_eq!(e.pack_header.as_deref(), Some(&[0xAA, 0xBB, 0xCC][..]));
+        let ppsc = e.program_packet_sequence_counter.unwrap();
+        assert_eq!(ppsc.counter, 0x55);
+        assert!(ppsc.mpeg1_mpeg2_identifier);
+        assert_eq!(ppsc.original_stuff_length, 0x21);
+        let pstd = e.p_std_buffer.unwrap();
+        assert!(pstd.scale);
+        assert_eq!(pstd.size, 0x1234);
+        assert_eq!(pstd.size_bytes(), 0x1234 * 1024);
+        assert_eq!(e.extension_field_2.as_deref(), Some(&[0xDE, 0xAD][..]));
+        assert_eq!(p.payload, b"data");
+    }
+
+    #[test]
+    fn parse_pes_extension_p_std_scale_clear_units_128() {
+        // Only the P-STD_buffer pair: '01' | scale=0 | size=10.
+        let ext = [0b0001_0000u8, 0b0100_0000, 10];
+        let pes = build_pes_with_extension(&ext);
+        let p = PesPacket::parse(&pes).unwrap();
+        let pstd = p.pes_extension.unwrap().p_std_buffer.unwrap();
+        assert!(!pstd.scale);
+        assert_eq!(pstd.size, 10);
+        assert_eq!(pstd.size_bytes(), 1280);
+    }
+
+    #[test]
+    fn parse_pes_extension_truncated_private_data_rejected() {
+        // private_data flag set but only 4 of the 16 bytes present.
+        let ext = [0b1000_0000u8, 1, 2, 3, 4];
+        let pes = build_pes_with_extension(&ext);
+        let err = PesPacket::parse(&pes).unwrap_err();
+        match err {
+            TsError::Truncated { what, .. } => assert_eq!(what, "PES_private_data"),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pes_extension_truncated_field_2_rejected() {
+        // ext2 flag set, PES_extension_field_length = 5 but no bytes.
+        let ext = [0b0000_0001u8, 0b1000_0101];
+        let pes = build_pes_with_extension(&ext);
+        let err = PesPacket::parse(&pes).unwrap_err();
+        match err {
+            TsError::Truncated { what, .. } => assert_eq!(what, "PES_extension_field"),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
     }
 
     #[test]

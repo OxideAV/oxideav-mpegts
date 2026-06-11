@@ -26,8 +26,10 @@
 //!   `data_alignment_indicator` / `copyright` / `original_or_copy` on
 //!   flags1, plus the flag-gated bodies ESCR (27 MHz tick), `ES_rate`
 //!   (50 bytes/s units), `DSM_trick_mode` (raw 8-bit byte),
-//!   `additional_copy_info`, `previous_PES_packet_CRC`, and a
-//!   `PES_extension`-present flag.
+//!   `additional_copy_info`, `previous_PES_packet_CRC`, and the full
+//!   `PES_extension` body ([`pes::PesExtension`] — private data, pack
+//!   header bytes, program_packet_sequence_counter, P-STD buffer,
+//!   PES_extension_field_2).
 //! - Stream-type → ESID helpers in [`stream_type`] mapping the BD-
 //!   relevant constants (`0x1B AVC`, `0x24 HEVC`, `0x81 AC-3`,
 //!   `0x82 DTS`, `0x90 PGS`, etc.) to a richer enum.
@@ -84,7 +86,7 @@ pub use packet::{
     iter_packets, AdaptationField, AdaptationFieldExtension, TsPacket, TsPacketIter, TS_PACKET_LEN,
     TS_SYNC_BYTE,
 };
-pub use pes::{PesPacket, PesReassembler};
+pub use pes::{PStdBuffer, PesExtension, PesPacket, PesReassembler, ProgramPacketSequenceCounter};
 pub use psi::{
     iter_sections, mpeg2_crc32, ConditionalAccessTable, PmtStream, ProgramAssociationTable,
     ProgramMapTable, PsiSectionAssembler, SectionIter, CAT_PID, CAT_TABLE_ID, MAX_PSI_SECTION_LEN,
