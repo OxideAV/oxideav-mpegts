@@ -34,11 +34,17 @@ pub const PAT_TABLE_ID: u8 = 0x00;
 pub const CAT_TABLE_ID: u8 = 0x01;
 /// PMT table_id per §2.4.4.8.
 pub const PMT_TABLE_ID: u8 = 0x02;
+/// TSDT (Transport Stream Description Table) table_id per §2.4.4.12 /
+/// Table 2-26.
+pub const TSDT_TABLE_ID: u8 = 0x03;
 
 /// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
 pub const PAT_PID: u16 = 0x0000;
 /// PID reserved for the Conditional Access Table per §2.4.4.6 / Table 2-3.
 pub const CAT_PID: u16 = 0x0001;
+/// PID reserved for the Transport Stream Description Table per §2.4.4.12
+/// / Table 2-3.
+pub const TSDT_PID: u16 = 0x0002;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
@@ -241,6 +247,56 @@ impl ConditionalAccessTable {
     /// been skipped).
     pub fn parse(section: &[u8]) -> Result<Self, TsError> {
         let (hdr, body) = parse_section_header(section, CAT_TABLE_ID)?;
+        Ok(Self {
+            version_number: hdr.version_number,
+            current_next_indicator: hdr.current_next_indicator,
+            section_number: hdr.section_number,
+            last_section_number: hdr.last_section_number,
+            descriptors: body.to_vec(),
+        })
+    }
+
+    /// Walk the carried descriptor() loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Parsed Transport Stream Description Table per §2.4.4.12 /
+/// Table 2-30-1.
+///
+/// The TSDT is optional. When present it is carried on the fixed PID
+/// [`TSDT_PID`] (`0x0002`) with `table_id == TSDT_TABLE_ID` (`0x03`)
+/// and carries a single `descriptor()` loop (§2.6) that applies to the
+/// **entire** Transport Stream rather than to one program or stream.
+/// Structurally it mirrors the CAT: the long-form section header
+/// (`table_id` … `last_section_number`), then a run of descriptors,
+/// then the CRC. The 16 bits at byte offsets 3–4 are reserved per the
+/// `reserved (18 bits)` field of Table 2-30-1 and carry no
+/// `table_id_extension` meaning; like the CAT they are ignored on
+/// parse. Sections may be segmented across the [`TSDT_PID`] stream and
+/// reassembled with [`PsiSectionAssembler`] before parsing.
+#[derive(Debug, Default, Clone)]
+pub struct TransportStreamDescriptionTable {
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// `current_next_indicator`.
+    pub current_next_indicator: bool,
+    /// `section_number`.
+    pub section_number: u8,
+    /// `last_section_number`.
+    pub last_section_number: u8,
+    /// Raw bytes of the descriptor() loop carried in the TSDT body —
+    /// walk with [`Self::iter_descriptors`] to get typed records.
+    pub descriptors: Vec<u8>,
+}
+
+impl TransportStreamDescriptionTable {
+    /// Parse a single TSDT section. The slice must run from `table_id`
+    /// through the CRC trailer (i.e. the pointer_field has already been
+    /// skipped).
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let (hdr, body) = parse_section_header(section, TSDT_TABLE_ID)?;
         Ok(Self {
             version_number: hdr.version_number,
             current_next_indicator: hdr.current_next_indicator,
@@ -927,6 +983,91 @@ mod tests {
             TsError::Unsupported(_) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// Build a TSDT section (table_id 0x03) carrying `descriptors` as
+    /// its body. Section bytes run from table_id through CRC. The TSDT
+    /// shares the CAT's wire layout: a long-form header whose bytes 3–4
+    /// are reserved, then a descriptor() loop, then CRC.
+    fn build_tsdt_section(version: u8, section_number: u8, descriptors: &[u8]) -> Vec<u8> {
+        let section_length = 5 + descriptors.len() + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(TSDT_TABLE_ID);
+        let len_hi = 0b1011_0000 | ((section_length >> 8) & 0x0F) as u8;
+        s.push(len_hi);
+        s.push((section_length & 0xFF) as u8);
+        // reserved 16 bits at bytes 3–4 (no table_id_extension meaning).
+        s.push(0xFF);
+        s.push(0xFF);
+        // reserved | version | current_next.
+        s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
+        s.push(section_number);
+        s.push(section_number); // last_section_number = section_number
+        s.extend_from_slice(descriptors);
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    #[test]
+    fn tsdt_round_trip_registration_descriptor() {
+        // Table 2-39 restricts the TSDT to 2.6 descriptors; a
+        // registration_descriptor (tag 0x05) is one such — carry
+        // format_identifier "HDMV" + a private byte.
+        let reg_descr: &[u8] = &[0x05, 0x05, b'H', b'D', b'M', b'V', 0xAB];
+        let section = build_tsdt_section(9, 0, reg_descr);
+        let tsdt = TransportStreamDescriptionTable::parse(&section).unwrap();
+        assert_eq!(tsdt.version_number, 9);
+        assert!(tsdt.current_next_indicator);
+        assert_eq!(tsdt.section_number, 0);
+        assert_eq!(tsdt.last_section_number, 0);
+        let descrs: Vec<_> = tsdt.iter_descriptors().collect::<Result<_, _>>().unwrap();
+        assert_eq!(descrs.len(), 1);
+        match &descrs[0].body {
+            crate::descriptor::DescriptorBody::Registration {
+                format_identifier, ..
+            } => assert_eq!(format_identifier, b"HDMV"),
+            other => panic!("expected Registration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tsdt_empty_descriptor_loop() {
+        // A TSDT with no descriptors is well-formed: header + CRC only.
+        let section = build_tsdt_section(0, 0, &[]);
+        let tsdt = TransportStreamDescriptionTable::parse(&section).unwrap();
+        assert_eq!(tsdt.version_number, 0);
+        assert!(tsdt.descriptors.is_empty());
+        assert_eq!(tsdt.iter_descriptors().count(), 0);
+    }
+
+    #[test]
+    fn tsdt_rejects_wrong_table_id() {
+        // A CAT-shaped section (table_id 0x01) must not parse as TSDT.
+        let section = build_cat_section(1, &[0x09, 0x04, 0x05, 0x00, 0xE1, 0x23]);
+        let err = TransportStreamDescriptionTable::parse(&section).unwrap_err();
+        match err {
+            TsError::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tsdt_reassembles_via_psi_assembler() {
+        // The TSDT shares the PSI section envelope, so the generic
+        // assembler must reassemble + hand it to TSDT::parse. Drive a
+        // single-payload feed (pointer_field = 0).
+        let reg_descr: &[u8] = &[0x05, 0x04, b'A', b'V', b'0', b'1'];
+        let section = build_tsdt_section(2, 0, reg_descr);
+        let mut payload = vec![0u8]; // pointer_field = 0
+        payload.extend_from_slice(&section);
+        payload.resize(184, 0xFF);
+        let mut asm = PsiSectionAssembler::new();
+        let out = asm.feed(&payload, true, 0).unwrap();
+        assert_eq!(out.len(), 1);
+        let tsdt = TransportStreamDescriptionTable::parse(&out[0]).unwrap();
+        assert_eq!(tsdt.version_number, 2);
+        assert_eq!(tsdt.iter_descriptors().count(), 1);
     }
 
     /// Build a synthetic TS packet carrying `payload` with the given

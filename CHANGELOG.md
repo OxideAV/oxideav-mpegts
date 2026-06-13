@@ -11,6 +11,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `TransportStreamDescriptionTable` — the Transport Stream Description
+  Table (TSDT, §2.4.4.12 / Table 2-30-1). The TSDT is the fourth
+  ISO/IEC 13818-1 PSI table after PAT / CAT / PMT: an optional table on
+  the fixed PID `TSDT_PID` (`0x0002`) with `table_id == TSDT_TABLE_ID`
+  (`0x03`) that carries a single `descriptor()` loop (§2.6) applying to
+  the **entire** Transport Stream. Structurally it mirrors the CAT — a
+  long-form section header (`table_id` … `last_section_number`) whose
+  bytes 3–4 are reserved (no `table_id_extension` meaning), then the
+  descriptor block, then CRC-32. `parse` rejects a wrong `table_id` as
+  `TsError::Unsupported`; `iter_descriptors` lifts the body to typed
+  `Descriptor` records, and a section that overflows one TS payload
+  reassembles through the existing `PsiSectionAssembler` before
+  parsing. New public constants `TSDT_TABLE_ID` and `TSDT_PID`.
 - `PesExtension` — full decode of the `PES_extension` body (§2.4.3.7,
   Table 2-17 concluded), replacing the bare
   `pes_extension_present: bool` on `PesPacket` with
