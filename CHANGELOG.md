@@ -11,6 +11,26 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `ServiceDescriptionTable` — the DVB Service Description Table (SDT,
+  ETSI EN 300 468 §5.2.3 / Table 5), the first Service Information
+  table beyond the ISO/IEC 13818-1 PSI set. Carried on the fixed PID
+  `SDT_PID` (`0x0011`); sections describing the actual TS use
+  `SDT_ACTUAL_TABLE_ID` (`0x42`) and those describing other TSs use
+  `SDT_OTHER_TABLE_ID` (`0x46`). `parse` accepts both table_ids
+  (recording which in `other_transport_stream`), CRC-verifies the
+  long-form section header the same way as PAT/PMT, then reads
+  `original_network_id` plus a loop of `SdtService` entries
+  (`service_id`, `EIT_schedule_flag`, `EIT_present_following_flag`,
+  `running_status` as the typed `RunningStatus` enum from Table 6,
+  `free_CA_mode`, and a per-service descriptor block). A truncated
+  service entry, a wrong `table_id`, or a bad CRC are rejected with
+  `TsError`.
+- `ServiceDescriptor` (DVB descriptor tag `0x48`, EN 300 468 §6.2.33 /
+  Table 88) decoded by the descriptor layer — `service_type` plus the
+  raw `service_provider_name` / `service_name` byte runs (DVB text
+  strings left undecoded; charset selection is the caller's concern).
+  Lifted through `SdtService::iter_descriptors`, this is the source of
+  a service's human-readable name for the remux→MKV title-naming path.
 - `TransportStreamDescriptionTable` — the Transport Stream Description
   Table (TSDT, §2.4.4.12 / Table 2-30-1). The TSDT is the fourth
   ISO/IEC 13818-1 PSI table after PAT / CAT / PMT: an optional table on

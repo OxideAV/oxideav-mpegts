@@ -48,7 +48,11 @@
 //!
 //! ## What's NOT in scope
 //!
-//! - PSIP / DVB SI tables beyond PAT + PMT (no SDT, NIT, EIT).
+//! - PSIP / DVB SI tables beyond PAT + PMT + CAT + TSDT + SDT (no NIT,
+//!   BAT, EIT, TDT/TOT yet). The SDT
+//!   ([`psi::ServiceDescriptionTable`], ETSI EN 300 468 §5.2.3) is
+//!   parsed including its per-service `service_descriptor` (tag `0x48`)
+//!   for human-readable service / provider names.
 //! - Conditional Access (CA) descriptors / scrambling.
 //! - Re-multiplexing — this is a demux-only crate. The MKV writer
 //!   in `oxideav-mkv` owns the output side.
@@ -78,8 +82,8 @@ pub use clock::{
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
     DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor,
-    Iso639Language, MaximumBitrateDescriptor, SmoothingBufferDescriptor, StdDescriptor,
-    SystemClockDescriptor, VideoStreamDescriptor,
+    Iso639Language, MaximumBitrateDescriptor, ServiceDescriptor, SmoothingBufferDescriptor,
+    StdDescriptor, SystemClockDescriptor, VideoStreamDescriptor,
 };
 pub use error::TsError;
 pub use packet::{
@@ -89,9 +93,10 @@ pub use packet::{
 pub use pes::{PStdBuffer, PesExtension, PesPacket, PesReassembler, ProgramPacketSequenceCounter};
 pub use psi::{
     iter_sections, mpeg2_crc32, ConditionalAccessTable, PmtStream, ProgramAssociationTable,
-    ProgramMapTable, PsiSectionAssembler, SectionIter, TransportStreamDescriptionTable, CAT_PID,
-    CAT_TABLE_ID, MAX_PSI_SECTION_LEN, PAT_PID, PAT_TABLE_ID, PMT_TABLE_ID, TSDT_PID,
-    TSDT_TABLE_ID,
+    ProgramMapTable, PsiSectionAssembler, RunningStatus, SdtService, SectionIter,
+    ServiceDescriptionTable, TransportStreamDescriptionTable, CAT_PID, CAT_TABLE_ID,
+    MAX_PSI_SECTION_LEN, PAT_PID, PAT_TABLE_ID, PMT_TABLE_ID, SDT_ACTUAL_TABLE_ID,
+    SDT_OTHER_TABLE_ID, SDT_PID, TSDT_PID, TSDT_TABLE_ID,
 };
 pub use stream_type::StreamType;
 

@@ -41,6 +41,7 @@
 //! | `0x12` | IBP_descriptor (§2.6.34)          | [`DescriptorBody::Ibp`]                      |
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
+//! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
 //!
 //! Every other tag is preserved as [`DescriptorBody::Raw`] so callers
 //! still see the payload bytes without losing information.
@@ -107,8 +108,38 @@ pub enum DescriptorBody<'a> {
     AvcVideo(AvcVideoDescriptor),
     /// `0x38` HEVC_video_descriptor (Amd. 3 §2.6.95).
     HevcVideo(HevcVideoDescriptor),
+    /// `0x48` service_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.33 Table 88). Carried in the SDT service loop; names the
+    /// service plus its provider in text form.
+    Service(ServiceDescriptor<'a>),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
+}
+
+/// service_descriptor body (ETSI EN 300 468 §6.2.33 Table 88).
+///
+/// This is a DVB Service Information extension to the ISO/IEC 13818-1
+/// descriptor space, carried inside the per-service descriptor loop of
+/// a [`crate::psi::ServiceDescriptionTable`] section. It pairs the
+/// service's textual provider name and service name with an 8-bit
+/// `service_type` (Table 89).
+///
+/// The two name fields are exposed as **raw byte slices** rather than
+/// decoded strings: DVB text strings (EN 300 468 annex A) carry an
+/// optional leading character-table selector byte and may use any of
+/// several code tables, so charset interpretation is deliberately left
+/// to the caller. The bytes are exactly the `service_provider_name`
+/// and `service_name` runs as they appear on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceDescriptor<'a> {
+    /// 8-bit `service_type` (Table 89). Common values: `0x01` digital
+    /// television, `0x02` digital radio, `0x11` HD digital television,
+    /// `0x19` H.264/AVC HD, `0x1F` HEVC digital television.
+    pub service_type: u8,
+    /// Raw `service_provider_name` bytes (DVB text string, annex A).
+    pub service_provider_name: &'a [u8],
+    /// Raw `service_name` bytes (DVB text string, annex A).
+    pub service_name: &'a [u8],
 }
 
 /// video_stream_descriptor body (§2.6.2 Table 2-46).
@@ -686,8 +717,42 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x12 => decode_ibp(data).unwrap_or(DescriptorBody::Raw),
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
+        0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
+}
+
+fn decode_service(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.33 Table 88:
+    //   service_type                 (8)
+    //   service_provider_name_length (8)
+    //   service_provider_name        (provider_len bytes)
+    //   service_name_length          (8)
+    //   service_name                 (name_len bytes)
+    if data.len() < 2 {
+        return None;
+    }
+    let service_type = data[0];
+    let provider_len = data[1] as usize;
+    let provider_start = 2usize;
+    let provider_end = provider_start.checked_add(provider_len)?;
+    // The name_length byte must still fit after the provider run.
+    if provider_end >= data.len() {
+        return None;
+    }
+    let service_provider_name = &data[provider_start..provider_end];
+    let name_len = data[provider_end] as usize;
+    let name_start = provider_end + 1;
+    let name_end = name_start.checked_add(name_len)?;
+    if name_end > data.len() {
+        return None;
+    }
+    let service_name = &data[name_start..name_end];
+    Some(DescriptorBody::Service(ServiceDescriptor {
+        service_type,
+        service_provider_name,
+        service_name,
+    }))
 }
 
 fn decode_video_stream(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -2181,5 +2246,56 @@ mod tests {
             }
             other => panic!("expected TargetBackgroundGrid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn service_descriptor_decodes_names_and_type() {
+        // service_type = 0x01 (digital television),
+        // provider = "Prov", service = "Channel 1".
+        let mut body = vec![0x01];
+        body.push(4);
+        body.extend_from_slice(b"Prov");
+        body.push(9);
+        body.extend_from_slice(b"Channel 1");
+        let block = tlv(0x48, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x48);
+        match d.body {
+            DescriptorBody::Service(s) => {
+                assert_eq!(s.service_type, 0x01);
+                assert_eq!(s.service_provider_name, b"Prov");
+                assert_eq!(s.service_name, b"Channel 1");
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_descriptor_empty_provider_name() {
+        // Zero-length provider, non-empty service name.
+        let mut body = vec![0x11]; // HD digital television
+        body.push(0);
+        body.push(3);
+        body.extend_from_slice(b"HD1");
+        let block = tlv(0x48, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Service(s) => {
+                assert_eq!(s.service_type, 0x11);
+                assert!(s.service_provider_name.is_empty());
+                assert_eq!(s.service_name, b"HD1");
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_descriptor_truncated_falls_back_to_raw() {
+        // provider_name_length claims 9 bytes but only 2 follow.
+        let block = tlv(0x48, &[0x01, 0x09, b'X', b'Y']);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x48);
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &[0x01, 0x09, b'X', b'Y']);
     }
 }

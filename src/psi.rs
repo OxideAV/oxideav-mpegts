@@ -37,6 +37,13 @@ pub const PMT_TABLE_ID: u8 = 0x02;
 /// TSDT (Transport Stream Description Table) table_id per §2.4.4.12 /
 /// Table 2-26.
 pub const TSDT_TABLE_ID: u8 = 0x03;
+/// SDT (Service Description Table) `table_id` for sections describing the
+/// **actual** Transport Stream — the one that carries the SDT (ETSI
+/// EN 300 468 §5.2.3 / Table 2, `service_description_section`).
+pub const SDT_ACTUAL_TABLE_ID: u8 = 0x42;
+/// SDT `table_id` for sections describing **other** Transport Streams
+/// (ETSI EN 300 468 §5.2.3 / Table 2).
+pub const SDT_OTHER_TABLE_ID: u8 = 0x46;
 
 /// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
 pub const PAT_PID: u16 = 0x0000;
@@ -45,6 +52,9 @@ pub const CAT_PID: u16 = 0x0001;
 /// PID reserved for the Transport Stream Description Table per §2.4.4.12
 /// / Table 2-3.
 pub const TSDT_PID: u16 = 0x0002;
+/// Fixed PID carrying the DVB SDT / BAT / ST sections (ETSI EN 300 468
+/// §5.1.3 Table 1 — `0x0011`).
+pub const SDT_PID: u16 = 0x0011;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
@@ -309,6 +319,189 @@ impl TransportStreamDescriptionTable {
     /// Walk the carried descriptor() loop as typed TLV records.
     pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
         iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Running status of a service (ETSI EN 300 468 §5.2.3 Table 6).
+///
+/// A 3-bit field; values 6 and 7 are reserved and surface as
+/// [`RunningStatus::Reserved`] preserving the raw value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningStatus {
+    /// `0` — undefined.
+    Undefined,
+    /// `1` — not running.
+    NotRunning,
+    /// `2` — starts in a few seconds (e.g. for video recording).
+    StartsSoon,
+    /// `3` — pausing.
+    Pausing,
+    /// `4` — running.
+    Running,
+    /// `5` — service off-air.
+    OffAir,
+    /// `6`–`7` — reserved for future use; raw value preserved.
+    Reserved(u8),
+}
+
+impl RunningStatus {
+    /// Map the 3-bit wire value to a typed status.
+    pub fn from_bits(value: u8) -> Self {
+        match value & 0b0000_0111 {
+            0 => RunningStatus::Undefined,
+            1 => RunningStatus::NotRunning,
+            2 => RunningStatus::StartsSoon,
+            3 => RunningStatus::Pausing,
+            4 => RunningStatus::Running,
+            5 => RunningStatus::OffAir,
+            other => RunningStatus::Reserved(other),
+        }
+    }
+}
+
+/// One service entry from the SDT service loop (ETSI EN 300 468
+/// §5.2.3 Table 5).
+#[derive(Debug, Clone)]
+pub struct SdtService {
+    /// 16-bit `service_id` — equals the corresponding PMT
+    /// `program_number` for normal services.
+    pub service_id: u16,
+    /// `EIT_schedule_flag` — EIT schedule info present in this TS.
+    pub eit_schedule_flag: bool,
+    /// `EIT_present_following_flag` — EIT present/following info present.
+    pub eit_present_following_flag: bool,
+    /// 3-bit `running_status` (Table 6).
+    pub running_status: RunningStatus,
+    /// `free_CA_mode` — when `false` every component stream is
+    /// unscrambled; when `true` one or more streams may be CA-controlled.
+    pub free_ca_mode: bool,
+    /// Raw bytes of this service's `descriptor()` loop — walk with
+    /// [`Self::iter_descriptors`]. The DVB `service_descriptor`
+    /// (tag `0x48`) carried here decodes the service / provider names.
+    pub descriptors: Vec<u8>,
+}
+
+impl SdtService {
+    /// Walk this service's descriptor loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Parsed DVB Service Description Table (ETSI EN 300 468 §5.2.3
+/// Table 5).
+///
+/// The SDT is a DVB Service Information table carried on the fixed PID
+/// [`SDT_PID`] (`0x0011`). Sections describing the **actual** TS use
+/// `table_id == SDT_ACTUAL_TABLE_ID` (`0x42`); sections describing
+/// **other** TSs use `SDT_OTHER_TABLE_ID` (`0x46`). It shares the
+/// 8-byte long-form PSI section header (parsed and CRC-verified the
+/// same way as PAT/PMT), then carries `original_network_id` (16 bits)
+/// plus one reserved byte, then a loop of [`SdtService`] entries, then
+/// the CRC.
+///
+/// `transport_stream_id` is taken from the `table_id_extension` slot
+/// per §5.2.3. The service loop's per-service descriptor blocks most
+/// commonly carry the DVB `service_descriptor` (tag `0x48`), which the
+/// crate's descriptor decoder lifts into
+/// [`crate::descriptor::ServiceDescriptor`] — the source of a service's
+/// human-readable name and provider.
+#[derive(Debug, Default, Clone)]
+pub struct ServiceDescriptionTable {
+    /// `transport_stream_id` (from `table_id_extension`).
+    pub transport_stream_id: u16,
+    /// `true` when the section's `table_id` was `0x46` (describes another
+    /// TS); `false` for `0x42` (the actual TS carrying the SDT).
+    pub other_transport_stream: bool,
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// `current_next_indicator`.
+    pub current_next_indicator: bool,
+    /// `section_number`.
+    pub section_number: u8,
+    /// `last_section_number`.
+    pub last_section_number: u8,
+    /// `original_network_id`.
+    pub original_network_id: u16,
+    /// Service entries carried in this section.
+    pub services: Vec<SdtService>,
+}
+
+impl ServiceDescriptionTable {
+    /// Parse a single SDT section. The slice must run from `table_id`
+    /// through the CRC trailer (i.e. the pointer_field has already been
+    /// skipped). Accepts both the actual-TS (`0x42`) and other-TS
+    /// (`0x46`) table_ids.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        let other_transport_stream = match table_id {
+            SDT_ACTUAL_TABLE_ID => false,
+            SDT_OTHER_TABLE_ID => true,
+            _ => {
+                return Err(TsError::Unsupported(
+                    "PSI table_id does not match expected value",
+                ))
+            }
+        };
+        let (hdr, body) = parse_section_header(section, table_id)?;
+        // Body layout (Table 5): original_network_id (16) +
+        // reserved_future_use (8) + service loop.
+        if body.len() < 3 {
+            return Err(TsError::Truncated {
+                what: "SDT body",
+                have: body.len(),
+                need: 3,
+            });
+        }
+        let original_network_id = u16::from_be_bytes([body[0], body[1]]);
+        // body[2] is reserved_future_use.
+        let mut services = Vec::new();
+        let mut i = 3;
+        // Each service entry: service_id (16) + flags/running_status/
+        // free_CA_mode (8) + descriptors_length (12, top 4 of next byte)
+        // + descriptor loop. Fixed head = 5 bytes before descriptors.
+        while i + 5 <= body.len() {
+            let service_id = u16::from_be_bytes([body[i], body[i + 1]]);
+            let b = body[i + 2];
+            let eit_schedule_flag = (b & 0b0000_0010) != 0;
+            let eit_present_following_flag = (b & 0b0000_0001) != 0;
+            let b3 = body[i + 3];
+            let running_status = RunningStatus::from_bits(b3 >> 5);
+            let free_ca_mode = (b3 & 0b0001_0000) != 0;
+            let descriptors_length = (u16::from_be_bytes([b3 & 0b0000_1111, body[i + 4]])) as usize;
+            let descr_start = i + 5;
+            let descr_end = descr_start.checked_add(descriptors_length).ok_or(
+                TsError::SectionLengthOverrun {
+                    claimed: descriptors_length,
+                    have: body.len() - descr_start,
+                },
+            )?;
+            if descr_end > body.len() {
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: descriptors_length,
+                    have: body.len() - descr_start,
+                });
+            }
+            services.push(SdtService {
+                service_id,
+                eit_schedule_flag,
+                eit_present_following_flag,
+                running_status,
+                free_ca_mode,
+                descriptors: body[descr_start..descr_end].to_vec(),
+            });
+            i = descr_end;
+        }
+        Ok(Self {
+            transport_stream_id: hdr.table_id_extension,
+            other_transport_stream,
+            version_number: hdr.version_number,
+            current_next_indicator: hdr.current_next_indicator,
+            section_number: hdr.section_number,
+            last_section_number: hdr.last_section_number,
+            original_network_id,
+            services,
+        })
     }
 }
 
@@ -1302,5 +1495,160 @@ mod tests {
         p1.resize(184, 0xFF);
         let out = asm.feed(&p1, false, 1).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// Build one service-loop entry for an SDT section.
+    fn build_sdt_service(
+        service_id: u16,
+        eit_sched: bool,
+        eit_pf: bool,
+        running_status: u8,
+        free_ca: bool,
+        descriptors: &[u8],
+    ) -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(&service_id.to_be_bytes());
+        // reserved_future_use (6) | EIT_schedule_flag | EIT_present_following.
+        let mut b = 0b1111_1100u8;
+        if eit_sched {
+            b |= 0b10;
+        }
+        if eit_pf {
+            b |= 0b01;
+        }
+        s.push(b);
+        // running_status (3) | free_CA_mode (1) | descriptors_length (12).
+        let dlen = descriptors.len() as u16;
+        let b3 = ((running_status & 0b111) << 5)
+            | (if free_ca { 0b0001_0000 } else { 0 })
+            | ((dlen >> 8) & 0x0F) as u8;
+        s.push(b3);
+        s.push((dlen & 0xFF) as u8);
+        s.extend_from_slice(descriptors);
+        s
+    }
+
+    /// Build a full SDT section (table_id through CRC).
+    fn build_sdt_section(
+        table_id: u8,
+        tsid: u16,
+        version: u8,
+        original_network_id: u16,
+        services: &[Vec<u8>],
+    ) -> Vec<u8> {
+        // body = onid(2) + reserved(1) + Σ service entries.
+        let body_len: usize = 3 + services.iter().map(|s| s.len()).sum::<usize>();
+        let section_length = 5 + body_len + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(table_id);
+        let len_hi = 0b1011_0000 | ((section_length >> 8) & 0x0F) as u8;
+        s.push(len_hi);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(&tsid.to_be_bytes());
+        s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
+        s.push(0); // section_number
+        s.push(0); // last_section_number
+        s.extend_from_slice(&original_network_id.to_be_bytes());
+        s.push(0xFF); // reserved_future_use
+        for svc in services {
+            s.extend_from_slice(svc);
+        }
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    /// Build a service_descriptor (tag 0x48) TLV.
+    fn build_service_descriptor(service_type: u8, provider: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut body = vec![service_type, provider.len() as u8];
+        body.extend_from_slice(provider);
+        body.push(name.len() as u8);
+        body.extend_from_slice(name);
+        let mut v = vec![0x48u8, body.len() as u8];
+        v.extend_from_slice(&body);
+        v
+    }
+
+    #[test]
+    fn sdt_actual_single_service_round_trip() {
+        let sd = build_service_descriptor(0x01, b"Provider", b"Channel One");
+        let svc = build_sdt_service(0x0064, true, true, 4, false, &sd);
+        let section = build_sdt_section(SDT_ACTUAL_TABLE_ID, 0x0001, 7, 0x2024, &[svc]);
+        let sdt = ServiceDescriptionTable::parse(&section).unwrap();
+        assert!(!sdt.other_transport_stream);
+        assert_eq!(sdt.transport_stream_id, 0x0001);
+        assert_eq!(sdt.version_number, 7);
+        assert!(sdt.current_next_indicator);
+        assert_eq!(sdt.original_network_id, 0x2024);
+        assert_eq!(sdt.services.len(), 1);
+        let s = &sdt.services[0];
+        assert_eq!(s.service_id, 0x0064);
+        assert!(s.eit_schedule_flag);
+        assert!(s.eit_present_following_flag);
+        assert_eq!(s.running_status, RunningStatus::Running);
+        assert!(!s.free_ca_mode);
+        let d = s.iter_descriptors().next().unwrap().unwrap();
+        match d.body {
+            crate::descriptor::DescriptorBody::Service(svc) => {
+                assert_eq!(svc.service_type, 0x01);
+                assert_eq!(svc.service_provider_name, b"Provider");
+                assert_eq!(svc.service_name, b"Channel One");
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sdt_other_table_id_sets_flag() {
+        let svc = build_sdt_service(0x0001, false, false, 1, true, &[]);
+        let section = build_sdt_section(SDT_OTHER_TABLE_ID, 0x0009, 0, 0x0001, &[svc]);
+        let sdt = ServiceDescriptionTable::parse(&section).unwrap();
+        assert!(sdt.other_transport_stream);
+        assert_eq!(sdt.services.len(), 1);
+        let s = &sdt.services[0];
+        assert_eq!(s.running_status, RunningStatus::NotRunning);
+        assert!(s.free_ca_mode);
+        assert!(!s.eit_schedule_flag);
+        assert!(!s.eit_present_following_flag);
+    }
+
+    #[test]
+    fn sdt_multiple_services() {
+        let svc0 = build_sdt_service(0x0064, true, true, 4, false, &[]);
+        let svc1 = build_sdt_service(0x0065, false, true, 5, true, &[]);
+        let section = build_sdt_section(SDT_ACTUAL_TABLE_ID, 0x0002, 1, 0x1000, &[svc0, svc1]);
+        let sdt = ServiceDescriptionTable::parse(&section).unwrap();
+        assert_eq!(sdt.services.len(), 2);
+        assert_eq!(sdt.services[0].service_id, 0x0064);
+        assert_eq!(sdt.services[1].service_id, 0x0065);
+        assert_eq!(sdt.services[1].running_status, RunningStatus::OffAir);
+    }
+
+    #[test]
+    fn sdt_rejects_wrong_table_id() {
+        // A PMT section fed to the SDT parser must be rejected.
+        let section = build_pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x1011, &[])]);
+        assert!(ServiceDescriptionTable::parse(&section).is_err());
+    }
+
+    #[test]
+    fn sdt_crc_mismatch_rejected() {
+        let svc = build_sdt_service(0x0064, true, true, 4, false, &[]);
+        let mut section = build_sdt_section(SDT_ACTUAL_TABLE_ID, 0x0001, 7, 0x2024, &[svc]);
+        let last = section.len() - 1;
+        section[last] ^= 0xFF;
+        assert!(matches!(
+            ServiceDescriptionTable::parse(&section),
+            Err(TsError::PsiCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn running_status_reserved_values() {
+        assert_eq!(RunningStatus::from_bits(6), RunningStatus::Reserved(6));
+        assert_eq!(RunningStatus::from_bits(7), RunningStatus::Reserved(7));
+        assert_eq!(RunningStatus::from_bits(0), RunningStatus::Undefined);
+        assert_eq!(RunningStatus::from_bits(2), RunningStatus::StartsSoon);
+        assert_eq!(RunningStatus::from_bits(3), RunningStatus::Pausing);
     }
 }

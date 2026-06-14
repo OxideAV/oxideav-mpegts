@@ -18,8 +18,8 @@ language-tagged tracks and chapter marks.
 | Module           | What it parses                                                              |
 |------------------|-----------------------------------------------------------------------------|
 | `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field (PCR + OPCR + splice_countdown + transport_private_data + adaptation_field_extension with ltw / piecewise_rate / seamless_splice), payload. |
-| `psi`            | PAT + PMT + CAT (Conditional Access Table, §2.4.4.6) + TSDT (Transport Stream Description Table, §2.4.4.12 — TS-wide descriptor loop on PID 0x0002 / table_id 0x03) section parsers, plus `PsiSectionAssembler` — per-PID reassembler that joins long sections across multiple 188-byte TS packets (§2.4.4 pointer_field + PUSI continuation). Handles up-to-1024-byte sections, stuffing terminators, CC-skip detection, and back-to-back sections in one payload. |
-| `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / hierarchy / AVC / HEVC / data-stream-alignment / target-background-grid / system-clock / multiplex-buffer-utilization / copyright / maximum-bitrate / smoothing-buffer / STD / IBP. |
+| `psi`            | PAT + PMT + CAT (Conditional Access Table, §2.4.4.6) + TSDT (Transport Stream Description Table, §2.4.4.12 — TS-wide descriptor loop on PID 0x0002 / table_id 0x03) + SDT (DVB Service Description Table, ETSI EN 300 468 §5.2.3 — service loop on PID 0x0011 / table_id 0x42 actual + 0x46 other, with typed `RunningStatus`) section parsers, plus `PsiSectionAssembler` — per-PID reassembler that joins long sections across multiple 188-byte TS packets (§2.4.4 pointer_field + PUSI continuation). Handles up-to-1024-byte sections, stuffing terminators, CC-skip detection, and back-to-back sections in one payload. |
+| `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / hierarchy / AVC / HEVC / data-stream-alignment / target-background-grid / system-clock / multiplex-buffer-utilization / copyright / maximum-bitrate / smoothing-buffer / STD / IBP — plus the DVB `service_descriptor` (tag 0x48, EN 300 468 §6.2.33) carrying the service / provider names. |
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. Decodes every Table 2-17 optional header field: PES_scrambling_control / PES_priority / data_alignment_indicator / copyright / original_or_copy on flags1, plus the flag-gated bodies ESCR (42-bit 27 MHz tick), ES_rate (50 bytes/s units), DSM_trick_mode (raw 8-bit), additional_copy_info, previous_PES_packet_CRC, and the full PES_extension body (16-byte private data, raw pack_header bytes, program_packet_sequence_counter, P-STD buffer scale/size, PES_extension_field_2). |
 | `stream_type`    | `stream_type` byte → BD-relevant codec class enum.                          |
 | `clock`          | Per-PCR-PID 27 MHz clock recovery + per-PID continuity-counter classification (§2.4.2.2 / §2.4.3.3 / §2.4.3.5). |
@@ -34,6 +34,19 @@ decoded body for the most common tags). Unrecognised tags surface as
 `DescriptorBody::Raw` so downstream callers still see the payload
 bytes verbatim. `ConditionalAccessTable::iter_descriptors` exposes
 the same view over a CAT's CA_descriptor block.
+
+`ServiceDescriptionTable::parse` reads a DVB SDT section into typed
+`SdtService` entries — `service_id` (equal to the PMT
+`program_number` for normal services), the two EIT-presence flags, a
+typed `RunningStatus` (EN 300 468 Table 6), `free_CA_mode`, and a
+per-service descriptor loop. `SdtService::iter_descriptors` lifts that
+loop, and the `service_descriptor` (tag 0x48) it usually carries
+decodes to `DescriptorBody::Service` exposing the `service_type` byte
+plus the raw service / provider name runs. That name is what the
+`oxideav remux bluray://` path needs to label an MKV title when the
+source TS carries an SDT. DVB text strings keep their original bytes —
+the EN 300 468 annex-A character-table selection is deliberately left
+to the caller rather than decoded here.
 
 `PsiSectionAssembler` is the building block that turns a stream of
 TS-packet payloads on a single PSI PID into a stream of complete
