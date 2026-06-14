@@ -44,6 +44,22 @@ pub const SDT_ACTUAL_TABLE_ID: u8 = 0x42;
 /// SDT `table_id` for sections describing **other** Transport Streams
 /// (ETSI EN 300 468 §5.2.3 / Table 2).
 pub const SDT_OTHER_TABLE_ID: u8 = 0x46;
+/// EIT `table_id` for present/following events on the **actual** TS
+/// (ETSI EN 300 468 §5.2.4 / Table 2 — `0x4E`).
+pub const EIT_ACTUAL_PF_TABLE_ID: u8 = 0x4E;
+/// EIT `table_id` for present/following events on **other** TSs
+/// (ETSI EN 300 468 §5.2.4 / Table 2 — `0x4F`).
+pub const EIT_OTHER_PF_TABLE_ID: u8 = 0x4F;
+/// First `table_id` of the EIT **actual**-TS schedule range
+/// (ETSI EN 300 468 §5.2.4 / Table 2 — `0x50`–`0x5F` inclusive).
+pub const EIT_ACTUAL_SCHEDULE_FIRST: u8 = 0x50;
+/// Last `table_id` of the EIT actual-TS schedule range (`0x5F`).
+pub const EIT_ACTUAL_SCHEDULE_LAST: u8 = 0x5F;
+/// First `table_id` of the EIT **other**-TS schedule range
+/// (ETSI EN 300 468 §5.2.4 / Table 2 — `0x60`–`0x6F` inclusive).
+pub const EIT_OTHER_SCHEDULE_FIRST: u8 = 0x60;
+/// Last `table_id` of the EIT other-TS schedule range (`0x6F`).
+pub const EIT_OTHER_SCHEDULE_LAST: u8 = 0x6F;
 
 /// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
 pub const PAT_PID: u16 = 0x0000;
@@ -55,6 +71,9 @@ pub const TSDT_PID: u16 = 0x0002;
 /// Fixed PID carrying the DVB SDT / BAT / ST sections (ETSI EN 300 468
 /// §5.1.3 Table 1 — `0x0011`).
 pub const SDT_PID: u16 = 0x0011;
+/// Fixed PID carrying the DVB EIT sections (ETSI EN 300 468 §5.1.3
+/// Table 1 / §5.2.4 — `0x0012`).
+pub const EIT_PID: u16 = 0x0012;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
@@ -505,6 +524,303 @@ impl ServiceDescriptionTable {
     }
 }
 
+/// A calendar date + wall-clock time decoded from an EIT 40-bit
+/// `start_time` field (ETSI EN 300 468 §5.2.4 / annex C).
+///
+/// On the wire the field is 16 bits of Modified Julian Date (the 16
+/// least-significant bits of the MJD) followed by 24 bits of 6-digit
+/// 4-bit BCD encoding the UTC hours/minutes/seconds. The date portion
+/// is converted to the proleptic Gregorian `(year, month, day)` using
+/// the integer formula in annex C; the time portion is the decoded BCD.
+///
+/// When every bit of the 40-bit field is set (`0xFF_FFFF_FFFF`) the
+/// start time is *undefined* (e.g. for an NVOD reference event) and the
+/// parser yields `None` rather than a bogus date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EitDateTime {
+    /// Full Gregorian year (e.g. `2003`), reconstructed from the 16-bit
+    /// MJD plus the annex-C `Y = year − 1900` intermediate.
+    pub year: u16,
+    /// Month, 1 (January) through 12 (December).
+    pub month: u8,
+    /// Day of month, 1 through 31.
+    pub day: u8,
+    /// UTC hour, 0 through 23 (decoded from BCD; not range-clamped).
+    pub hour: u8,
+    /// UTC minute, 0 through 59 (decoded from BCD; not range-clamped).
+    pub minute: u8,
+    /// UTC second, 0 through 59 (decoded from BCD; not range-clamped).
+    pub second: u8,
+    /// The raw 16-bit MJD value, preserved for callers that prefer to do
+    /// their own date arithmetic.
+    pub mjd: u16,
+}
+
+/// An event duration decoded from an EIT 24-bit `duration` field
+/// (ETSI EN 300 468 §5.2.4) — 6 digits of 4-bit BCD giving hours,
+/// minutes, and seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EitDuration {
+    /// Hours component (BCD-decoded; may exceed 24 for long events).
+    pub hours: u8,
+    /// Minutes component (BCD-decoded, 0–59).
+    pub minutes: u8,
+    /// Seconds component (BCD-decoded, 0–59).
+    pub seconds: u8,
+}
+
+impl EitDuration {
+    /// Total duration expressed in whole seconds.
+    pub fn as_seconds(&self) -> u32 {
+        (self.hours as u32) * 3600 + (self.minutes as u32) * 60 + (self.seconds as u32)
+    }
+}
+
+/// Decode one 4-bit-BCD byte into its 0–99 integer value.
+fn bcd_byte(b: u8) -> u8 {
+    (b >> 4) * 10 + (b & 0x0F)
+}
+
+/// Decode the 40-bit EIT `start_time` (16-bit MJD + 24-bit BCD time).
+///
+/// Returns `None` when the field is the all-ones "undefined" sentinel.
+/// The MJD→(Y,M,D) conversion follows the integer formula in
+/// ETSI EN 300 468 annex C:
+///
+/// ```text
+/// Y' = int((MJD − 15078,2) / 365,25)
+/// M' = int((MJD − 14956,1 − int(Y' × 365,25)) / 30,6001)
+/// D  = MJD − 14956 − int(Y' × 365,25) − int(M' × 30,6001)
+/// K  = 1 if M' == 14 or M' == 15 else 0
+/// Y  = Y' + K                 (years since 1900)
+/// M  = M' − 1 − K × 12
+/// ```
+fn decode_eit_start_time(bytes: [u8; 5]) -> Option<EitDateTime> {
+    if bytes == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF] {
+        return None;
+    }
+    let mjd = u16::from_be_bytes([bytes[0], bytes[1]]);
+    // Annex C integer arithmetic. The constants 365,25 and 30,6001 are
+    // applied via scaled integer multiplication to avoid floating point:
+    // int(Y' × 365,25) == (Y' × 36525) / 100, etc.
+    let mjd_i = mjd as i64;
+    let yp = ((mjd_i - 15078) * 100 - 20) / 36525; // int((MJD − 15078,2)/365,25)
+    let yp_days = (yp * 36525) / 100; // int(Y' × 365,25)
+                                      // int((MJD − 14956,1 − yp_days)/30,6001)
+    let mp = ((mjd_i - 14956 - yp_days) * 10000 - 1) / 306001;
+    let mp_days = (mp * 306001) / 10000; // int(M' × 30,6001)
+    let d = mjd_i - 14956 - yp_days - mp_days;
+    let k: i64 = if mp == 14 || mp == 15 { 1 } else { 0 };
+    let y = yp + k;
+    let m = mp - 1 - k * 12;
+    let year = (1900 + y) as u16;
+    let month = m as u8;
+    let day = d as u8;
+    let hour = bcd_byte(bytes[2]);
+    let minute = bcd_byte(bytes[3]);
+    let second = bcd_byte(bytes[4]);
+    Some(EitDateTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        mjd,
+    })
+}
+
+/// One event entry from the EIT event loop (ETSI EN 300 468 §5.2.4
+/// Table 7).
+#[derive(Debug, Clone)]
+pub struct EitEvent {
+    /// 16-bit `event_id`, unique within a service.
+    pub event_id: u16,
+    /// Decoded `start_time` — `None` when the field was the all-ones
+    /// "undefined" sentinel (e.g. for an NVOD reference event).
+    pub start_time: Option<EitDateTime>,
+    /// Decoded `duration` (BCD hours/minutes/seconds).
+    pub duration: EitDuration,
+    /// 3-bit `running_status` (Table 6).
+    pub running_status: RunningStatus,
+    /// `free_CA_mode` — `false` when every component stream of the event
+    /// is unscrambled; `true` when one or more may be CA-controlled.
+    pub free_ca_mode: bool,
+    /// Raw bytes of this event's `descriptor()` loop — walk with
+    /// [`Self::iter_descriptors`]. The DVB `short_event_descriptor`
+    /// (tag `0x4D`) carried here decodes the event name + short text.
+    pub descriptors: Vec<u8>,
+}
+
+impl EitEvent {
+    /// Walk this event's descriptor loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Parsed DVB Event Information Table (ETSI EN 300 468 §5.2.4 Table 7).
+///
+/// The EIT carries chronological per-event metadata (start time,
+/// duration, running status, descriptors) for the services in a
+/// multiplex. It is carried on the fixed PID [`EIT_PID`] (`0x0012`) and
+/// distinguished from other tables by `table_id`:
+///
+/// * `0x4E` — present/following events on the **actual** TS.
+/// * `0x4F` — present/following events on **other** TSs.
+/// * `0x50`–`0x5F` — event schedule on the actual TS.
+/// * `0x60`–`0x6F` — event schedule on other TSs.
+///
+/// The section shares the 8-byte long-form PSI header (CRC-verified the
+/// same way as PAT/PMT/SDT) where `service_id` lives in the
+/// `table_id_extension` slot. After the header the body carries
+/// `transport_stream_id` (16) + `original_network_id` (16) +
+/// `segment_last_section_number` (8) + `last_table_id` (8), then a loop
+/// of [`EitEvent`] entries, then the CRC.
+///
+/// The `service_id` equals the corresponding PMT `program_number` for
+/// normal services, so an EIT lets the `oxideav remux bluray://` path
+/// attach human-readable event names (via the per-event
+/// `short_event_descriptor`) and time ranges to each program.
+#[derive(Debug, Default, Clone)]
+pub struct EventInformationTable {
+    /// `service_id` (from `table_id_extension`).
+    pub service_id: u16,
+    /// `true` when the section describes other TSs (`table_id` `0x4F`
+    /// or `0x60`–`0x6F`); `false` for the actual TS (`0x4E` /
+    /// `0x50`–`0x5F`).
+    pub other_transport_stream: bool,
+    /// `true` when the section is event-schedule information
+    /// (`0x50`–`0x6F`); `false` for present/following (`0x4E` / `0x4F`).
+    pub schedule: bool,
+    /// Raw `table_id` of the parsed section.
+    pub table_id: u8,
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// `current_next_indicator`.
+    pub current_next_indicator: bool,
+    /// `section_number`.
+    pub section_number: u8,
+    /// `last_section_number`.
+    pub last_section_number: u8,
+    /// `transport_stream_id`.
+    pub transport_stream_id: u16,
+    /// `original_network_id`.
+    pub original_network_id: u16,
+    /// `segment_last_section_number` — last section of this segment of
+    /// the sub_table (equals `last_section_number` for unsegmented
+    /// sub_tables).
+    pub segment_last_section_number: u8,
+    /// `last_table_id` — the largest `table_id` used by this service's
+    /// sub_table (per §5.2.4 may differ per service).
+    pub last_table_id: u8,
+    /// Event entries carried in this section, in chronological order.
+    pub events: Vec<EitEvent>,
+}
+
+impl EventInformationTable {
+    /// `true` when `table_id` is any of the four EIT classifications
+    /// (`0x4E`, `0x4F`, `0x50`–`0x5F`, `0x60`–`0x6F`).
+    pub fn is_eit_table_id(table_id: u8) -> bool {
+        matches!(table_id, EIT_ACTUAL_PF_TABLE_ID | EIT_OTHER_PF_TABLE_ID)
+            || (EIT_ACTUAL_SCHEDULE_FIRST..=EIT_ACTUAL_SCHEDULE_LAST).contains(&table_id)
+            || (EIT_OTHER_SCHEDULE_FIRST..=EIT_OTHER_SCHEDULE_LAST).contains(&table_id)
+    }
+
+    /// Parse a single EIT section. The slice must run from `table_id`
+    /// through the CRC trailer (i.e. the pointer_field has already been
+    /// skipped). Accepts any of the four EIT `table_id` classifications.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        if !Self::is_eit_table_id(table_id) {
+            return Err(TsError::Unsupported(
+                "PSI table_id does not match expected value",
+            ));
+        }
+        let other_transport_stream = table_id == EIT_OTHER_PF_TABLE_ID
+            || (EIT_OTHER_SCHEDULE_FIRST..=EIT_OTHER_SCHEDULE_LAST).contains(&table_id);
+        let schedule = (EIT_ACTUAL_SCHEDULE_FIRST..=EIT_OTHER_SCHEDULE_LAST).contains(&table_id);
+        let (hdr, body) = parse_section_header(section, table_id)?;
+        // Body layout (Table 7): transport_stream_id (16) +
+        // original_network_id (16) + segment_last_section_number (8) +
+        // last_table_id (8), then the event loop.
+        if body.len() < 6 {
+            return Err(TsError::Truncated {
+                what: "EIT body",
+                have: body.len(),
+                need: 6,
+            });
+        }
+        let transport_stream_id = u16::from_be_bytes([body[0], body[1]]);
+        let original_network_id = u16::from_be_bytes([body[2], body[3]]);
+        let segment_last_section_number = body[4];
+        let last_table_id = body[5];
+        let mut events = Vec::new();
+        let mut i = 6;
+        // Each event entry: event_id (16) + start_time (40) +
+        // duration (24) + running_status (3) / free_CA_mode (1) /
+        // descriptors_length (12). Fixed head = 12 bytes before the
+        // descriptor loop.
+        while i + 12 <= body.len() {
+            let event_id = u16::from_be_bytes([body[i], body[i + 1]]);
+            let start_time = decode_eit_start_time([
+                body[i + 2],
+                body[i + 3],
+                body[i + 4],
+                body[i + 5],
+                body[i + 6],
+            ]);
+            let duration = EitDuration {
+                hours: bcd_byte(body[i + 7]),
+                minutes: bcd_byte(body[i + 8]),
+                seconds: bcd_byte(body[i + 9]),
+            };
+            let b10 = body[i + 10];
+            let running_status = RunningStatus::from_bits(b10 >> 5);
+            let free_ca_mode = (b10 & 0b0001_0000) != 0;
+            let descriptors_length =
+                (u16::from_be_bytes([b10 & 0b0000_1111, body[i + 11]])) as usize;
+            let descr_start = i + 12;
+            let descr_end = descr_start.checked_add(descriptors_length).ok_or(
+                TsError::SectionLengthOverrun {
+                    claimed: descriptors_length,
+                    have: body.len() - descr_start,
+                },
+            )?;
+            if descr_end > body.len() {
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: descriptors_length,
+                    have: body.len() - descr_start,
+                });
+            }
+            events.push(EitEvent {
+                event_id,
+                start_time,
+                duration,
+                running_status,
+                free_ca_mode,
+                descriptors: body[descr_start..descr_end].to_vec(),
+            });
+            i = descr_end;
+        }
+        Ok(Self {
+            service_id: hdr.table_id_extension,
+            other_transport_stream,
+            schedule,
+            table_id,
+            version_number: hdr.version_number,
+            current_next_indicator: hdr.current_next_indicator,
+            section_number: hdr.section_number,
+            last_section_number: hdr.last_section_number,
+            transport_stream_id,
+            original_network_id,
+            segment_last_section_number,
+            last_table_id,
+            events,
+        })
+    }
+}
+
 /// Per-PID PSI section reassembler — joins TS payloads carrying the
 /// same `table_id` across multiple 188-byte TS packets per §2.4.4.
 ///
@@ -898,6 +1214,7 @@ impl<'a> Iterator for SectionIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::descriptor::DescriptorBody;
 
     /// Build a PAT section for a single (program_number, pmt_pid)
     /// pair. Section bytes run from table_id through CRC.
@@ -1650,5 +1967,261 @@ mod tests {
         assert_eq!(RunningStatus::from_bits(0), RunningStatus::Undefined);
         assert_eq!(RunningStatus::from_bits(2), RunningStatus::StartsSoon);
         assert_eq!(RunningStatus::from_bits(3), RunningStatus::Pausing);
+    }
+
+    /// Build a short_event_descriptor (tag 0x4D) TLV.
+    fn build_short_event_descriptor(lang: &[u8; 3], name: &[u8], text: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(lang);
+        body.push(name.len() as u8);
+        body.extend_from_slice(name);
+        body.push(text.len() as u8);
+        body.extend_from_slice(text);
+        let mut v = vec![0x4Du8, body.len() as u8];
+        v.extend_from_slice(&body);
+        v
+    }
+
+    /// Build one EIT event entry (event loop element, no CRC).
+    #[allow(clippy::too_many_arguments)]
+    fn build_eit_event(
+        event_id: u16,
+        start_time: [u8; 5],
+        duration_bcd: [u8; 3],
+        running_status: u8,
+        free_ca: bool,
+        descriptors: &[u8],
+    ) -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(&event_id.to_be_bytes());
+        s.extend_from_slice(&start_time);
+        s.extend_from_slice(&duration_bcd);
+        let dlen = descriptors.len() as u16;
+        let b = ((running_status & 0b111) << 5)
+            | (if free_ca { 0b0001_0000 } else { 0 })
+            | ((dlen >> 8) & 0x0F) as u8;
+        s.push(b);
+        s.push((dlen & 0xFF) as u8);
+        s.extend_from_slice(descriptors);
+        s
+    }
+
+    /// Build a full EIT section (table_id through CRC).
+    #[allow(clippy::too_many_arguments)]
+    fn build_eit_section(
+        table_id: u8,
+        service_id: u16,
+        version: u8,
+        tsid: u16,
+        onid: u16,
+        segment_last: u8,
+        last_table_id: u8,
+        events: &[Vec<u8>],
+    ) -> Vec<u8> {
+        // body = tsid(2) + onid(2) + segment_last(1) + last_table_id(1)
+        //        + Σ events.
+        let body_len: usize = 6 + events.iter().map(|e| e.len()).sum::<usize>();
+        let section_length = 5 + body_len + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(table_id);
+        let len_hi = 0b1011_0000 | ((section_length >> 8) & 0x0F) as u8;
+        s.push(len_hi);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(&service_id.to_be_bytes());
+        s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
+        s.push(0); // section_number
+        s.push(0); // last_section_number
+        s.extend_from_slice(&tsid.to_be_bytes());
+        s.extend_from_slice(&onid.to_be_bytes());
+        s.push(segment_last);
+        s.push(last_table_id);
+        for e in events {
+            s.extend_from_slice(e);
+        }
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    #[test]
+    fn eit_start_time_spec_example() {
+        // EN 300 468 §5.2.4 example 2: 93/10/13 12:45:00 is coded as
+        // 0xC0 7912 4500 (MJD 0xC079 = 49273, then 12 45 00 in BCD).
+        let dt = decode_eit_start_time([0xC0, 0x79, 0x12, 0x45, 0x00]).unwrap();
+        assert_eq!(dt.mjd, 0xC079);
+        assert_eq!(dt.year, 1993);
+        assert_eq!(dt.month, 10);
+        assert_eq!(dt.day, 13);
+        assert_eq!(dt.hour, 12);
+        assert_eq!(dt.minute, 45);
+        assert_eq!(dt.second, 0);
+    }
+
+    #[test]
+    fn eit_start_time_undefined_sentinel() {
+        assert!(decode_eit_start_time([0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).is_none());
+    }
+
+    #[test]
+    fn eit_duration_spec_example() {
+        // EN 300 468 §5.2.4 example 3: 01:45:30 is coded as 0x01 4530.
+        let d = EitDuration {
+            hours: bcd_byte(0x01),
+            minutes: bcd_byte(0x45),
+            seconds: bcd_byte(0x30),
+        };
+        assert_eq!(d.hours, 1);
+        assert_eq!(d.minutes, 45);
+        assert_eq!(d.seconds, 30);
+        assert_eq!(d.as_seconds(), 3600 + 45 * 60 + 30);
+    }
+
+    #[test]
+    fn eit_actual_pf_single_event_round_trip() {
+        let sed = build_short_event_descriptor(b"eng", b"The Event", b"A short description");
+        let ev = build_eit_event(
+            0x1234,
+            [0xC0, 0x79, 0x12, 0x45, 0x00],
+            [0x01, 0x45, 0x30],
+            4, // running
+            false,
+            &sed,
+        );
+        let section = build_eit_section(
+            EIT_ACTUAL_PF_TABLE_ID,
+            0x0064, // service_id
+            5,
+            0x0001, // tsid
+            0x2024, // onid
+            0,
+            EIT_ACTUAL_PF_TABLE_ID,
+            &[ev],
+        );
+        let eit = EventInformationTable::parse(&section).unwrap();
+        assert!(!eit.other_transport_stream);
+        assert!(!eit.schedule);
+        assert_eq!(eit.table_id, EIT_ACTUAL_PF_TABLE_ID);
+        assert_eq!(eit.service_id, 0x0064);
+        assert_eq!(eit.version_number, 5);
+        assert!(eit.current_next_indicator);
+        assert_eq!(eit.transport_stream_id, 0x0001);
+        assert_eq!(eit.original_network_id, 0x2024);
+        assert_eq!(eit.last_table_id, EIT_ACTUAL_PF_TABLE_ID);
+        assert_eq!(eit.events.len(), 1);
+        let e = &eit.events[0];
+        assert_eq!(e.event_id, 0x1234);
+        let st = e.start_time.unwrap();
+        assert_eq!((st.year, st.month, st.day), (1993, 10, 13));
+        assert_eq!((st.hour, st.minute, st.second), (12, 45, 0));
+        assert_eq!(e.duration.as_seconds(), 6330);
+        assert_eq!(e.running_status, RunningStatus::Running);
+        assert!(!e.free_ca_mode);
+        // The short_event_descriptor decodes to the event name + text.
+        let d = e.iter_descriptors().next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ShortEvent(se) => {
+                assert_eq!(&se.language_code, b"eng");
+                assert_eq!(se.event_name, b"The Event");
+                assert_eq!(se.text, b"A short description");
+            }
+            other => panic!("expected ShortEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eit_schedule_and_other_flags() {
+        // 0x60 = other-TS schedule.
+        let ev = build_eit_event(1, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF], [0, 0, 0], 0, true, &[]);
+        let section = build_eit_section(0x60, 0x0001, 0, 0x0001, 0x0001, 0, 0x62, &[ev]);
+        let eit = EventInformationTable::parse(&section).unwrap();
+        assert!(eit.other_transport_stream);
+        assert!(eit.schedule);
+        assert_eq!(eit.last_table_id, 0x62);
+        // Undefined start time surfaces as None; free_CA_mode set.
+        assert!(eit.events[0].start_time.is_none());
+        assert!(eit.events[0].free_ca_mode);
+    }
+
+    #[test]
+    fn eit_multiple_events() {
+        let e0 = build_eit_event(
+            10,
+            [0xC0, 0x79, 0x12, 0x00, 0x00],
+            [0, 0x30, 0],
+            4,
+            false,
+            &[],
+        );
+        let e1 = build_eit_event(
+            11,
+            [0xC0, 0x79, 0x12, 0x30, 0x00],
+            [0x01, 0, 0],
+            1,
+            false,
+            &[],
+        );
+        let section = build_eit_section(
+            EIT_ACTUAL_PF_TABLE_ID,
+            0x0064,
+            0,
+            0x0001,
+            0x0001,
+            0,
+            0x4E,
+            &[e0, e1],
+        );
+        let eit = EventInformationTable::parse(&section).unwrap();
+        assert_eq!(eit.events.len(), 2);
+        assert_eq!(eit.events[0].event_id, 10);
+        assert_eq!(eit.events[1].event_id, 11);
+        assert_eq!(eit.events[0].duration.minutes, 30);
+        assert_eq!(eit.events[1].duration.hours, 1);
+    }
+
+    #[test]
+    fn eit_table_id_classification() {
+        assert!(EventInformationTable::is_eit_table_id(0x4E));
+        assert!(EventInformationTable::is_eit_table_id(0x4F));
+        assert!(EventInformationTable::is_eit_table_id(0x50));
+        assert!(EventInformationTable::is_eit_table_id(0x5F));
+        assert!(EventInformationTable::is_eit_table_id(0x60));
+        assert!(EventInformationTable::is_eit_table_id(0x6F));
+        assert!(!EventInformationTable::is_eit_table_id(0x4D));
+        assert!(!EventInformationTable::is_eit_table_id(0x70));
+        assert!(!EventInformationTable::is_eit_table_id(0x42));
+    }
+
+    #[test]
+    fn eit_rejects_wrong_table_id() {
+        let ev = build_eit_event(1, [0xFF; 5], [0, 0, 0], 0, false, &[]);
+        // Build with a valid EIT id, then corrupt the table_id byte so
+        // the CRC still matches the original — parse must reject on id.
+        let mut section = build_eit_section(0x70, 0, 0, 0, 0, 0, 0, &[ev]);
+        section[0] = 0x70;
+        assert!(matches!(
+            EventInformationTable::parse(&section),
+            Err(TsError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn eit_crc_mismatch_rejected() {
+        let ev = build_eit_event(1, [0xC0, 0x79, 0x12, 0x45, 0x00], [0, 0, 0], 4, false, &[]);
+        let mut section = build_eit_section(
+            EIT_ACTUAL_PF_TABLE_ID,
+            0x0064,
+            0,
+            0x0001,
+            0x0001,
+            0,
+            0x4E,
+            &[ev],
+        );
+        let last = section.len() - 1;
+        section[last] ^= 0xFF;
+        assert!(matches!(
+            EventInformationTable::parse(&section),
+            Err(TsError::PsiCrcMismatch { .. })
+        ));
     }
 }

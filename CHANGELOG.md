@@ -11,6 +11,35 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `EventInformationTable` — the DVB Event Information Table (EIT,
+  ETSI EN 300 468 §5.2.4 / Table 7), carrying chronological per-event
+  metadata for the services in a multiplex. Carried on the fixed PID
+  `EIT_PID` (`0x0012`); `parse` accepts all four `table_id`
+  classifications — present/following on the actual TS
+  (`EIT_ACTUAL_PF_TABLE_ID`, `0x4E`) and other TSs (`0x4F`), and the
+  event-schedule ranges `0x50`–`0x5F` (actual) / `0x60`–`0x6F` (other)
+  — recording `other_transport_stream` and `schedule`. It CRC-verifies
+  the long-form section header the same way as PAT/PMT/SDT, reads
+  `transport_stream_id` / `original_network_id` /
+  `segment_last_section_number` / `last_table_id`, then a loop of
+  `EitEvent` entries (`event_id`, decoded `start_time`, `duration`,
+  `running_status`, `free_CA_mode`, and a per-event descriptor block).
+  A truncated event, a wrong `table_id`, or a bad CRC are rejected with
+  `TsError`.
+- `EitDateTime` / `EitDuration` — the EIT `start_time` 40-bit field is
+  decoded per EN 300 468 annex C: 16 bits of Modified Julian Date
+  converted to a Gregorian `(year, month, day)` via the integer
+  conversion formula, plus 24 bits of 4-bit BCD UTC time. The
+  all-ones sentinel surfaces as `None`. `duration` is the 24-bit BCD
+  hours/minutes/seconds, with `EitDuration::as_seconds`. The spec
+  worked examples (`0xC0 7912 4500` → 1993-10-13 12:45:00 and
+  `0x01 4530` → 01:45:30) are pinned as tests.
+- `ShortEventDescriptor` (DVB descriptor tag `0x4D`, EN 300 468
+  §6.2.37 / Table 93) decoded by the descriptor layer — the 24-bit
+  `ISO_639_language_code` plus the raw `event_name` / `text` byte runs
+  (DVB text strings, annex A character-table selection left to the
+  caller). Carried in the EIT event loop, this is the source of an
+  event's human-readable name for the `oxideav remux bluray://` path.
 - `ServiceDescriptionTable` — the DVB Service Description Table (SDT,
   ETSI EN 300 468 §5.2.3 / Table 5), the first Service Information
   table beyond the ISO/IEC 13818-1 PSI set. Carried on the fixed PID

@@ -18,8 +18,8 @@ language-tagged tracks and chapter marks.
 | Module           | What it parses                                                              |
 |------------------|-----------------------------------------------------------------------------|
 | `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field (PCR + OPCR + splice_countdown + transport_private_data + adaptation_field_extension with ltw / piecewise_rate / seamless_splice), payload. |
-| `psi`            | PAT + PMT + CAT (Conditional Access Table, §2.4.4.6) + TSDT (Transport Stream Description Table, §2.4.4.12 — TS-wide descriptor loop on PID 0x0002 / table_id 0x03) + SDT (DVB Service Description Table, ETSI EN 300 468 §5.2.3 — service loop on PID 0x0011 / table_id 0x42 actual + 0x46 other, with typed `RunningStatus`) section parsers, plus `PsiSectionAssembler` — per-PID reassembler that joins long sections across multiple 188-byte TS packets (§2.4.4 pointer_field + PUSI continuation). Handles up-to-1024-byte sections, stuffing terminators, CC-skip detection, and back-to-back sections in one payload. |
-| `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / hierarchy / AVC / HEVC / data-stream-alignment / target-background-grid / system-clock / multiplex-buffer-utilization / copyright / maximum-bitrate / smoothing-buffer / STD / IBP — plus the DVB `service_descriptor` (tag 0x48, EN 300 468 §6.2.33) carrying the service / provider names. |
+| `psi`            | PAT + PMT + CAT (Conditional Access Table, §2.4.4.6) + TSDT (Transport Stream Description Table, §2.4.4.12 — TS-wide descriptor loop on PID 0x0002 / table_id 0x03) + SDT (DVB Service Description Table, ETSI EN 300 468 §5.2.3 — service loop on PID 0x0011 / table_id 0x42 actual + 0x46 other, with typed `RunningStatus`) + EIT (DVB Event Information Table, EN 300 468 §5.2.4 — event loop on PID 0x0012 / table_id 0x4E/0x4F present-following + 0x50–0x6F schedule, with MJD/BCD `start_time` + BCD `duration` decoded per annex C) section parsers, plus `PsiSectionAssembler` — per-PID reassembler that joins long sections across multiple 188-byte TS packets (§2.4.4 pointer_field + PUSI continuation). Handles up-to-1024-byte sections, stuffing terminators, CC-skip detection, and back-to-back sections in one payload. |
+| `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / hierarchy / AVC / HEVC / data-stream-alignment / target-background-grid / system-clock / multiplex-buffer-utilization / copyright / maximum-bitrate / smoothing-buffer / STD / IBP — plus the DVB `service_descriptor` (tag 0x48, EN 300 468 §6.2.33) carrying the service / provider names and the DVB `short_event_descriptor` (tag 0x4D, EN 300 468 §6.2.37) carrying the event name + short text. |
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. Decodes every Table 2-17 optional header field: PES_scrambling_control / PES_priority / data_alignment_indicator / copyright / original_or_copy on flags1, plus the flag-gated bodies ESCR (42-bit 27 MHz tick), ES_rate (50 bytes/s units), DSM_trick_mode (raw 8-bit), additional_copy_info, previous_PES_packet_CRC, and the full PES_extension body (16-byte private data, raw pack_header bytes, program_packet_sequence_counter, P-STD buffer scale/size, PES_extension_field_2). |
 | `stream_type`    | `stream_type` byte → BD-relevant codec class enum.                          |
 | `clock`          | Per-PCR-PID 27 MHz clock recovery + per-PID continuity-counter classification (§2.4.2.2 / §2.4.3.3 / §2.4.3.5). |
@@ -47,6 +47,29 @@ plus the raw service / provider name runs. That name is what the
 source TS carries an SDT. DVB text strings keep their original bytes —
 the EN 300 468 annex-A character-table selection is deliberately left
 to the caller rather than decoded here.
+
+`EventInformationTable::parse` reads a DVB EIT section (EN 300 468
+§5.2.4) into typed `EitEvent` entries. The EIT lives on the fixed PID
+`0x0012` and comes in four `table_id` classifications — present/
+following on the actual TS (`0x4E`) or another TS (`0x4F`), and the
+event schedule on the actual TS (`0x50`–`0x5F`) or another TS
+(`0x60`–`0x6F`); `parse` accepts all four and records
+`other_transport_stream` / `schedule`. Each `EitEvent` carries its
+`event_id`, a decoded `start_time` (`EitDateTime` — the 40-bit field's
+16-bit Modified Julian Date is converted to a Gregorian
+`(year, month, day)` via the annex-C integer formula, and the 24-bit
+BCD UTC time is decoded alongside; the all-ones "undefined" sentinel
+surfaces as `None`), a `duration` (`EitDuration` — BCD hours/minutes/
+seconds with `as_seconds`), a typed `RunningStatus`, `free_CA_mode`,
+and a per-event descriptor loop. `EitEvent::iter_descriptors` lifts
+that loop, where the `short_event_descriptor` (tag `0x4D`) decodes to
+`DescriptorBody::ShortEvent` exposing the language code plus the raw
+event-name and short-text runs. Since `service_id` equals the PMT
+`program_number` for normal services, the EIT lets the
+`oxideav remux bluray://` path attach human-readable event names and
+time ranges to each title. The spec's worked examples
+(`0xC0 7912 4500` → 1993-10-13 12:45:00 and `0x01 4530` → 01:45:30)
+are pinned as tests.
 
 `PsiSectionAssembler` is the building block that turns a stream of
 TS-packet payloads on a single PSI PID into a stream of complete

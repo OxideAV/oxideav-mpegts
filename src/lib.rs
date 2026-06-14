@@ -48,11 +48,15 @@
 //!
 //! ## What's NOT in scope
 //!
-//! - PSIP / DVB SI tables beyond PAT + PMT + CAT + TSDT + SDT (no NIT,
-//!   BAT, EIT, TDT/TOT yet). The SDT
+//! - PSIP / DVB SI tables beyond PAT + PMT + CAT + TSDT + SDT + EIT
+//!   (no NIT, BAT, TDT/TOT yet). The SDT
 //!   ([`psi::ServiceDescriptionTable`], ETSI EN 300 468 §5.2.3) is
 //!   parsed including its per-service `service_descriptor` (tag `0x48`)
-//!   for human-readable service / provider names.
+//!   for human-readable service / provider names. The EIT
+//!   ([`psi::EventInformationTable`], §5.2.4) is parsed across all four
+//!   `table_id` classifications, decoding each event's MJD/BCD
+//!   `start_time`, BCD `duration`, and per-event descriptor loop — the
+//!   `short_event_descriptor` (tag `0x4D`) names the event.
 //! - Conditional Access (CA) descriptors / scrambling.
 //! - Re-multiplexing — this is a demux-only crate. The MKV writer
 //!   in `oxideav-mkv` owns the output side.
@@ -82,8 +86,8 @@ pub use clock::{
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
     DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor,
-    Iso639Language, MaximumBitrateDescriptor, ServiceDescriptor, SmoothingBufferDescriptor,
-    StdDescriptor, SystemClockDescriptor, VideoStreamDescriptor,
+    Iso639Language, MaximumBitrateDescriptor, ServiceDescriptor, ShortEventDescriptor,
+    SmoothingBufferDescriptor, StdDescriptor, SystemClockDescriptor, VideoStreamDescriptor,
 };
 pub use error::TsError;
 pub use packet::{
@@ -92,11 +96,14 @@ pub use packet::{
 };
 pub use pes::{PStdBuffer, PesExtension, PesPacket, PesReassembler, ProgramPacketSequenceCounter};
 pub use psi::{
-    iter_sections, mpeg2_crc32, ConditionalAccessTable, PmtStream, ProgramAssociationTable,
-    ProgramMapTable, PsiSectionAssembler, RunningStatus, SdtService, SectionIter,
-    ServiceDescriptionTable, TransportStreamDescriptionTable, CAT_PID, CAT_TABLE_ID,
-    MAX_PSI_SECTION_LEN, PAT_PID, PAT_TABLE_ID, PMT_TABLE_ID, SDT_ACTUAL_TABLE_ID,
-    SDT_OTHER_TABLE_ID, SDT_PID, TSDT_PID, TSDT_TABLE_ID,
+    iter_sections, mpeg2_crc32, ConditionalAccessTable, EitDateTime, EitDuration, EitEvent,
+    EventInformationTable, PmtStream, ProgramAssociationTable, ProgramMapTable,
+    PsiSectionAssembler, RunningStatus, SdtService, SectionIter, ServiceDescriptionTable,
+    TransportStreamDescriptionTable, CAT_PID, CAT_TABLE_ID, EIT_ACTUAL_PF_TABLE_ID,
+    EIT_ACTUAL_SCHEDULE_FIRST, EIT_ACTUAL_SCHEDULE_LAST, EIT_OTHER_PF_TABLE_ID,
+    EIT_OTHER_SCHEDULE_FIRST, EIT_OTHER_SCHEDULE_LAST, EIT_PID, MAX_PSI_SECTION_LEN, PAT_PID,
+    PAT_TABLE_ID, PMT_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SDT_PID, TSDT_PID,
+    TSDT_TABLE_ID,
 };
 pub use stream_type::StreamType;
 

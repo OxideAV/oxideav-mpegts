@@ -42,6 +42,7 @@
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
 //! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
+//! | `0x4D` | short_event_descriptor (EN 300 468 §6.2.37) | [`DescriptorBody::ShortEvent`]     |
 //!
 //! Every other tag is preserved as [`DescriptorBody::Raw`] so callers
 //! still see the payload bytes without losing information.
@@ -112,6 +113,10 @@ pub enum DescriptorBody<'a> {
     /// §6.2.33 Table 88). Carried in the SDT service loop; names the
     /// service plus its provider in text form.
     Service(ServiceDescriptor<'a>),
+    /// `0x4D` short_event_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.37 Table 93). Carried in the EIT event loop; names the event
+    /// plus a short text description, both tagged with a language code.
+    ShortEvent(ShortEventDescriptor<'a>),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -140,6 +145,33 @@ pub struct ServiceDescriptor<'a> {
     pub service_provider_name: &'a [u8],
     /// Raw `service_name` bytes (DVB text string, annex A).
     pub service_name: &'a [u8],
+}
+
+/// short_event_descriptor body (ETSI EN 300 468 §6.2.37 Table 93).
+///
+/// A DVB Service Information extension to the ISO/IEC 13818-1 descriptor
+/// space, carried inside the per-event descriptor loop of an
+/// [`crate::psi::EventInformationTable`] section. It pairs the event's
+/// name with a short free-text description, both tagged by the same
+/// 3-character ISO 639-2 language code.
+///
+/// Like the `service_descriptor`, the `event_name` and `text` fields
+/// are exposed as **raw byte slices** rather than decoded strings: DVB
+/// text strings (EN 300 468 annex A) carry an optional leading
+/// character-table selector byte and may use any of several code
+/// tables, so charset interpretation is deliberately left to the
+/// caller. The bytes are exactly the `event_name` and `text` runs as
+/// they appear on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortEventDescriptor<'a> {
+    /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
+    /// coded as one ISO/IEC 8859-1 byte (e.g. `b"eng"`, `b"fre"`).
+    pub language_code: [u8; 3],
+    /// Raw `event_name` bytes (DVB text string, annex A).
+    pub event_name: &'a [u8],
+    /// Raw `text` bytes — the short event description (DVB text string,
+    /// annex A).
+    pub text: &'a [u8],
 }
 
 /// video_stream_descriptor body (§2.6.2 Table 2-46).
@@ -718,6 +750,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
+        0x4D => decode_short_event(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
 }
@@ -752,6 +785,39 @@ fn decode_service(data: &[u8]) -> Option<DescriptorBody<'_>> {
         service_type,
         service_provider_name,
         service_name,
+    }))
+}
+
+fn decode_short_event(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.37 Table 93:
+    //   ISO_639_language_code (24)
+    //   event_name_length     (8)
+    //   event_name            (name_len bytes)
+    //   text_length           (8)
+    //   text                  (text_len bytes)
+    if data.len() < 4 {
+        return None;
+    }
+    let language_code = [data[0], data[1], data[2]];
+    let name_len = data[3] as usize;
+    let name_start = 4usize;
+    let name_end = name_start.checked_add(name_len)?;
+    // The text_length byte must still fit after the event_name run.
+    if name_end >= data.len() {
+        return None;
+    }
+    let event_name = &data[name_start..name_end];
+    let text_len = data[name_end] as usize;
+    let text_start = name_end + 1;
+    let text_end = text_start.checked_add(text_len)?;
+    if text_end > data.len() {
+        return None;
+    }
+    let text = &data[text_start..text_end];
+    Some(DescriptorBody::ShortEvent(ShortEventDescriptor {
+        language_code,
+        event_name,
+        text,
     }))
 }
 
@@ -2297,5 +2363,56 @@ mod tests {
         assert_eq!(d.tag, 0x48);
         assert!(matches!(d.body, DescriptorBody::Raw));
         assert_eq!(d.data, &[0x01, 0x09, b'X', b'Y']);
+    }
+
+    #[test]
+    fn short_event_descriptor_decodes_name_and_text() {
+        // ISO_639 = "eng", name = "News", text = "Daily bulletin".
+        let mut body = Vec::new();
+        body.extend_from_slice(b"eng");
+        body.push(4);
+        body.extend_from_slice(b"News");
+        body.push(14);
+        body.extend_from_slice(b"Daily bulletin");
+        let block = tlv(0x4D, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x4D);
+        match d.body {
+            DescriptorBody::ShortEvent(s) => {
+                assert_eq!(&s.language_code, b"eng");
+                assert_eq!(s.event_name, b"News");
+                assert_eq!(s.text, b"Daily bulletin");
+            }
+            other => panic!("expected ShortEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_event_descriptor_empty_text() {
+        // Zero-length text run after a non-empty name.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fre");
+        body.push(5);
+        body.extend_from_slice(b"Match");
+        body.push(0);
+        let block = tlv(0x4D, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ShortEvent(s) => {
+                assert_eq!(&s.language_code, b"fre");
+                assert_eq!(s.event_name, b"Match");
+                assert!(s.text.is_empty());
+            }
+            other => panic!("expected ShortEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_event_descriptor_truncated_falls_back_to_raw() {
+        // name_length claims 9 bytes but only 2 follow the language code.
+        let block = tlv(0x4D, &[b'e', b'n', b'g', 0x09, b'X', b'Y']);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x4D);
+        assert!(matches!(d.body, DescriptorBody::Raw));
     }
 }
