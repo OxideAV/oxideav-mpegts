@@ -9,6 +9,34 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.1...v0.0.2) - 2026-06-15
+
+### Other
+
+- decode §2.6.14 video_window_descriptor (tag 0x08)
+- add DVB Event Information Table (EIT, EN 300 468 §5.2.4)
+- add DVB Service Description Table (SDT, EN 300 468 §5.2.3)
+- add Transport Stream Description Table (TSDT, §2.4.4.12)
+- decode the full PES_extension body (Table 2-17 concluded, §2.4.3.7)
+- target_background_grid (tag 0x07, §2.6.12 Table 2-49)
+- ibp_descriptor (tag 0x12, §2.6.34)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- multiplex_buffer_utilization_descriptor (tag 0x0C, §2.6.22)
+- hierarchy_descriptor (tag 0x04, §2.6.6)
+- copyright_descriptor (tag 0x0D, §2.6.24)
+- smoothing_buffer_descriptor (tag 0x10, §2.6.30)
+- PsiSectionAssembler + ConditionalAccessTable for multi-TS-packet sections
+- decode every optional PES-header field (Table 2-17)
+- unpack every optional field in the adaptation field (§2.4.3.4)
+- PCR jitter / time-base discontinuity tracker + per-PID CC classifier
+- add four more §2.6 descriptor decoders (alignment, sysclk, max-bitrate, STD)
+- parse §2.6 program / ES descriptors (registration, ISO-639, CA, AVC, HEVC)
+- resync past short TS sync misalignments instead of erroring
+- include input byte offset in sync-byte / short-read errors
+- write MPEG-TS files from oxideav_core::Packet streams
+- move oxideav_core::register! to crate root so meta can resolve it
+- demuxer + registry: container-shape Demuxer for the registry
+
 ### Added
 
 - `VideoWindowDescriptor` — typed view of the §2.6.14
