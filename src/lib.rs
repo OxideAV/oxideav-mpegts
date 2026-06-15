@@ -86,8 +86,9 @@ pub use clock::{
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
     DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor,
-    Iso639Language, MaximumBitrateDescriptor, ServiceDescriptor, ShortEventDescriptor,
-    SmoothingBufferDescriptor, StdDescriptor, SystemClockDescriptor, VideoStreamDescriptor,
+    Iso639Language, MaximumBitrateDescriptor, NetworkNameDescriptor, ServiceDescriptor,
+    ShortEventDescriptor, SmoothingBufferDescriptor, StdDescriptor, SystemClockDescriptor,
+    VideoStreamDescriptor,
 };
 pub use error::TsError;
 pub use packet::{
@@ -97,13 +98,13 @@ pub use packet::{
 pub use pes::{PStdBuffer, PesExtension, PesPacket, PesReassembler, ProgramPacketSequenceCounter};
 pub use psi::{
     iter_sections, mpeg2_crc32, ConditionalAccessTable, EitDateTime, EitDuration, EitEvent,
-    EventInformationTable, PmtStream, ProgramAssociationTable, ProgramMapTable,
-    PsiSectionAssembler, RunningStatus, SdtService, SectionIter, ServiceDescriptionTable,
-    TransportStreamDescriptionTable, CAT_PID, CAT_TABLE_ID, EIT_ACTUAL_PF_TABLE_ID,
-    EIT_ACTUAL_SCHEDULE_FIRST, EIT_ACTUAL_SCHEDULE_LAST, EIT_OTHER_PF_TABLE_ID,
-    EIT_OTHER_SCHEDULE_FIRST, EIT_OTHER_SCHEDULE_LAST, EIT_PID, MAX_PSI_SECTION_LEN, PAT_PID,
-    PAT_TABLE_ID, PMT_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SDT_PID, TSDT_PID,
-    TSDT_TABLE_ID,
+    EventInformationTable, NetworkInformationTable, NitTransportStream, PmtStream,
+    ProgramAssociationTable, ProgramMapTable, PsiSectionAssembler, RunningStatus, SdtService,
+    SectionIter, ServiceDescriptionTable, TransportStreamDescriptionTable, CAT_PID, CAT_TABLE_ID,
+    EIT_ACTUAL_PF_TABLE_ID, EIT_ACTUAL_SCHEDULE_FIRST, EIT_ACTUAL_SCHEDULE_LAST,
+    EIT_OTHER_PF_TABLE_ID, EIT_OTHER_SCHEDULE_FIRST, EIT_OTHER_SCHEDULE_LAST, EIT_PID,
+    MAX_PSI_SECTION_LEN, NIT_ACTUAL_TABLE_ID, NIT_OTHER_TABLE_ID, NIT_PID, PAT_PID, PAT_TABLE_ID,
+    PMT_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SDT_PID, TSDT_PID, TSDT_TABLE_ID,
 };
 pub use stream_type::StreamType;
 

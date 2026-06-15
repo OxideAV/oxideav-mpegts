@@ -39,6 +39,34 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `NetworkInformationTable` — the DVB Network Information Table (NIT,
+  ETSI EN 300 468 §5.2.1 Table 3) carried on the fixed PID `0x0010`
+  ([`NIT_PID`]). `NetworkInformationTable::parse` reads a section into
+  the `network_id` (from `table_id_extension`), the standard version /
+  section bookkeeping, the network-level descriptor loop, and a typed
+  `transport_stream_loop` of `NitTransportStream` entries. Both NIT
+  `table_id` classifications are accepted — actual network (`0x40`,
+  `NIT_ACTUAL_TABLE_ID`) and other networks (`0x41`,
+  `NIT_OTHER_TABLE_ID`), with `other_network` recording which —
+  matching the predicate `NetworkInformationTable::is_nit_table_id`.
+  Each `NitTransportStream` pairs `(transport_stream_id,
+  original_network_id)` — the combination the spec notes uniquely
+  identifies a TS throughout the application area — with its own
+  descriptor loop, walkable via `NitTransportStream::iter_descriptors`;
+  the network-level loop is walkable via
+  `NetworkInformationTable::iter_descriptors`. The two-level descriptor
+  layout (network-wide loop then per-TS loops) mirrors the PMT's
+  program-info / ES-info split, and sections may be reassembled with
+  `PsiSectionAssembler` before parsing like the other long-form tables.
+- `NetworkNameDescriptor` — typed view of the DVB
+  `network_name_descriptor` (tag `0x40`, ETSI EN 300 468 §6.2.27
+  Table 81). The entire descriptor payload is the `network_name` run
+  (no inner length prefix), exposed as raw bytes — the EN 300 468
+  annex-A character-table selection is left to the caller, consistent
+  with the `service_descriptor` / `short_event_descriptor` name fields.
+  This is the network-level descriptor a NIT usually carries to name
+  the delivery system, wired through the shared descriptor decoder so
+  `NetworkInformationTable::iter_descriptors` lifts it.
 - `VideoWindowDescriptor` — typed view of the §2.6.14
   video_window_descriptor (tag `0x08`, Table 2-50). Surfaces the
   four-byte body as the 14-bit `horizontal_offset`, the 14-bit

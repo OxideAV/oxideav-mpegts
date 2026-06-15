@@ -42,6 +42,7 @@
 //! | `0x12` | IBP_descriptor (§2.6.34)          | [`DescriptorBody::Ibp`]                      |
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
+//! | `0x40` | network_name_descriptor (EN 300 468 §6.2.27) | [`DescriptorBody::NetworkName`]  |
 //! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
 //! | `0x4D` | short_event_descriptor (EN 300 468 §6.2.37) | [`DescriptorBody::ShortEvent`]     |
 //!
@@ -122,6 +123,10 @@ pub enum DescriptorBody<'a> {
     /// §6.2.37 Table 93). Carried in the EIT event loop; names the event
     /// plus a short text description, both tagged with a language code.
     ShortEvent(ShortEventDescriptor<'a>),
+    /// `0x40` network_name_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.27 Table 81). Carried in the NIT network-level descriptor
+    /// loop; names the delivery system the NIT informs about.
+    NetworkName(NetworkNameDescriptor<'a>),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -177,6 +182,25 @@ pub struct ShortEventDescriptor<'a> {
     /// Raw `text` bytes — the short event description (DVB text string,
     /// annex A).
     pub text: &'a [u8],
+}
+
+/// network_name_descriptor body (ETSI EN 300 468 §6.2.27 Table 81).
+///
+/// A DVB Service Information extension to the ISO/IEC 13818-1 descriptor
+/// space, carried inside the network-level descriptor loop of a
+/// [`crate::psi::NetworkInformationTable`] section. It carries the
+/// human-readable name of the delivery system the NIT informs about.
+///
+/// The whole descriptor payload is the name run — there is no
+/// length-prefix or terminator inside it; the `descriptor_length` of
+/// the TLV envelope bounds the field. As with the other DVB name
+/// descriptors, the bytes are exposed **raw** (DVB text string, annex A)
+/// so the caller chooses the character-table interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkNameDescriptor<'a> {
+    /// Raw `network_name` bytes (DVB text string, annex A) — the entire
+    /// descriptor payload.
+    pub network_name: &'a [u8],
 }
 
 /// video_stream_descriptor body (§2.6.2 Table 2-46).
@@ -795,6 +819,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x12 => decode_ibp(data).unwrap_or(DescriptorBody::Raw),
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
+        0x40 => DescriptorBody::NetworkName(NetworkNameDescriptor { network_name: data }),
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
         0x4D => decode_short_event(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
@@ -2588,5 +2613,29 @@ mod tests {
         let d = iter_descriptors(&block).next().unwrap().unwrap();
         assert_eq!(d.tag, 0x4D);
         assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn network_name_descriptor_decodes_whole_payload() {
+        // The whole descriptor payload is the name run (no inner length).
+        let block = tlv(0x40, b"Example Network");
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x40);
+        match d.body {
+            DescriptorBody::NetworkName(n) => {
+                assert_eq!(n.network_name, b"Example Network");
+            }
+            other => panic!("expected NetworkName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_name_descriptor_empty_is_legal() {
+        let block = tlv(0x40, b"");
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::NetworkName(n) => assert!(n.network_name.is_empty()),
+            other => panic!("expected NetworkName, got {other:?}"),
+        }
     }
 }

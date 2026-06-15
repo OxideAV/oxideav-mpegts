@@ -60,6 +60,13 @@ pub const EIT_ACTUAL_SCHEDULE_LAST: u8 = 0x5F;
 pub const EIT_OTHER_SCHEDULE_FIRST: u8 = 0x60;
 /// Last `table_id` of the EIT other-TS schedule range (`0x6F`).
 pub const EIT_OTHER_SCHEDULE_LAST: u8 = 0x6F;
+/// NIT (Network Information Table) `table_id` for sections describing the
+/// **actual** network — the network the TS carrying the NIT belongs to
+/// (ETSI EN 300 468 §5.2.1 / Table 2 — `0x40`).
+pub const NIT_ACTUAL_TABLE_ID: u8 = 0x40;
+/// NIT `table_id` for sections describing **other** networks (ETSI
+/// EN 300 468 §5.2.1 / Table 2 — `0x41`).
+pub const NIT_OTHER_TABLE_ID: u8 = 0x41;
 
 /// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
 pub const PAT_PID: u16 = 0x0000;
@@ -74,6 +81,9 @@ pub const SDT_PID: u16 = 0x0011;
 /// Fixed PID carrying the DVB EIT sections (ETSI EN 300 468 §5.1.3
 /// Table 1 / §5.2.4 — `0x0012`).
 pub const EIT_PID: u16 = 0x0012;
+/// Fixed PID carrying the DVB NIT sections (ETSI EN 300 468 §5.1.3
+/// Table 1 / §5.2.1 — `0x0010`).
+pub const NIT_PID: u16 = 0x0010;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
@@ -336,6 +346,202 @@ impl TransportStreamDescriptionTable {
     }
 
     /// Walk the carried descriptor() loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// One transport-stream entry from a NIT's `transport_stream_loop`
+/// (ETSI EN 300 468 §5.2.1 Table 3).
+///
+/// Each entry pairs a `(transport_stream_id, original_network_id)` —
+/// which the spec notes uniquely identifies a TS throughout the
+/// application area — with a per-TS descriptor loop. That loop most
+/// commonly carries delivery-system descriptors (cable / satellite /
+/// terrestrial) plus the `service_list_descriptor`; this crate exposes
+/// the raw descriptor block so callers walk it with
+/// [`Self::iter_descriptors`].
+#[derive(Debug, Default, Clone)]
+pub struct NitTransportStream {
+    /// 16-bit `transport_stream_id` — labels this TS within the
+    /// delivery system.
+    pub transport_stream_id: u16,
+    /// 16-bit `original_network_id` — labels the network_id of the
+    /// originating delivery system.
+    pub original_network_id: u16,
+    /// Raw bytes of this TS entry's descriptor() loop — walk with
+    /// [`Self::iter_descriptors`] to get typed TLV records.
+    pub descriptors: Vec<u8>,
+}
+
+impl NitTransportStream {
+    /// Walk this TS entry's descriptor() loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Parsed Network Information Table per ETSI EN 300 468 §5.2.1 (Table 3).
+///
+/// The NIT conveys the physical organization of the multiplexes / TSs
+/// carried by a network and the characteristics of the network itself.
+/// It is carried on the fixed PID [`NIT_PID`] (`0x0010`); sections that
+/// describe the **actual** network carry `table_id` `0x40`
+/// ([`NIT_ACTUAL_TABLE_ID`]) and sections that describe **other**
+/// networks carry `0x41` ([`NIT_OTHER_TABLE_ID`]). The `network_id`
+/// label rides in the `table_id_extension` slot.
+///
+/// Structurally the section carries a two-level descriptor layout — a
+/// network-level descriptor loop (most commonly the
+/// `network_name_descriptor`, tag `0x40`, naming the delivery system)
+/// followed by a `transport_stream_loop` whose entries each carry their
+/// own descriptor loop. This mirrors the PMT's program-info / ES-info
+/// split. Like the other long-form tables a NIT may be segmented across
+/// the [`NIT_PID`] stream and reassembled with [`PsiSectionAssembler`]
+/// before parsing.
+#[derive(Debug, Default, Clone)]
+pub struct NetworkInformationTable {
+    /// `network_id` (from `table_id_extension`).
+    pub network_id: u16,
+    /// `true` when the section's `table_id` was `0x41` (describes another
+    /// network); `false` for `0x40` (the actual network carrying the NIT).
+    pub other_network: bool,
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// `current_next_indicator`.
+    pub current_next_indicator: bool,
+    /// `section_number`.
+    pub section_number: u8,
+    /// `last_section_number`.
+    pub last_section_number: u8,
+    /// Raw bytes of the network-level descriptor() loop — walk with
+    /// [`Self::iter_descriptors`] to get typed records (e.g. the
+    /// `network_name_descriptor`).
+    pub descriptors: Vec<u8>,
+    /// Transport-stream entries carried in this section.
+    pub transport_streams: Vec<NitTransportStream>,
+}
+
+impl NetworkInformationTable {
+    /// `true` when `table_id` is either NIT classification (`0x40`/`0x41`).
+    pub fn is_nit_table_id(table_id: u8) -> bool {
+        matches!(table_id, NIT_ACTUAL_TABLE_ID | NIT_OTHER_TABLE_ID)
+    }
+
+    /// Parse a single NIT section. The slice must run from `table_id`
+    /// through the CRC trailer (i.e. the pointer_field has already been
+    /// skipped). Accepts both the actual-network (`0x40`) and
+    /// other-network (`0x41`) table_ids.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        let other_network = match table_id {
+            NIT_ACTUAL_TABLE_ID => false,
+            NIT_OTHER_TABLE_ID => true,
+            _ => {
+                return Err(TsError::Unsupported(
+                    "PSI table_id does not match expected value",
+                ))
+            }
+        };
+        let (hdr, body) = parse_section_header(section, table_id)?;
+        // Body layout (Table 3): reserved_future_use (4) +
+        // network_descriptors_length (12) + network descriptors +
+        // reserved_future_use (4) + transport_stream_loop_length (12) +
+        // TS loop.
+        if body.len() < 2 {
+            return Err(TsError::Truncated {
+                what: "NIT body",
+                have: body.len(),
+                need: 2,
+            });
+        }
+        let network_descriptors_length =
+            (u16::from_be_bytes([body[0] & 0b0000_1111, body[1]])) as usize;
+        let nd_start = 2usize;
+        let nd_end = nd_start.checked_add(network_descriptors_length).ok_or(
+            TsError::SectionLengthOverrun {
+                claimed: network_descriptors_length,
+                have: body.len() - nd_start,
+            },
+        )?;
+        if nd_end > body.len() {
+            return Err(TsError::SectionLengthOverrun {
+                claimed: network_descriptors_length,
+                have: body.len() - nd_start,
+            });
+        }
+        let descriptors = body[nd_start..nd_end].to_vec();
+
+        // transport_stream_loop_length (12 bits) gates the TS loop.
+        if nd_end + 2 > body.len() {
+            return Err(TsError::Truncated {
+                what: "NIT transport_stream_loop_length",
+                have: body.len() - nd_end,
+                need: 2,
+            });
+        }
+        let ts_loop_length =
+            (u16::from_be_bytes([body[nd_end] & 0b0000_1111, body[nd_end + 1]])) as usize;
+        let loop_start = nd_end + 2;
+        let loop_end =
+            loop_start
+                .checked_add(ts_loop_length)
+                .ok_or(TsError::SectionLengthOverrun {
+                    claimed: ts_loop_length,
+                    have: body.len() - loop_start,
+                })?;
+        if loop_end > body.len() {
+            return Err(TsError::SectionLengthOverrun {
+                claimed: ts_loop_length,
+                have: body.len() - loop_start,
+            });
+        }
+        let ts_loop = &body[loop_start..loop_end];
+
+        let mut transport_streams = Vec::new();
+        let mut i = 0;
+        // Each TS entry: transport_stream_id (16) + original_network_id
+        // (16) + reserved_future_use (4) + transport_descriptors_length
+        // (12) + descriptor loop. Fixed head = 6 bytes before descriptors.
+        while i + 6 <= ts_loop.len() {
+            let transport_stream_id = u16::from_be_bytes([ts_loop[i], ts_loop[i + 1]]);
+            let original_network_id = u16::from_be_bytes([ts_loop[i + 2], ts_loop[i + 3]]);
+            let transport_descriptors_length =
+                (u16::from_be_bytes([ts_loop[i + 4] & 0b0000_1111, ts_loop[i + 5]])) as usize;
+            let descr_start = i + 6;
+            let descr_end = descr_start
+                .checked_add(transport_descriptors_length)
+                .ok_or(TsError::SectionLengthOverrun {
+                    claimed: transport_descriptors_length,
+                    have: ts_loop.len() - descr_start,
+                })?;
+            if descr_end > ts_loop.len() {
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: transport_descriptors_length,
+                    have: ts_loop.len() - descr_start,
+                });
+            }
+            transport_streams.push(NitTransportStream {
+                transport_stream_id,
+                original_network_id,
+                descriptors: ts_loop[descr_start..descr_end].to_vec(),
+            });
+            i = descr_end;
+        }
+
+        Ok(Self {
+            network_id: hdr.table_id_extension,
+            other_network,
+            version_number: hdr.version_number,
+            current_next_indicator: hdr.current_next_indicator,
+            section_number: hdr.section_number,
+            last_section_number: hdr.last_section_number,
+            descriptors,
+            transport_streams,
+        })
+    }
+
+    /// Walk the network-level descriptor() loop as typed TLV records.
     pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
         iter_descriptors(&self.descriptors)
     }
@@ -1958,6 +2164,147 @@ mod tests {
             ServiceDescriptionTable::parse(&section),
             Err(TsError::PsiCrcMismatch { .. })
         ));
+    }
+
+    /// Build a network_name_descriptor (tag 0x40) TLV.
+    fn build_network_name_descriptor(name: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x40u8, name.len() as u8];
+        v.extend_from_slice(name);
+        v
+    }
+
+    /// Build one NIT transport_stream loop entry (no CRC).
+    fn build_nit_ts(tsid: u16, onid: u16, descriptors: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(&tsid.to_be_bytes());
+        s.extend_from_slice(&onid.to_be_bytes());
+        // reserved_future_use (4) | transport_descriptors_length (12).
+        let dlen = descriptors.len() as u16;
+        s.push(0b1111_0000 | ((dlen >> 8) & 0x0F) as u8);
+        s.push((dlen & 0xFF) as u8);
+        s.extend_from_slice(descriptors);
+        s
+    }
+
+    /// Build a full NIT section (table_id through CRC).
+    fn build_nit_section(
+        table_id: u8,
+        network_id: u16,
+        version: u8,
+        net_descriptors: &[u8],
+        ts_entries: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let ts_loop_len: usize = ts_entries.iter().map(|e| e.len()).sum();
+        // body = nd_len_field(2) + net_descriptors + ts_loop_len_field(2)
+        //        + ts loop.
+        let body_len = 2 + net_descriptors.len() + 2 + ts_loop_len;
+        let section_length = 5 + body_len + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(table_id);
+        let len_hi = 0b1011_0000 | ((section_length >> 8) & 0x0F) as u8;
+        s.push(len_hi);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(&network_id.to_be_bytes());
+        s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
+        s.push(0); // section_number
+        s.push(0); // last_section_number
+                   // reserved_future_use (4) | network_descriptors_length (12).
+        let nd_len = net_descriptors.len() as u16;
+        s.push(0b1111_0000 | ((nd_len >> 8) & 0x0F) as u8);
+        s.push((nd_len & 0xFF) as u8);
+        s.extend_from_slice(net_descriptors);
+        // reserved_future_use (4) | transport_stream_loop_length (12).
+        let tsl = ts_loop_len as u16;
+        s.push(0b1111_0000 | ((tsl >> 8) & 0x0F) as u8);
+        s.push((tsl & 0xFF) as u8);
+        for e in ts_entries {
+            s.extend_from_slice(e);
+        }
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    #[test]
+    fn nit_actual_with_network_name_and_ts_loop() {
+        let nn = build_network_name_descriptor(b"Example Network");
+        let ts0 = build_nit_ts(0x0001, 0x2024, &[]);
+        let ts1 = build_nit_ts(0x0002, 0x2024, &[]);
+        let section = build_nit_section(NIT_ACTUAL_TABLE_ID, 0x1234, 11, &nn, &[ts0, ts1]);
+        let nit = NetworkInformationTable::parse(&section).unwrap();
+        assert!(!nit.other_network);
+        assert_eq!(nit.network_id, 0x1234);
+        assert_eq!(nit.version_number, 11);
+        assert!(nit.current_next_indicator);
+        // network-level descriptor decodes to a NetworkName body.
+        let d = nit.iter_descriptors().next().unwrap().unwrap();
+        match d.body {
+            crate::descriptor::DescriptorBody::NetworkName(n) => {
+                assert_eq!(n.network_name, b"Example Network");
+            }
+            other => panic!("expected NetworkName, got {other:?}"),
+        }
+        assert_eq!(nit.transport_streams.len(), 2);
+        assert_eq!(nit.transport_streams[0].transport_stream_id, 0x0001);
+        assert_eq!(nit.transport_streams[0].original_network_id, 0x2024);
+        assert_eq!(nit.transport_streams[1].transport_stream_id, 0x0002);
+    }
+
+    #[test]
+    fn nit_other_table_id_sets_flag() {
+        let section = build_nit_section(NIT_OTHER_TABLE_ID, 0x0009, 0, &[], &[]);
+        let nit = NetworkInformationTable::parse(&section).unwrap();
+        assert!(nit.other_network);
+        assert_eq!(nit.network_id, 0x0009);
+        assert!(nit.descriptors.is_empty());
+        assert!(nit.transport_streams.is_empty());
+    }
+
+    #[test]
+    fn nit_per_ts_descriptor_loop() {
+        // A TS entry carrying a descriptor in its own loop is parsed and
+        // the per-TS descriptor block is walkable.
+        let raw = vec![0x83u8, 0x03, 0xAA, 0xBB, 0xCC]; // tag 0x83 (raw) len 3
+        let ts0 = build_nit_ts(0x0064, 0x1000, &raw);
+        let section = build_nit_section(NIT_ACTUAL_TABLE_ID, 0x0001, 1, &[], &[ts0]);
+        let nit = NetworkInformationTable::parse(&section).unwrap();
+        assert_eq!(nit.transport_streams.len(), 1);
+        let entry = &nit.transport_streams[0];
+        let d = entry.iter_descriptors().next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x83);
+        assert_eq!(d.data, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn nit_rejects_wrong_table_id() {
+        // An SDT section fed to the NIT parser must be rejected.
+        let svc = build_sdt_service(0x0064, true, true, 4, false, &[]);
+        let section = build_sdt_section(SDT_ACTUAL_TABLE_ID, 0x0001, 7, 0x2024, &[svc]);
+        assert!(NetworkInformationTable::parse(&section).is_err());
+    }
+
+    #[test]
+    fn nit_crc_mismatch_rejected() {
+        let nn = build_network_name_descriptor(b"Net");
+        let mut section = build_nit_section(NIT_ACTUAL_TABLE_ID, 0x1234, 1, &nn, &[]);
+        let last = section.len() - 1;
+        section[last] ^= 0xFF;
+        assert!(matches!(
+            NetworkInformationTable::parse(&section),
+            Err(TsError::PsiCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn nit_is_nit_table_id() {
+        assert!(NetworkInformationTable::is_nit_table_id(
+            NIT_ACTUAL_TABLE_ID
+        ));
+        assert!(NetworkInformationTable::is_nit_table_id(NIT_OTHER_TABLE_ID));
+        assert!(!NetworkInformationTable::is_nit_table_id(
+            SDT_ACTUAL_TABLE_ID
+        ));
+        assert!(!NetworkInformationTable::is_nit_table_id(PMT_TABLE_ID));
     }
 
     #[test]
