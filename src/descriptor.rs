@@ -30,6 +30,7 @@
 //! | `0x05` | registration_descriptor (§2.6.8)  | [`DescriptorBody::Registration`]             |
 //! | `0x06` | data_stream_alignment_descriptor (§2.6.10) | [`DescriptorBody::DataStreamAlignment`] |
 //! | `0x07` | target_background_grid_descriptor (§2.6.12) | [`DescriptorBody::TargetBackgroundGrid`] |
+//! | `0x08` | video_window_descriptor (§2.6.14) | [`DescriptorBody::VideoWindow`]              |
 //! | `0x09` | CA_descriptor (§2.6.16)           | [`DescriptorBody::Ca`]                       |
 //! | `0x0A` | ISO_639_language_descriptor (§2.6.18) | [`DescriptorBody::Iso639Language`]       |
 //! | `0x0B` | system_clock_descriptor (§2.6.20) | [`DescriptorBody::SystemClock`]              |
@@ -86,6 +87,10 @@ pub enum DescriptorBody<'a> {
     /// a paired video_window_descriptor places the stream's window
     /// (Table 2-49).
     TargetBackgroundGrid(TargetBackgroundGridDescriptor),
+    /// `0x08` video_window_descriptor (§2.6.14) — places the stream's
+    /// display window on the grid defined by its paired
+    /// target_background_grid_descriptor (Table 2-50).
+    VideoWindow(VideoWindowDescriptor),
     /// `0x09` CA_descriptor (§2.6.16) — Conditional Access PID + system.
     Ca(CaDescriptor<'a>),
     /// `0x0A` ISO_639_language_descriptor (§2.6.18).
@@ -424,6 +429,46 @@ pub struct TargetBackgroundGridDescriptor {
     pub aspect_ratio_information: u8,
 }
 
+/// video_window_descriptor body (§2.6.14 Table 2-50).
+///
+/// Describes the window characteristics of the associated video
+/// elementary stream; its offsets reference the grid established by the
+/// stream's paired target_background_grid_descriptor (§2.6.12). Per
+/// §2.6.15:
+///
+/// * `horizontal_offset` — horizontal position of the top-left pixel of
+///   the video display window (or display rectangle) on the target
+///   background grid. The top-left pixel shall coincide with a grid
+///   pixel.
+/// * `vertical_offset` — vertical position of the same top-left pixel on
+///   the grid.
+/// * `window_priority` — overlap order, `0` lowest through `15` highest;
+///   windows at priority `15` are always visible.
+///
+/// On the wire the body is exactly 4 bytes (Table 2-50), laid out
+/// identically to the target_background_grid_descriptor's first three
+/// fields:
+///
+/// ```text
+/// byte 0: horizontal_offset bits 13..6                     (8)
+/// byte 1: horizontal_offset bits 5..0 (6) | vertical_offset bits 13..12 (2)
+/// byte 2: vertical_offset bits 11..4                       (8)
+/// byte 3: vertical_offset bits 3..0 (4) | window_priority  (4)
+/// ```
+///
+/// Both offset fields are big-endian 14-bit unsigned values; the table
+/// carries no reserved bits, so all 32 bits are payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoWindowDescriptor {
+    /// `horizontal_offset` (14 bits) — top-left X on the grid, in pixels.
+    pub horizontal_offset: u16,
+    /// `vertical_offset` (14 bits) — top-left Y on the grid, in pixels.
+    pub vertical_offset: u16,
+    /// `window_priority` (4 bits) — overlap order, `0` lowest, `15`
+    /// highest (always visible).
+    pub window_priority: u8,
+}
+
 /// system_clock_descriptor body (§2.6.20 Table 2-54).
 ///
 /// `clock_accuracy_integer × 10^(-clock_accuracy_exponent)` gives the
@@ -738,6 +783,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x05 => decode_registration(data).unwrap_or(DescriptorBody::Raw),
         0x06 => decode_data_stream_alignment(data).unwrap_or(DescriptorBody::Raw),
         0x07 => decode_target_background_grid(data).unwrap_or(DescriptorBody::Raw),
+        0x08 => decode_video_window(data).unwrap_or(DescriptorBody::Raw),
         0x09 => decode_ca(data).unwrap_or(DescriptorBody::Raw),
         0x0A => decode_iso639_language(data).unwrap_or(DescriptorBody::Raw),
         0x0B => decode_system_clock(data).unwrap_or(DescriptorBody::Raw),
@@ -966,6 +1012,30 @@ fn decode_target_background_grid(data: &[u8]) -> Option<DescriptorBody<'_>> {
             aspect_ratio_information,
         },
     ))
+}
+
+fn decode_video_window(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // Four-byte payload (Table 2-50):
+    //   byte 0: horizontal_offset bits 13..6                     (8)
+    //   byte 1: horizontal_offset bits 5..0 (6) | vertical_offset 13..12 (2)
+    //   byte 2: vertical_offset bits 11..4                       (8)
+    //   byte 3: vertical_offset bits 3..0 (4) | window_priority  (4)
+    // Both offset fields are big-endian 14-bit unsigneds; the table carries
+    // no reserved bits, so all 32 bits are payload (same layout as the
+    // target_background_grid_descriptor's size + aspect-ratio fields).
+    if data.len() < 4 {
+        return None;
+    }
+    let horizontal_offset = ((data[0] as u16) << 6) | ((data[1] >> 2) as u16);
+    let vertical_offset = (((data[1] & 0b0000_0011) as u16) << 12)
+        | ((data[2] as u16) << 4)
+        | ((data[3] >> 4) as u16);
+    let window_priority = data[3] & 0b0000_1111;
+    Some(DescriptorBody::VideoWindow(VideoWindowDescriptor {
+        horizontal_offset,
+        vertical_offset,
+        window_priority,
+    }))
 }
 
 fn decode_system_clock(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -2311,6 +2381,110 @@ mod tests {
                 assert_eq!(g.aspect_ratio_information, 1);
             }
             other => panic!("expected TargetBackgroundGrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn video_window_descriptor_typical_offsets() {
+        // horizontal_offset = 320, vertical_offset = 240, priority = 5.
+        // 320 = 0x140, 240 = 0x0F0.
+        //   byte 0: horizontal[13..6] = 0x140 >> 6 = 0x05         = 0x05
+        //   byte 1: horizontal[5..0]<<2 | vertical[13..12]
+        //           = (0x140 & 0x3F) << 2 | (0x0F0 >> 12)
+        //           = (0x00) << 2 | 0 = 0x00                      = 0x00
+        //   byte 2: vertical[11..4] = (0x0F0 >> 4) & 0xFF = 0x0F  = 0x0F
+        //   byte 3: vertical[3..0]<<4 | priority = (0x0F0 & 0xF)<<4 | 5
+        //           = 0x00 | 0x05                                 = 0x05
+        let block = tlv(0x08, &[0x05, 0x00, 0x0F, 0x05]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x08);
+        match &d.body {
+            DescriptorBody::VideoWindow(w) => {
+                assert_eq!(w.horizontal_offset, 320);
+                assert_eq!(w.vertical_offset, 240);
+                assert_eq!(w.window_priority, 5);
+            }
+            other => panic!("expected VideoWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn video_window_descriptor_max_fields() {
+        // horizontal_offset = 0x3FFF, vertical_offset = 0x3FFF,
+        // priority = 0xF — every payload bit set.
+        //   byte 0: 0x3FFF >> 6 = 0xFF
+        //   byte 1: (0x3FFF & 0x3F) << 2 | (0x3FFF >> 12) = 0xFC | 0x3 = 0xFF
+        //   byte 2: (0x3FFF >> 4) & 0xFF = 0xFF
+        //   byte 3: (0x3FFF & 0xF) << 4 | 0xF = 0xF0 | 0xF = 0xFF
+        let block = tlv(0x08, &[0xFF, 0xFF, 0xFF, 0xFF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::VideoWindow(w) => {
+                assert_eq!(w.horizontal_offset, 0x3FFF);
+                assert_eq!(w.vertical_offset, 0x3FFF);
+                assert_eq!(w.window_priority, 0xF);
+            }
+            other => panic!("expected VideoWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn video_window_descriptor_all_zero() {
+        let block = tlv(0x08, &[0x00, 0x00, 0x00, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match &d.body {
+            DescriptorBody::VideoWindow(w) => {
+                assert_eq!(w.horizontal_offset, 0);
+                assert_eq!(w.vertical_offset, 0);
+                assert_eq!(w.window_priority, 0);
+            }
+            other => panic!("expected VideoWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn video_window_descriptor_short_body_falls_back_to_raw() {
+        // 3-byte body — short of the fixed 4-byte payload, so the typed
+        // decoder declines and the generic TLV layer keeps the raw bytes.
+        let block = tlv(0x08, &[0x05, 0x00, 0x0F]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x08);
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data, &[0x05, 0x00, 0x0F]);
+    }
+
+    #[test]
+    fn video_window_descriptor_pairs_with_grid_in_es_info_list() {
+        // Realistic PMT ES_info block: a target_background_grid_descriptor
+        // (the 1920×1080 grid) immediately followed by the
+        // video_window_descriptor that places this stream's window on it.
+        // Window at offset (100, 50), priority 7. 100 = 0x064, 50 = 0x032.
+        //   byte 0: 0x064 >> 6 = 0x01
+        //   byte 1: (0x064 & 0x3F) << 2 | (0x032 >> 12)
+        //           = (0x24) << 2 | 0 = 0x90
+        //   byte 2: (0x032 >> 4) & 0xFF = 0x03
+        //   byte 3: (0x032 & 0xF) << 4 | 7 = 0x20 | 0x07 = 0x27
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x07, &[0x1E, 0x00, 0x43, 0x81]));
+        block.extend_from_slice(&tlv(0x08, &[0x01, 0x90, 0x03, 0x27]));
+        let v = parse_descriptors(&block).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].tag, 0x07);
+        assert_eq!(v[1].tag, 0x08);
+        match &v[0].body {
+            DescriptorBody::TargetBackgroundGrid(g) => {
+                assert_eq!(g.horizontal_size, 1920);
+                assert_eq!(g.vertical_size, 1080);
+            }
+            other => panic!("expected TargetBackgroundGrid, got {other:?}"),
+        }
+        match &v[1].body {
+            DescriptorBody::VideoWindow(w) => {
+                assert_eq!(w.horizontal_offset, 100);
+                assert_eq!(w.vertical_offset, 50);
+                assert_eq!(w.window_priority, 7);
+            }
+            other => panic!("expected VideoWindow, got {other:?}"),
         }
     }
 

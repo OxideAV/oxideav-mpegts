@@ -11,6 +11,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `VideoWindowDescriptor` — typed view of the §2.6.14
+  video_window_descriptor (tag `0x08`, Table 2-50). Surfaces the
+  four-byte body as the 14-bit `horizontal_offset`, the 14-bit
+  `vertical_offset` (the top-left position of the stream's display
+  window on the grid per §2.6.15), and the 4-bit `window_priority`
+  (overlap order, `0` lowest through `15` always-visible). The body
+  shares the target_background_grid_descriptor's wire layout (14 + 14 +
+  4 bits across four bytes, both offsets big-endian and spanning a byte
+  boundary), and the table carries no reserved bits, so all 32 payload
+  bits are read. Bodies shorter than four bytes fall back to
+  `DescriptorBody::Raw`. Wired through `PmtStream::iter_descriptors` and
+  `ProgramMapTable::iter_program_descriptors` alongside the existing tag
+  set. This completes the §2.6.12–§2.6.15 grid/window descriptor pair:
+  a target_background_grid_descriptor (tag `0x07`) establishes the
+  display grid and a video_window_descriptor places the associated
+  stream's window onto it.
 - `EventInformationTable` — the DVB Event Information Table (EIT,
   ETSI EN 300 468 §5.2.4 / Table 7), carrying chronological per-event
   metadata for the services in a multiplex. Carried on the fixed PID
@@ -105,8 +121,8 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   the body. Bodies shorter than four bytes fall back to
   `DescriptorBody::Raw`. Wired through `PmtStream::iter_descriptors` and
   `ProgramMapTable::iter_program_descriptors` alongside the existing tag
-  set. A paired §2.6.14 video_window_descriptor (tag `0x08`) is the
-  natural next step to place a stream's window on this grid.
+  set. The paired §2.6.14 video_window_descriptor (tag `0x08`) that
+  places a stream's window on this grid is now also decoded.
 - `IbpDescriptor` — typed view of the §2.6.34 IBP_descriptor (tag
   `0x12`, Table 2-61). Surfaces the two-byte body as `closed_gop_flag`,
   `identical_gop_flag`, and the 14-bit `max_gop_length` (big-endian,
