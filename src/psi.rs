@@ -67,6 +67,12 @@ pub const NIT_ACTUAL_TABLE_ID: u8 = 0x40;
 /// NIT `table_id` for sections describing **other** networks (ETSI
 /// EN 300 468 §5.2.1 / Table 2 — `0x41`).
 pub const NIT_OTHER_TABLE_ID: u8 = 0x41;
+/// TDT (Time and Date Table) `table_id` (ETSI EN 300 468 §5.2.5 /
+/// Table 8 — `0x70`).
+pub const TDT_TABLE_ID: u8 = 0x70;
+/// TOT (Time Offset Table) `table_id` (ETSI EN 300 468 §5.2.6 /
+/// Table 9 — `0x73`).
+pub const TOT_TABLE_ID: u8 = 0x73;
 
 /// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
 pub const PAT_PID: u16 = 0x0000;
@@ -84,6 +90,9 @@ pub const EIT_PID: u16 = 0x0012;
 /// Fixed PID carrying the DVB NIT sections (ETSI EN 300 468 §5.1.3
 /// Table 1 / §5.2.1 — `0x0010`).
 pub const NIT_PID: u16 = 0x0010;
+/// Fixed PID carrying the DVB TDT and TOT sections (ETSI EN 300 468
+/// §5.1.3 Table 1 / §5.2.5 / §5.2.6 — `0x0014`).
+pub const TDT_TOT_PID: u16 = 0x0014;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
@@ -787,7 +796,13 @@ fn bcd_byte(b: u8) -> u8 {
     (b >> 4) * 10 + (b & 0x0F)
 }
 
-/// Decode the 40-bit EIT `start_time` (16-bit MJD + 24-bit BCD time).
+/// Decode a 40-bit DVB UTC_time field (16-bit MJD + 24-bit BCD time).
+///
+/// This is the common time encoding shared by the EIT `start_time`
+/// (§5.2.4), the TDT / TOT `UTC_time` (§5.2.5 / §5.2.6), and the
+/// `local_time_offset_descriptor` `time_of_change` (§6.2.20): 16 bits
+/// giving the 16 lsb of the Modified Julian Date followed by 24 bits of
+/// 6-digit 4-bit BCD encoding the UTC hours/minutes/seconds.
 ///
 /// Returns `None` when the field is the all-ones "undefined" sentinel.
 /// The MJD→(Y,M,D) conversion follows the integer formula in
@@ -801,7 +816,7 @@ fn bcd_byte(b: u8) -> u8 {
 /// Y  = Y' + K                 (years since 1900)
 /// M  = M' − 1 − K × 12
 /// ```
-fn decode_eit_start_time(bytes: [u8; 5]) -> Option<EitDateTime> {
+pub fn decode_utc_time(bytes: [u8; 5]) -> Option<EitDateTime> {
     if bytes == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF] {
         return None;
     }
@@ -969,7 +984,7 @@ impl EventInformationTable {
         // descriptor loop.
         while i + 12 <= body.len() {
             let event_id = u16::from_be_bytes([body[i], body[i + 1]]);
-            let start_time = decode_eit_start_time([
+            let start_time = decode_utc_time([
                 body[i + 2],
                 body[i + 3],
                 body[i + 4],
@@ -1025,6 +1040,176 @@ impl EventInformationTable {
             events,
         })
     }
+}
+
+/// Parsed DVB Time and Date Table (ETSI EN 300 468 §5.2.5 Table 8).
+///
+/// The TDT is the simplest DVB SI table: a single **short-form** section
+/// (`section_syntax_indicator == 0`, no `version_number` /
+/// `section_number` / CRC trailer) carrying nothing but the current UTC
+/// time and date. It is transmitted on the fixed PID [`TDT_TOT_PID`]
+/// (`0x0014`) with `table_id` [`TDT_TABLE_ID`] (`0x70`).
+///
+/// The wall-clock value lets the `oxideav remux bluray://` path stamp an
+/// absolute capture time on a title when the source TS carries a TDT;
+/// the richer [`TimeOffsetTable`] (TOT) additionally describes the local
+/// time offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeDateTable {
+    /// Decoded `UTC_time` — the current UTC date and wall-clock time.
+    /// `None` for the all-ones "undefined" sentinel (not expected on a
+    /// real TDT, but handled the same way as the EIT `start_time`).
+    pub utc_time: Option<EitDateTime>,
+}
+
+impl TimeDateTable {
+    /// `table_id` this parser accepts (`0x70`).
+    pub const TABLE_ID: u8 = TDT_TABLE_ID;
+
+    /// Parse a single TDT section. The slice must run from `table_id`
+    /// through the end of the section (the pointer_field has already been
+    /// skipped). The TDT has no CRC, so the body is validated by length
+    /// alone.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        if table_id != TDT_TABLE_ID {
+            return Err(TsError::Unsupported(
+                "PSI table_id does not match expected value",
+            ));
+        }
+        let body = parse_short_section_body(section)?;
+        // Table 8 body: UTC_time (40 bits = 5 bytes).
+        if body.len() < 5 {
+            return Err(TsError::Truncated {
+                what: "TDT body",
+                have: body.len(),
+                need: 5,
+            });
+        }
+        let utc_time = decode_utc_time([body[0], body[1], body[2], body[3], body[4]]);
+        Ok(Self { utc_time })
+    }
+}
+
+/// Parsed DVB Time Offset Table (ETSI EN 300 468 §5.2.6 Table 9).
+///
+/// The TOT extends the [`TimeDateTable`] with a descriptor loop and a
+/// CRC trailer. It is a single **short-form** section
+/// (`section_syntax_indicator == 0`) transmitted on the fixed PID
+/// [`TDT_TOT_PID`] (`0x0014`) with `table_id` [`TOT_TABLE_ID`] (`0x73`).
+/// Unlike the TDT, the section carries a CRC_32 (verified here), and the
+/// descriptor loop almost always holds a `local_time_offset_descriptor`
+/// (tag `0x58`) giving the country-specific local-time offset relative
+/// to the [`Self::utc_time`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeOffsetTable {
+    /// Decoded `UTC_time` — the current UTC date and wall-clock time.
+    /// `None` for the all-ones sentinel.
+    pub utc_time: Option<EitDateTime>,
+    /// Raw bytes of the section's `descriptor()` loop — walk with
+    /// [`Self::iter_descriptors`]. Normally a single
+    /// `local_time_offset_descriptor` (tag `0x58`).
+    pub descriptors: Vec<u8>,
+}
+
+impl TimeOffsetTable {
+    /// `table_id` this parser accepts (`0x73`).
+    pub const TABLE_ID: u8 = TOT_TABLE_ID;
+
+    /// Parse a single TOT section. The slice must run from `table_id`
+    /// through the CRC trailer (the pointer_field has already been
+    /// skipped). The CRC_32 is verified the same way as a long-form PSI
+    /// section.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        if table_id != TOT_TABLE_ID {
+            return Err(TsError::Unsupported(
+                "PSI table_id does not match expected value",
+            ));
+        }
+        let body = parse_short_section_body(section)?;
+        // Table 9 body: UTC_time (40) + reserved (4) + descriptors_length
+        // (12) + descriptors + CRC_32 (32). parse_short_section_body
+        // returns the bytes between section_length and the section end
+        // (CRC included), so split the trailing CRC off here.
+        if body.len() < 5 + 2 + SECTION_CRC_LEN {
+            return Err(TsError::Truncated {
+                what: "TOT body",
+                have: body.len(),
+                need: 5 + 2 + SECTION_CRC_LEN,
+            });
+        }
+        // Verify the CRC over table_id .. end-4. The whole section slice
+        // was already trimmed to `3 + section_length` by
+        // parse_short_section_body; recompute over that.
+        let total = 3 + (((section[1] as usize & 0x0F) << 8) | section[2] as usize);
+        let crc_pos = total - SECTION_CRC_LEN;
+        let computed = mpeg2_crc32(&section[..crc_pos]);
+        let header_crc = u32::from_be_bytes([
+            section[crc_pos],
+            section[crc_pos + 1],
+            section[crc_pos + 2],
+            section[crc_pos + 3],
+        ]);
+        if computed != header_crc {
+            return Err(TsError::PsiCrcMismatch {
+                header: header_crc,
+                computed,
+            });
+        }
+        let utc_time = decode_utc_time([body[0], body[1], body[2], body[3], body[4]]);
+        // 4 reserved bits + 12-bit descriptors_length.
+        let descriptors_length = (((body[5] as usize) & 0x0F) << 8) | body[6] as usize;
+        let descr_start = 7usize;
+        let descr_end = descr_start + descriptors_length;
+        // Descriptors must fit before the CRC trailer.
+        let descr_limit = body.len() - SECTION_CRC_LEN;
+        if descr_end > descr_limit {
+            return Err(TsError::SectionLengthOverrun {
+                claimed: descriptors_length,
+                have: descr_limit - descr_start,
+            });
+        }
+        Ok(Self {
+            utc_time,
+            descriptors: body[descr_start..descr_end].to_vec(),
+        })
+    }
+
+    /// Walk the TOT's descriptor loop as typed TLV records. The
+    /// `local_time_offset_descriptor` (tag `0x58`) decodes to
+    /// `DescriptorBody::LocalTimeOffset`.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Validate a **short-form** DVB section header (TDT / TOT, §5.2.5 /
+/// §5.2.6) and return the body bytes that follow the 12-bit
+/// `section_length`.
+///
+/// Short-form sections set `section_syntax_indicator == 0` and have no
+/// `table_id_extension` / `version_number` / `section_number` fields —
+/// the body begins immediately at `section[3]`. The returned slice runs
+/// from `section[3]` through `3 + section_length` (which for the TOT
+/// still includes the trailing CRC_32; the caller splits it off).
+fn parse_short_section_body(section: &[u8]) -> Result<&[u8], TsError> {
+    if section.len() < 3 {
+        return Err(TsError::Truncated {
+            what: "short PSI section header",
+            have: section.len(),
+            need: 3,
+        });
+    }
+    let section_length = (((section[1] as usize) & 0x0F) << 8) | section[2] as usize;
+    let total = 3 + section_length;
+    if total > section.len() {
+        return Err(TsError::SectionLengthOverrun {
+            claimed: section_length,
+            have: section.len() - 3,
+        });
+    }
+    Ok(&section[3..total])
 }
 
 /// Per-PID PSI section reassembler — joins TS payloads carrying the
@@ -2394,7 +2579,7 @@ mod tests {
     fn eit_start_time_spec_example() {
         // EN 300 468 §5.2.4 example 2: 93/10/13 12:45:00 is coded as
         // 0xC0 7912 4500 (MJD 0xC079 = 49273, then 12 45 00 in BCD).
-        let dt = decode_eit_start_time([0xC0, 0x79, 0x12, 0x45, 0x00]).unwrap();
+        let dt = decode_utc_time([0xC0, 0x79, 0x12, 0x45, 0x00]).unwrap();
         assert_eq!(dt.mjd, 0xC079);
         assert_eq!(dt.year, 1993);
         assert_eq!(dt.month, 10);
@@ -2406,7 +2591,7 @@ mod tests {
 
     #[test]
     fn eit_start_time_undefined_sentinel() {
-        assert!(decode_eit_start_time([0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).is_none());
+        assert!(decode_utc_time([0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).is_none());
     }
 
     #[test]
@@ -2570,5 +2755,133 @@ mod tests {
             EventInformationTable::parse(&section),
             Err(TsError::PsiCrcMismatch { .. })
         ));
+    }
+
+    // ---- TDT / TOT (EN 300 468 §5.2.5 / §5.2.6) ----
+
+    fn build_tdt_section(utc: [u8; 5]) -> Vec<u8> {
+        // Short-form: table_id, then section_syntax_indicator=0 + '0' +
+        // reserved + 12-bit section_length, then UTC_time (5 bytes).
+        // section_length counts bytes after itself = UTC_time (5).
+        let section_length = 5usize;
+        let mut s = Vec::new();
+        s.push(TDT_TABLE_ID);
+        // ssi=0, '0', reserved=0b11 -> top nibble 0b0011 | length hi.
+        s.push(0b0011_0000 | ((section_length >> 8) & 0x0F) as u8);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(&utc);
+        s
+    }
+
+    fn build_tot_section(utc: [u8; 5], descriptors: &[u8]) -> Vec<u8> {
+        // Short-form body: UTC_time (5) + reserved/desc_len (2) +
+        // descriptors + CRC_32 (4).
+        let section_length = 5 + 2 + descriptors.len() + 4;
+        let mut s = Vec::new();
+        s.push(TOT_TABLE_ID);
+        s.push(0b0011_0000 | ((section_length >> 8) & 0x0F) as u8);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(&utc);
+        // reserved_future_use (4) = 0b1111, then 12-bit descriptors_length.
+        let dl = descriptors.len();
+        s.push(0xF0 | ((dl >> 8) & 0x0F) as u8);
+        s.push((dl & 0xFF) as u8);
+        s.extend_from_slice(descriptors);
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    #[test]
+    fn tdt_spec_example() {
+        // EN 300 468 §5.2.5 example: 93/10/13 12:45:00 = 0xC0 7912 4500.
+        let section = build_tdt_section([0xC0, 0x79, 0x12, 0x45, 0x00]);
+        let tdt = TimeDateTable::parse(&section).unwrap();
+        let dt = tdt.utc_time.unwrap();
+        assert_eq!(dt.year, 1993);
+        assert_eq!(dt.month, 10);
+        assert_eq!(dt.day, 13);
+        assert_eq!(dt.hour, 12);
+        assert_eq!(dt.minute, 45);
+        assert_eq!(dt.second, 0);
+    }
+
+    #[test]
+    fn tdt_wrong_table_id_rejected() {
+        let mut section = build_tdt_section([0xC0, 0x79, 0x12, 0x45, 0x00]);
+        section[0] = 0x71; // RST table_id
+        assert!(matches!(
+            TimeDateTable::parse(&section),
+            Err(TsError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn tot_no_descriptors() {
+        let section = build_tot_section([0xC0, 0x79, 0x12, 0x45, 0x00], &[]);
+        let tot = TimeOffsetTable::parse(&section).unwrap();
+        let dt = tot.utc_time.unwrap();
+        assert_eq!((dt.year, dt.month, dt.day), (1993, 10, 13));
+        assert_eq!((dt.hour, dt.minute, dt.second), (12, 45, 0));
+        assert!(tot.descriptors.is_empty());
+        assert_eq!(tot.iter_descriptors().count(), 0);
+    }
+
+    #[test]
+    fn tot_with_local_time_offset_descriptor() {
+        // local_time_offset_descriptor (tag 0x58): one 13-byte entry.
+        //   country_code "GBR"
+        //   country_region_id=1, reserved, polarity=1 (negative)
+        //     -> 0b000001_0_1 = 0x05
+        //   local_time_offset BCD 0100 -> 01:00
+        //   time_of_change = 0xC0 7912 4500
+        //   next_time_offset BCD 0200 -> 02:00
+        let mut entry = Vec::new();
+        entry.extend_from_slice(b"GBR");
+        entry.push(0b0000_0101);
+        entry.extend_from_slice(&[0x01, 0x00]);
+        entry.extend_from_slice(&[0xC0, 0x79, 0x12, 0x45, 0x00]);
+        entry.extend_from_slice(&[0x02, 0x00]);
+        let mut descr = vec![0x58u8, entry.len() as u8];
+        descr.extend_from_slice(&entry);
+
+        let section = build_tot_section([0xC0, 0x79, 0x12, 0x45, 0x00], &descr);
+        let tot = TimeOffsetTable::parse(&section).unwrap();
+        assert_eq!(tot.utc_time.unwrap().year, 1993);
+
+        let d = tot.iter_descriptors().next().unwrap().unwrap();
+        match d.body {
+            crate::descriptor::DescriptorBody::LocalTimeOffset(ref lto) => {
+                assert_eq!(lto.entries.len(), 1);
+                let e = lto.entries[0];
+                assert_eq!(&e.country_code, b"GBR");
+                assert_eq!(e.country_region_id, 1);
+                assert!(e.offset_negative);
+                assert_eq!(e.local_time_offset_minutes, 60);
+                assert_eq!(e.next_time_offset_minutes, 120);
+                let toc = e.time_of_change.unwrap();
+                assert_eq!((toc.year, toc.month, toc.day), (1993, 10, 13));
+                assert_eq!((toc.hour, toc.minute, toc.second), (12, 45, 0));
+            }
+            ref other => panic!("expected LocalTimeOffset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tot_crc_mismatch_rejected() {
+        let mut section = build_tot_section([0xC0, 0x79, 0x12, 0x45, 0x00], &[]);
+        let last = section.len() - 1;
+        section[last] ^= 0xFF;
+        assert!(matches!(
+            TimeOffsetTable::parse(&section),
+            Err(TsError::PsiCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn tot_truncated_body_rejected() {
+        // section_length claims 5 but a TOT needs UTC(5)+declen(2)+CRC(4).
+        let section = vec![TOT_TABLE_ID, 0b0011_0000, 0x05, 0, 0, 0, 0, 0];
+        assert!(TimeOffsetTable::parse(&section).is_err());
     }
 }

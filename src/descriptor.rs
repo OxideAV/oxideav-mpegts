@@ -45,6 +45,7 @@
 //! | `0x40` | network_name_descriptor (EN 300 468 §6.2.27) | [`DescriptorBody::NetworkName`]  |
 //! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
 //! | `0x4D` | short_event_descriptor (EN 300 468 §6.2.37) | [`DescriptorBody::ShortEvent`]     |
+//! | `0x58` | local_time_offset_descriptor (EN 300 468 §6.2.20) | [`DescriptorBody::LocalTimeOffset`] |
 //!
 //! Every other tag is preserved as [`DescriptorBody::Raw`] so callers
 //! still see the payload bytes without losing information.
@@ -127,8 +128,61 @@ pub enum DescriptorBody<'a> {
     /// §6.2.27 Table 81). Carried in the NIT network-level descriptor
     /// loop; names the delivery system the NIT informs about.
     NetworkName(NetworkNameDescriptor<'a>),
+    /// `0x58` local_time_offset_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.20 Table 69). Carried in the TOT descriptor loop;
+    /// describes country-specific local-time-offset transitions.
+    LocalTimeOffset(LocalTimeOffsetDescriptor),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
+}
+
+/// One per-country entry of a `local_time_offset_descriptor`
+/// (ETSI EN 300 468 §6.2.20 Table 69).
+///
+/// The descriptor's payload is a flat array of these 13-byte records,
+/// each describing the local-time-offset rules for one country (or
+/// group of countries) and time-zone region. The two offsets and the
+/// `time_of_change` instant let a player display wall-clock local time
+/// around a daylight-saving transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalTimeOffsetEntry {
+    /// 24-bit `country_code` — three ISO 3166 alpha-3 characters, each
+    /// coded as one ISO/IEC 8859-1 byte (e.g. `b"GBR"`), or the ASCII
+    /// string representation of a 900–999 country-group number.
+    pub country_code: [u8; 3],
+    /// 6-bit `country_region_id` (Table 70) — `0` when the country has
+    /// no time-zone subdivision, else a 1–60 zone index.
+    pub country_region_id: u8,
+    /// `local_time_offset_polarity` — `false` (`0b0`) when local time is
+    /// **ahead** of UTC (positive offset), `true` (`0b1`) when local time
+    /// is **behind** UTC (negative offset). Applies to both offsets.
+    pub offset_negative: bool,
+    /// `local_time_offset` minutes — the BCD `HHMM` offset in effect when
+    /// the current UTC time is **before** `time_of_change`, converted to
+    /// whole minutes (sign carried by [`Self::offset_negative`]).
+    pub local_time_offset_minutes: u16,
+    /// `time_of_change` — the UTC instant at which the offset switches
+    /// from `local_time_offset` to `next_time_offset`. Decoded from the
+    /// 40-bit MJD/BCD field; `None` for the all-ones sentinel.
+    pub time_of_change: Option<crate::psi::EitDateTime>,
+    /// `next_time_offset` minutes — the BCD `HHMM` offset in effect once
+    /// the current UTC time reaches or passes `time_of_change`, converted
+    /// to whole minutes (sign carried by [`Self::offset_negative`]).
+    pub next_time_offset_minutes: u16,
+}
+
+/// local_time_offset_descriptor body (ETSI EN 300 468 §6.2.20 Table 69).
+///
+/// A DVB Service Information extension to the ISO/IEC 13818-1 descriptor
+/// space, carried inside the descriptor loop of a
+/// [`crate::psi::TimeOffsetTable`] (TOT) section. It describes how local
+/// time relates to UTC across one or more countries / time zones,
+/// including the next daylight-saving transition. The payload is a flat
+/// array of fixed-size [`LocalTimeOffsetEntry`] records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTimeOffsetDescriptor {
+    /// Per-country / per-region offset entries, in wire order.
+    pub entries: Vec<LocalTimeOffsetEntry>,
 }
 
 /// service_descriptor body (ETSI EN 300 468 §6.2.33 Table 88).
@@ -822,8 +876,54 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x40 => DescriptorBody::NetworkName(NetworkNameDescriptor { network_name: data }),
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
         0x4D => decode_short_event(data).unwrap_or(DescriptorBody::Raw),
+        0x58 => decode_local_time_offset(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
+}
+
+fn decode_local_time_offset(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.20 Table 69 — a flat array of 13-byte records:
+    //   country_code               (24)  3 ISO-8859-1 bytes
+    //   country_region_id          (6)
+    //   reserved_future_use        (1)
+    //   local_time_offset_polarity (1)
+    //   local_time_offset          (16)  BCD HHMM
+    //   time_of_change             (40)  MJD + BCD time
+    //   next_time_offset           (16)  BCD HHMM
+    const ENTRY_LEN: usize = 13;
+    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
+    for chunk in data.chunks_exact(ENTRY_LEN) {
+        let country_code = [chunk[0], chunk[1], chunk[2]];
+        let b3 = chunk[3];
+        let country_region_id = b3 >> 2;
+        let offset_negative = (b3 & 0b0000_0001) != 0;
+        let local_time_offset_minutes = bcd_hhmm_minutes(chunk[4], chunk[5]);
+        let time_of_change =
+            crate::psi::decode_utc_time([chunk[6], chunk[7], chunk[8], chunk[9], chunk[10]]);
+        let next_time_offset_minutes = bcd_hhmm_minutes(chunk[11], chunk[12]);
+        entries.push(LocalTimeOffsetEntry {
+            country_code,
+            country_region_id,
+            offset_negative,
+            local_time_offset_minutes,
+            time_of_change,
+            next_time_offset_minutes,
+        });
+    }
+    Some(DescriptorBody::LocalTimeOffset(LocalTimeOffsetDescriptor {
+        entries,
+    }))
+}
+
+/// Convert a 16-bit BCD `HHMM` time-offset field to whole minutes.
+/// `hh` holds two BCD digits of hours, `mm` two BCD digits of minutes.
+fn bcd_hhmm_minutes(hh: u8, mm: u8) -> u16 {
+    let hours = (hh >> 4) as u16 * 10 + (hh & 0x0F) as u16;
+    let minutes = (mm >> 4) as u16 * 10 + (mm & 0x0F) as u16;
+    hours * 60 + minutes
 }
 
 fn decode_service(data: &[u8]) -> Option<DescriptorBody<'_>> {

@@ -9,6 +9,17 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Added
+
+- DVB Time and Date Table (TDT, EN 300 468 §5.2.5) and Time Offset
+  Table (TOT, §5.2.6) parsers — both short-form sections on PID
+  `0x0014`. `TimeDateTable` / `TimeOffsetTable` decode the 40-bit
+  MJD/BCD `UTC_time` via a shared `decode_utc_time` helper; the TOT
+  additionally verifies its CRC-32 and exposes a descriptor loop.
+- `local_time_offset_descriptor` (tag `0x58`, EN 300 468 §6.2.20)
+  decode — per-country offset entries
+  (`DescriptorBody::LocalTimeOffset`).
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.1...v0.0.2) - 2026-06-15
 
 ### Other

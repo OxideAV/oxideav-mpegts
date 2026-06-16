@@ -18,8 +18,8 @@ language-tagged tracks and chapter marks.
 | Module           | What it parses                                                              |
 |------------------|-----------------------------------------------------------------------------|
 | `packet`         | 188-byte TS packet — sync byte, flags, PID, adaptation field (PCR + OPCR + splice_countdown + transport_private_data + adaptation_field_extension with ltw / piecewise_rate / seamless_splice), payload. |
-| `psi`            | PAT + PMT + CAT (Conditional Access Table, §2.4.4.6) + TSDT (Transport Stream Description Table, §2.4.4.12 — TS-wide descriptor loop on PID 0x0002 / table_id 0x03) + SDT (DVB Service Description Table, ETSI EN 300 468 §5.2.3 — service loop on PID 0x0011 / table_id 0x42 actual + 0x46 other, with typed `RunningStatus`) + EIT (DVB Event Information Table, EN 300 468 §5.2.4 — event loop on PID 0x0012 / table_id 0x4E/0x4F present-following + 0x50–0x6F schedule, with MJD/BCD `start_time` + BCD `duration` decoded per annex C) + NIT (DVB Network Information Table, EN 300 468 §5.2.1 — PID 0x0010 / table_id 0x40 actual + 0x41 other, with the `network_id` plus a network-level descriptor loop and a typed `transport_stream_loop` of `(transport_stream_id, original_network_id)` entries each carrying their own descriptor loop) section parsers, plus `PsiSectionAssembler` — per-PID reassembler that joins long sections across multiple 188-byte TS packets (§2.4.4 pointer_field + PUSI continuation). Handles up-to-1024-byte sections, stuffing terminators, CC-skip detection, and back-to-back sections in one payload. |
-| `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / hierarchy / AVC / HEVC / data-stream-alignment / target-background-grid / video-window / system-clock / multiplex-buffer-utilization / copyright / maximum-bitrate / smoothing-buffer / STD / IBP — plus the DVB `service_descriptor` (tag 0x48, EN 300 468 §6.2.33) carrying the service / provider names, the DVB `short_event_descriptor` (tag 0x4D, EN 300 468 §6.2.37) carrying the event name + short text, and the DVB `network_name_descriptor` (tag 0x40, EN 300 468 §6.2.27) carrying the delivery-system name. |
+| `psi`            | PAT + PMT + CAT (Conditional Access Table, §2.4.4.6) + TSDT (Transport Stream Description Table, §2.4.4.12 — TS-wide descriptor loop on PID 0x0002 / table_id 0x03) + SDT (DVB Service Description Table, ETSI EN 300 468 §5.2.3 — service loop on PID 0x0011 / table_id 0x42 actual + 0x46 other, with typed `RunningStatus`) + EIT (DVB Event Information Table, EN 300 468 §5.2.4 — event loop on PID 0x0012 / table_id 0x4E/0x4F present-following + 0x50–0x6F schedule, with MJD/BCD `start_time` + BCD `duration` decoded per annex C) + NIT (DVB Network Information Table, EN 300 468 §5.2.1 — PID 0x0010 / table_id 0x40 actual + 0x41 other, with the `network_id` plus a network-level descriptor loop and a typed `transport_stream_loop` of `(transport_stream_id, original_network_id)` entries each carrying their own descriptor loop) + TDT (DVB Time and Date Table, EN 300 468 §5.2.5 — short-form section on PID 0x0014 / table_id 0x70 carrying just the 40-bit MJD/BCD `UTC_time`) + TOT (DVB Time Offset Table, EN 300 468 §5.2.6 — short-form section on PID 0x0014 / table_id 0x73, the `UTC_time` plus a CRC-verified descriptor loop that usually carries the `local_time_offset_descriptor`) section parsers, plus `PsiSectionAssembler` — per-PID reassembler that joins long sections across multiple 188-byte TS packets (§2.4.4 pointer_field + PUSI continuation). Handles up-to-1024-byte sections, stuffing terminators, CC-skip detection, and back-to-back sections in one payload. |
+| `descriptor`     | §2.6 TLV descriptors — registration / ISO-639 language / CA / video / audio / hierarchy / AVC / HEVC / data-stream-alignment / target-background-grid / video-window / system-clock / multiplex-buffer-utilization / copyright / maximum-bitrate / smoothing-buffer / STD / IBP — plus the DVB `service_descriptor` (tag 0x48, EN 300 468 §6.2.33) carrying the service / provider names, the DVB `short_event_descriptor` (tag 0x4D, EN 300 468 §6.2.37) carrying the event name + short text, the DVB `network_name_descriptor` (tag 0x40, EN 300 468 §6.2.27) carrying the delivery-system name, and the DVB `local_time_offset_descriptor` (tag 0x58, EN 300 468 §6.2.20) carrying per-country local-time-offset entries (offset minutes + `time_of_change` instant + next offset). |
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. Decodes every Table 2-17 optional header field: PES_scrambling_control / PES_priority / data_alignment_indicator / copyright / original_or_copy on flags1, plus the flag-gated bodies ESCR (42-bit 27 MHz tick), ES_rate (50 bytes/s units), DSM_trick_mode (raw 8-bit), additional_copy_info, previous_PES_packet_CRC, and the full PES_extension body (16-byte private data, raw pack_header bytes, program_packet_sequence_counter, P-STD buffer scale/size, PES_extension_field_2). |
 | `stream_type`    | `stream_type` byte → BD-relevant codec class enum.                          |
 | `clock`          | Per-PCR-PID 27 MHz clock recovery + per-PID continuity-counter classification (§2.4.2.2 / §2.4.3.3 / §2.4.3.5). |
@@ -89,6 +89,29 @@ application area — with its own descriptor loop, walkable via
 the per-service SDT and per-event EIT records. DVB text strings keep
 their original bytes — the annex-A character-table selection is left to
 the caller, as with the SDT and EIT name descriptors.
+
+`TimeDateTable::parse` and `TimeOffsetTable::parse` read the two DVB
+time tables that share the fixed PID `0x0014` (EN 300 468 §5.2.5 /
+§5.2.6). Both are **short-form** sections — `section_syntax_indicator`
+is `0`, so there is no `table_id_extension` / `version_number` /
+`section_number` header and the body starts immediately after the
+12-bit `section_length`. The TDT (`table_id 0x70`) carries nothing but
+the 40-bit `UTC_time` and has no CRC; the TOT (`table_id 0x73`) adds a
+CRC-32 (verified the same way as a long-form section) plus a descriptor
+loop. Both reuse the same `decode_utc_time` helper that decodes the
+EIT `start_time` — 16 bits of MJD converted to a Gregorian
+`(year, month, day)` via the annex-C integer formula, then 24 bits of
+6-digit BCD UTC time. `TimeOffsetTable::iter_descriptors` walks the
+loop, where the `local_time_offset_descriptor` (tag `0x58`) decodes to
+`DescriptorBody::LocalTimeOffset` — a flat array of per-country entries
+giving the `country_code`, `country_region_id`, signed
+`local_time_offset` / `next_time_offset` (in minutes), and the
+`time_of_change` instant. The TDT/TOT give the
+`oxideav remux bluray://` path an absolute wall-clock anchor for a
+title, and the TOT's offset lets a player turn that UTC into local
+time across a daylight-saving boundary. The spec's worked example
+(`0xC0 7912 4500` → 1993-10-13 12:45:00 UTC) is pinned as a test for
+both tables.
 
 `PsiSectionAssembler` is the building block that turns a stream of
 TS-packet payloads on a single PSI PID into a stream of complete
