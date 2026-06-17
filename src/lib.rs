@@ -56,7 +56,9 @@
 //!   ([`psi::EventInformationTable`], §5.2.4) is parsed across all four
 //!   `table_id` classifications, decoding each event's MJD/BCD
 //!   `start_time`, BCD `duration`, and per-event descriptor loop — the
-//!   `short_event_descriptor` (tag `0x4D`) names the event.
+//!   `short_event_descriptor` (tag `0x4D`) names the event and the
+//!   `extended_event_descriptor` (tag `0x4E`) carries its detailed
+//!   two-column item list plus non-itemized synopsis text.
 //! - Conditional Access (CA) descriptors / scrambling.
 //! - Re-multiplexing — this is a demux-only crate. The MKV writer
 //!   in `oxideav-mkv` owns the output side.
@@ -85,8 +87,9 @@ pub use clock::{
 };
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
-    DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, HevcVideoDescriptor,
-    Iso639Language, LocalTimeOffsetDescriptor, LocalTimeOffsetEntry, MaximumBitrateDescriptor,
+    DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter,
+    ExtendedEventDescriptor, ExtendedEventItem, HevcVideoDescriptor, Iso639Language,
+    LocalTimeOffsetDescriptor, LocalTimeOffsetEntry, MaximumBitrateDescriptor,
     NetworkNameDescriptor, ServiceDescriptor, ShortEventDescriptor, SmoothingBufferDescriptor,
     StdDescriptor, SystemClockDescriptor, VideoStreamDescriptor,
 };

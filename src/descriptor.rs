@@ -124,6 +124,11 @@ pub enum DescriptorBody<'a> {
     /// §6.2.37 Table 93). Carried in the EIT event loop; names the event
     /// plus a short text description, both tagged with a language code.
     ShortEvent(ShortEventDescriptor<'a>),
+    /// `0x4E` extended_event_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.15 Table 53). Carried in the EIT event loop alongside the
+    /// short_event_descriptor; conveys a detailed two-column item list
+    /// plus non-itemized free text, fragmentable across an associated set.
+    ExtendedEvent(ExtendedEventDescriptor<'a>),
     /// `0x40` network_name_descriptor — DVB SI extension (ETSI EN 300 468
     /// §6.2.27 Table 81). Carried in the NIT network-level descriptor
     /// loop; names the delivery system the NIT informs about.
@@ -235,6 +240,62 @@ pub struct ShortEventDescriptor<'a> {
     pub event_name: &'a [u8],
     /// Raw `text` bytes — the short event description (DVB text string,
     /// annex A).
+    pub text: &'a [u8],
+}
+
+/// One `(item_description, item)` pair from an
+/// [`ExtendedEventDescriptor`] (ETSI EN 300 468 §6.2.15 Table 53).
+///
+/// The item structure carries two columns of text — a description and
+/// the item text itself. The spec's worked example is a cast list where
+/// `item_description` might be `b"Producer"` and `item` the name of the
+/// producer. Both runs are exposed **raw** (DVB text string, annex A);
+/// the character-table selection is left to the caller, as with every
+/// other DVB text field in this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedEventItem<'a> {
+    /// Raw `item_description_char` bytes (DVB text string, annex A).
+    pub item_description: &'a [u8],
+    /// Raw `item_char` bytes (DVB text string, annex A).
+    pub item: &'a [u8],
+}
+
+/// extended_event_descriptor body (ETSI EN 300 468 §6.2.15 Table 53).
+///
+/// A DVB Service Information extension to the ISO/IEC 13818-1 descriptor
+/// space, carried inside the per-event descriptor loop of an
+/// [`crate::psi::EventInformationTable`] section alongside the
+/// [`ShortEventDescriptor`]. Where the short_event_descriptor caps the
+/// description at the ~244 bytes that fit a single descriptor, the
+/// extended_event_descriptor provides the **detailed** text: a list of
+/// two-column `(item_description, item)` pairs followed by a block of
+/// non-itemized free text.
+///
+/// More than one extended_event_descriptor can be associated with a
+/// single event to convey more than 256 bytes; `descriptor_number` /
+/// `last_descriptor_number` thread the fragments together. This decoder
+/// surfaces those numbers so the caller can concatenate the `text`
+/// runs across the associated set in descriptor-number order.
+///
+/// As with the other DVB text descriptors, the `item_description`,
+/// `item`, and `text` runs are exposed **raw** (DVB text string,
+/// annex A) so the caller chooses the character-table interpretation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedEventDescriptor<'a> {
+    /// 4-bit `descriptor_number` — the index of this descriptor within
+    /// the associated set (the first is `0x0`).
+    pub descriptor_number: u8,
+    /// 4-bit `last_descriptor_number` — the highest `descriptor_number`
+    /// in the associated set.
+    pub last_descriptor_number: u8,
+    /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
+    /// coded as one ISO/IEC 8859-1 byte (e.g. `b"eng"`, `b"fre"`).
+    pub language_code: [u8; 3],
+    /// The `(item_description, item)` pairs from the item loop, in wire
+    /// order. Empty when `length_of_items` is `0`.
+    pub items: Vec<ExtendedEventItem<'a>>,
+    /// Raw `text_char` bytes — the non-itemized extended text (DVB text
+    /// string, annex A).
     pub text: &'a [u8],
 }
 
@@ -876,6 +937,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x40 => DescriptorBody::NetworkName(NetworkNameDescriptor { network_name: data }),
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
         0x4D => decode_short_event(data).unwrap_or(DescriptorBody::Raw),
+        0x4E => decode_extended_event(data).unwrap_or(DescriptorBody::Raw),
         0x58 => decode_local_time_offset(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
@@ -988,6 +1050,82 @@ fn decode_short_event(data: &[u8]) -> Option<DescriptorBody<'_>> {
     Some(DescriptorBody::ShortEvent(ShortEventDescriptor {
         language_code,
         event_name,
+        text,
+    }))
+}
+
+fn decode_extended_event(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.15 Table 53:
+    //   descriptor_number      (4) \ packed into one byte
+    //   last_descriptor_number (4) /
+    //   ISO_639_language_code  (24)
+    //   length_of_items        (8)
+    //     repeated until length_of_items bytes are consumed:
+    //       item_description_length (8)
+    //       item_description_char   (item_description_length bytes)
+    //       item_length             (8)
+    //       item_char               (item_length bytes)
+    //   text_length            (8)
+    //   text_char              (text_length bytes)
+    // Fixed prefix: number byte + 3 language bytes + length_of_items byte.
+    if data.len() < 5 {
+        return None;
+    }
+    let descriptor_number = data[0] >> 4;
+    let last_descriptor_number = data[0] & 0x0F;
+    let language_code = [data[1], data[2], data[3]];
+    let length_of_items = data[4] as usize;
+
+    // The item block occupies exactly `length_of_items` bytes immediately
+    // after the prefix; the text_length byte and its run follow it.
+    let items_start = 5usize;
+    let items_end = items_start.checked_add(length_of_items)?;
+    if items_end > data.len() {
+        return None;
+    }
+    let items_block = &data[items_start..items_end];
+
+    let mut items = Vec::new();
+    let mut pos = 0usize;
+    while pos < items_block.len() {
+        // item_description_length + its run.
+        let desc_len = items_block[pos] as usize;
+        let desc_start = pos.checked_add(1)?;
+        let desc_end = desc_start.checked_add(desc_len)?;
+        // The item_length byte must still fit after the description run.
+        if desc_end >= items_block.len() {
+            return None;
+        }
+        let item_description = &items_block[desc_start..desc_end];
+        // item_length + its run.
+        let item_len = items_block[desc_end] as usize;
+        let item_start = desc_end + 1;
+        let item_end = item_start.checked_add(item_len)?;
+        if item_end > items_block.len() {
+            return None;
+        }
+        let item = &items_block[item_start..item_end];
+        items.push(ExtendedEventItem {
+            item_description,
+            item,
+        });
+        pos = item_end;
+    }
+
+    // text_length and its run come after the item block.
+    let text_len = data[items_end] as usize;
+    let text_start = items_end + 1;
+    let text_end = text_start.checked_add(text_len)?;
+    if text_end > data.len() {
+        return None;
+    }
+    let text = &data[text_start..text_end];
+
+    Some(DescriptorBody::ExtendedEvent(ExtendedEventDescriptor {
+        descriptor_number,
+        last_descriptor_number,
+        language_code,
+        items,
         text,
     }))
 }
@@ -2712,6 +2850,122 @@ mod tests {
         let block = tlv(0x4D, &[b'e', b'n', b'g', 0x09, b'X', b'Y']);
         let d = iter_descriptors(&block).next().unwrap().unwrap();
         assert_eq!(d.tag, 0x4D);
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn extended_event_descriptor_decodes_items_and_text() {
+        // descriptor_number = 0, last = 1, lang = "eng",
+        // one item ("Producer" -> "Jane Doe"), text = "Full synopsis".
+        let mut item_block = Vec::new();
+        item_block.push(8); // item_description_length
+        item_block.extend_from_slice(b"Producer");
+        item_block.push(8); // item_length
+        item_block.extend_from_slice(b"Jane Doe");
+
+        let mut body = Vec::new();
+        body.push(0x01); // descriptor_number=0, last_descriptor_number=1
+        body.extend_from_slice(b"eng");
+        body.push(item_block.len() as u8); // length_of_items
+        body.extend_from_slice(&item_block);
+        body.push(13); // text_length
+        body.extend_from_slice(b"Full synopsis");
+
+        let block = tlv(0x4E, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x4E);
+        match d.body {
+            DescriptorBody::ExtendedEvent(e) => {
+                assert_eq!(e.descriptor_number, 0);
+                assert_eq!(e.last_descriptor_number, 1);
+                assert_eq!(&e.language_code, b"eng");
+                assert_eq!(e.items.len(), 1);
+                assert_eq!(e.items[0].item_description, b"Producer");
+                assert_eq!(e.items[0].item, b"Jane Doe");
+                assert_eq!(e.text, b"Full synopsis");
+            }
+            other => panic!("expected ExtendedEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extended_event_descriptor_multiple_items() {
+        // Two item pairs, then a text run — cast-list shape from §6.2.15.
+        let mut item_block = Vec::new();
+        for (desc, txt) in [(&b"Director"[..], &b"A"[..]), (&b"Writer"[..], &b"B"[..])] {
+            item_block.push(desc.len() as u8);
+            item_block.extend_from_slice(desc);
+            item_block.push(txt.len() as u8);
+            item_block.extend_from_slice(txt);
+        }
+        let mut body = Vec::new();
+        body.push(0x22); // descriptor_number=2, last_descriptor_number=2
+        body.extend_from_slice(b"fre");
+        body.push(item_block.len() as u8);
+        body.extend_from_slice(&item_block);
+        body.push(0); // empty text run
+
+        let block = tlv(0x4E, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ExtendedEvent(e) => {
+                assert_eq!(e.descriptor_number, 2);
+                assert_eq!(e.last_descriptor_number, 2);
+                assert_eq!(&e.language_code, b"fre");
+                assert_eq!(e.items.len(), 2);
+                assert_eq!(e.items[0].item_description, b"Director");
+                assert_eq!(e.items[0].item, b"A");
+                assert_eq!(e.items[1].item_description, b"Writer");
+                assert_eq!(e.items[1].item, b"B");
+                assert!(e.text.is_empty());
+            }
+            other => panic!("expected ExtendedEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extended_event_descriptor_no_items_text_only() {
+        // length_of_items = 0 — descriptor carries only the free text.
+        let mut body = Vec::new();
+        body.push(0x00);
+        body.extend_from_slice(b"deu");
+        body.push(0); // length_of_items
+        body.push(5); // text_length
+        body.extend_from_slice(b"Hallo");
+
+        let block = tlv(0x4E, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ExtendedEvent(e) => {
+                assert!(e.items.is_empty());
+                assert_eq!(e.text, b"Hallo");
+            }
+            other => panic!("expected ExtendedEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extended_event_descriptor_truncated_falls_back_to_raw() {
+        // length_of_items claims 10 bytes but only 2 follow it.
+        let block = tlv(0x4E, &[0x00, b'e', b'n', b'g', 0x0A, b'X', b'Y']);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x4E);
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn extended_event_descriptor_item_overruns_block() {
+        // length_of_items = 4 but the single item claims a 9-byte
+        // description that spills past the item block boundary.
+        let mut body = Vec::new();
+        body.push(0x00);
+        body.extend_from_slice(b"eng");
+        body.push(4); // length_of_items
+        body.push(9); // item_description_length overruns the 4-byte block
+        body.extend_from_slice(b"abc");
+        body.push(0); // text_length
+        let block = tlv(0x4E, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
         assert!(matches!(d.body, DescriptorBody::Raw));
     }
 

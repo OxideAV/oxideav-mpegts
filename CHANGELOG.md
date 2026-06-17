@@ -11,6 +11,12 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `extended_event_descriptor` (tag `0x4E`, EN 300 468 §6.2.15) decode —
+  the long-form companion to the `short_event_descriptor`, carried in
+  the EIT event loop. `DescriptorBody::ExtendedEvent` exposes the
+  `descriptor_number` / `last_descriptor_number` association pair, the
+  language code, a `Vec` of two-column `(item_description, item)` pairs,
+  and the non-itemized free text. Item/text runs stay raw (annex A).
 - DVB Time and Date Table (TDT, EN 300 468 §5.2.5) and Time Offset
   Table (TOT, §5.2.6) parsers — both short-form sections on PID
   `0x0014`. `TimeDateTable` / `TimeOffsetTable` decode the 40-bit
