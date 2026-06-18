@@ -45,6 +45,7 @@
 //! | `0x40` | network_name_descriptor (EN 300 468 §6.2.27) | [`DescriptorBody::NetworkName`]  |
 //! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
 //! | `0x4D` | short_event_descriptor (EN 300 468 §6.2.37) | [`DescriptorBody::ShortEvent`]     |
+//! | `0x54` | content_descriptor (EN 300 468 §6.2.9) | [`DescriptorBody::Content`]             |
 //! | `0x58` | local_time_offset_descriptor (EN 300 468 §6.2.20) | [`DescriptorBody::LocalTimeOffset`] |
 //!
 //! Every other tag is preserved as [`DescriptorBody::Raw`] so callers
@@ -129,6 +130,11 @@ pub enum DescriptorBody<'a> {
     /// short_event_descriptor; conveys a detailed two-column item list
     /// plus non-itemized free text, fragmentable across an associated set.
     ExtendedEvent(ExtendedEventDescriptor<'a>),
+    /// `0x54` content_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.9 Table 28). Carried in the EIT event loop; classifies the
+    /// event's genre as a flat array of `(content_nibble_level_1,
+    /// content_nibble_level_2, user_byte)` triples.
+    Content(ContentDescriptor),
     /// `0x40` network_name_descriptor — DVB SI extension (ETSI EN 300 468
     /// §6.2.27 Table 81). Carried in the NIT network-level descriptor
     /// loop; names the delivery system the NIT informs about.
@@ -188,6 +194,45 @@ pub struct LocalTimeOffsetEntry {
 pub struct LocalTimeOffsetDescriptor {
     /// Per-country / per-region offset entries, in wire order.
     pub entries: Vec<LocalTimeOffsetEntry>,
+}
+
+/// One genre-classification entry of a `content_descriptor`
+/// (ETSI EN 300 468 §6.2.9 Table 28).
+///
+/// The descriptor body is a flat array of these 16-bit records, each
+/// pairing a two-level content nibble (the genre, coded per Table 29 —
+/// e.g. `(0x1, 0x4)` = comedy, `(0x4, 0x3)` = football/soccer) with an
+/// 8-bit `user_byte` whose meaning is broadcaster-defined. The Table 29
+/// genre strings are reference data the spec leaves to the application;
+/// this crate exposes the raw nibbles so the caller maps them against
+/// whatever classification table its UI uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentNibble {
+    /// 4-bit `content_nibble_level_1` — first level of the content
+    /// identifier (Table 29). `0x0` = undefined, `0x1` = movie/drama,
+    /// `0x2` = news/current affairs, `0x4` = sports, `0xF` = user defined.
+    pub level_1: u8,
+    /// 4-bit `content_nibble_level_2` — second level of the content
+    /// identifier (Table 29), scoped to `level_1`.
+    pub level_2: u8,
+    /// 8-bit `user_byte` — broadcaster-defined; preserved verbatim.
+    pub user_byte: u8,
+}
+
+/// content_descriptor body (ETSI EN 300 468 §6.2.9 Table 28).
+///
+/// A DVB Service Information extension to the ISO/IEC 13818-1 descriptor
+/// space, carried inside the per-event descriptor loop of an
+/// [`crate::psi::EventInformationTable`] section. It classifies the
+/// event's genre as a flat array of fixed-size [`ContentNibble`]
+/// records. The two content nibbles index ETSI EN 300 468 Table 29; the
+/// genre strings themselves are reference data left to the caller, so
+/// the raw nibble values plus the broadcaster-defined `user_byte` are
+/// surfaced directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentDescriptor {
+    /// Genre-classification entries, in wire order.
+    pub entries: Vec<ContentNibble>,
 }
 
 /// service_descriptor body (ETSI EN 300 468 §6.2.33 Table 88).
@@ -938,6 +983,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
         0x4D => decode_short_event(data).unwrap_or(DescriptorBody::Raw),
         0x4E => decode_extended_event(data).unwrap_or(DescriptorBody::Raw),
+        0x54 => decode_content(data).unwrap_or(DescriptorBody::Raw),
         0x58 => decode_local_time_offset(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
@@ -978,6 +1024,26 @@ fn decode_local_time_offset(data: &[u8]) -> Option<DescriptorBody<'_>> {
     Some(DescriptorBody::LocalTimeOffset(LocalTimeOffsetDescriptor {
         entries,
     }))
+}
+
+fn decode_content(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.9 Table 28 — a flat array of 2-byte records:
+    //   content_nibble_level_1 (4)
+    //   content_nibble_level_2 (4)
+    //   user_byte              (8)
+    const ENTRY_LEN: usize = 2;
+    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
+    for chunk in data.chunks_exact(ENTRY_LEN) {
+        entries.push(ContentNibble {
+            level_1: chunk[0] >> 4,
+            level_2: chunk[0] & 0x0F,
+            user_byte: chunk[1],
+        });
+    }
+    Some(DescriptorBody::Content(ContentDescriptor { entries }))
 }
 
 /// Convert a 16-bit BCD `HHMM` time-offset field to whole minutes.
@@ -2991,5 +3057,69 @@ mod tests {
             DescriptorBody::NetworkName(n) => assert!(n.network_name.is_empty()),
             other => panic!("expected NetworkName, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn content_descriptor_decodes_genre_nibbles() {
+        // Two genre entries: (0x1, 0x4) = comedy, user 0x00; and
+        // (0x4, 0x3) = football/soccer, user 0xAB (EN 300 468 Table 29).
+        let body = [0x14, 0x00, 0x43, 0xAB];
+        let block = tlv(0x54, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x54);
+        match d.body {
+            DescriptorBody::Content(c) => {
+                assert_eq!(c.entries.len(), 2);
+                assert_eq!(
+                    c.entries[0],
+                    ContentNibble {
+                        level_1: 0x1,
+                        level_2: 0x4,
+                        user_byte: 0x00,
+                    }
+                );
+                assert_eq!(
+                    c.entries[1],
+                    ContentNibble {
+                        level_1: 0x4,
+                        level_2: 0x3,
+                        user_byte: 0xAB,
+                    }
+                );
+            }
+            other => panic!("expected Content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_descriptor_single_entry() {
+        // (0x2, 0x3) = documentary, user 0x00.
+        let block = tlv(0x54, &[0x23, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Content(c) => {
+                assert_eq!(c.entries.len(), 1);
+                assert_eq!(c.entries[0].level_1, 0x2);
+                assert_eq!(c.entries[0].level_2, 0x3);
+                assert_eq!(c.entries[0].user_byte, 0x00);
+            }
+            other => panic!("expected Content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_descriptor_empty_falls_back_to_raw() {
+        // A zero-length content_descriptor has no genre entry; surface Raw.
+        let block = tlv(0x54, b"");
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn content_descriptor_odd_length_falls_back_to_raw() {
+        // Each entry is exactly 2 bytes; an odd-length body is malformed.
+        let block = tlv(0x54, &[0x14, 0x00, 0x43]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
     }
 }

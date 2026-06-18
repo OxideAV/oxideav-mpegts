@@ -11,6 +11,13 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `content_descriptor` (tag `0x54`, EN 300 468 §6.2.9) decode — the DVB
+  genre classifier carried in the EIT event loop alongside the short /
+  extended event descriptors. `DescriptorBody::Content` exposes a flat
+  array of `ContentNibble` records, each pairing the two 4-bit content
+  nibbles (Table 29 genre index) with the broadcaster-defined
+  `user_byte`. Genre strings are left to the caller; an empty or
+  odd-length body falls back to `Raw`.
 - `extended_event_descriptor` (tag `0x4E`, EN 300 468 §6.2.15) decode —
   the long-form companion to the `short_event_descriptor`, carried in
   the EIT event loop. `DescriptorBody::ExtendedEvent` exposes the
