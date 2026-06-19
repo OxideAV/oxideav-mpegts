@@ -1802,6 +1802,73 @@ mod tests {
     }
 
     #[test]
+    fn pmt_dvb_es_descriptors_decode_through_typed_paths() {
+        use crate::descriptor::DescriptorBody;
+        // A DVB-style PMT: a private-data PES (0x06) carrying a DVB
+        // subtitle stream tagged with a stream_identifier_descriptor +
+        // a subtitling_descriptor, and an AC-3 stream (0x06 private PES
+        // in DVB) tagged with an AC-3_descriptor. Walk each ES loop and
+        // confirm the new typed variants decode end-to-end through the
+        // PMT parse path.
+        let mut sub_es: Vec<u8> = Vec::new();
+        // stream_identifier_descriptor (0x52): component_tag 0x09.
+        sub_es.extend_from_slice(&[0x52, 0x01, 0x09]);
+        // subtitling_descriptor (0x59): one "eng" entry, type 0x10,
+        // composition 0x0001, ancillary 0x0002.
+        sub_es.extend_from_slice(&[0x59, 0x08, b'e', b'n', b'g', 0x10, 0x00, 0x01, 0x00, 0x02]);
+
+        // AC-3_descriptor (0x6A): flags 0x40 → only bsid present (0x08).
+        let ac3_es: &[u8] = &[0x6A, 0x02, 0x40, 0x08];
+
+        let section = build_pmt_section(
+            1,
+            0,
+            0x100,
+            &[],
+            &[(0x06, 0x1500, &sub_es), (0x06, 0x1600, ac3_es)],
+        );
+        let pmt = ProgramMapTable::parse(&section).unwrap();
+        assert_eq!(pmt.streams.len(), 2);
+
+        // Subtitle stream: two descriptors, both typed.
+        let sub_descrs: Vec<_> = pmt.streams[0]
+            .iter_descriptors()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sub_descrs.len(), 2);
+        match &sub_descrs[0].body {
+            DescriptorBody::StreamIdentifier(s) => assert_eq!(s.component_tag, 0x09),
+            other => panic!("expected StreamIdentifier, got {other:?}"),
+        }
+        match &sub_descrs[1].body {
+            DescriptorBody::Subtitling(s) => {
+                assert_eq!(s.entries.len(), 1);
+                assert_eq!(&s.entries[0].language_code, b"eng");
+                assert_eq!(s.entries[0].subtitling_type, 0x10);
+                assert_eq!(s.entries[0].composition_page_id, 0x0001);
+                assert_eq!(s.entries[0].ancillary_page_id, 0x0002);
+            }
+            other => panic!("expected Subtitling, got {other:?}"),
+        }
+
+        // AC-3 stream: one typed AC-3 descriptor.
+        let ac3_descrs: Vec<_> = pmt.streams[1]
+            .iter_descriptors()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ac3_descrs.len(), 1);
+        match &ac3_descrs[0].body {
+            DescriptorBody::Ac3(a) => {
+                assert_eq!(a.component_type, None);
+                assert_eq!(a.bsid, Some(0x08));
+                assert_eq!(a.mainid, None);
+                assert_eq!(a.asvc, None);
+            }
+            other => panic!("expected Ac3, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn pmt_program_info_descriptors_decode_registration() {
         // program_info: registration descriptor with format_identifier=HDMV.
         let program_info: &[u8] = &[0x05, 0x04, b'H', b'D', b'M', b'V'];
