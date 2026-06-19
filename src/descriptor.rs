@@ -45,8 +45,14 @@
 //! | `0x40` | network_name_descriptor (EN 300 468 §6.2.27) | [`DescriptorBody::NetworkName`]  |
 //! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
 //! | `0x4D` | short_event_descriptor (EN 300 468 §6.2.37) | [`DescriptorBody::ShortEvent`]     |
+//! | `0x52` | stream_identifier_descriptor (EN 300 468 §6.2.39) | [`DescriptorBody::StreamIdentifier`] |
 //! | `0x54` | content_descriptor (EN 300 468 §6.2.9) | [`DescriptorBody::Content`]             |
+//! | `0x56` | teletext_descriptor (EN 300 468 §6.2.43) | [`DescriptorBody::Teletext`]          |
 //! | `0x58` | local_time_offset_descriptor (EN 300 468 §6.2.20) | [`DescriptorBody::LocalTimeOffset`] |
+//! | `0x59` | subtitling_descriptor (EN 300 468 §6.2.41) | [`DescriptorBody::Subtitling`]      |
+//! | `0x6A` | AC-3_descriptor (EN 300 468 annex D)  | [`DescriptorBody::Ac3`]                      |
+//! | `0x7A` | enhanced_AC-3_descriptor (EN 300 468 annex D) | [`DescriptorBody::EnhancedAc3`]      |
+//! | `0x7B` | DTS_descriptor (EN 300 468 annex G)   | [`DescriptorBody::Dts`]                      |
 //!
 //! Every other tag is preserved as [`DescriptorBody::Raw`] so callers
 //! still see the payload bytes without losing information.
@@ -143,6 +149,30 @@ pub enum DescriptorBody<'a> {
     /// EN 300 468 §6.2.20 Table 69). Carried in the TOT descriptor loop;
     /// describes country-specific local-time-offset transitions.
     LocalTimeOffset(LocalTimeOffsetDescriptor),
+    /// `0x52` stream_identifier_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.39 Table 97). Carried in a PMT `ES_info` loop;
+    /// labels the component stream with a `component_tag`.
+    StreamIdentifier(StreamIdentifierDescriptor),
+    /// `0x56` teletext_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.43 Table 101). Carried in a PMT `ES_info` loop; identifies an
+    /// EBU teletext stream and its per-language pages.
+    Teletext(TeletextDescriptor),
+    /// `0x59` subtitling_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.41 Table 99). Carried in a PMT `ES_info` loop; identifies an
+    /// EN 300 743 DVB subtitle stream and its per-language services.
+    Subtitling(SubtitlingDescriptor),
+    /// `0x6A` AC-3_descriptor — DVB SI extension (ETSI EN 300 468 annex D
+    /// Table D.6). Carried in a PMT `ES_info` loop; configures an AC-3
+    /// audio stream.
+    Ac3(Ac3Descriptor<'a>),
+    /// `0x7A` enhanced_AC-3_descriptor — DVB SI extension (ETSI EN 300 468
+    /// annex D Table D.7). Carried in a PMT `ES_info` loop; configures an
+    /// Enhanced AC-3 (E-AC-3) audio stream.
+    EnhancedAc3(EnhancedAc3Descriptor<'a>),
+    /// `0x7B` DTS_descriptor — DVB SI extension (ETSI EN 300 468 annex G
+    /// Table G.1). Carried in a PMT `ES_info` loop; configures a DTS
+    /// Coherent Acoustics audio stream.
+    Dts(DtsDescriptor<'a>),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -194,6 +224,187 @@ pub struct LocalTimeOffsetEntry {
 pub struct LocalTimeOffsetDescriptor {
     /// Per-country / per-region offset entries, in wire order.
     pub entries: Vec<LocalTimeOffsetEntry>,
+}
+
+/// stream_identifier_descriptor body (ETSI EN 300 468 §6.2.39 Table 97).
+///
+/// A DVB Service Information extension carried inside a PMT elementary
+/// stream's `ES_info` descriptor loop. It labels the component stream
+/// with an 8-bit `component_tag` so a `component_descriptor` in the EIT
+/// can attach a text description to it. Within one `program_map_section`
+/// each `stream_identifier_descriptor` carries a distinct value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamIdentifierDescriptor {
+    /// 8-bit `component_tag` — the cross-reference key matching a
+    /// `component_descriptor`'s `component_tag` field for this stream.
+    pub component_tag: u8,
+}
+
+/// One language entry of a `subtitling_descriptor`
+/// (ETSI EN 300 468 §6.2.41 Table 99).
+///
+/// Each 8-byte record names one DVB subtitle service inside the
+/// elementary stream: its language, its `subtitling_type` (the
+/// component_type code for `stream_content == 0x03`, Table 26), and the
+/// page identifiers an EN 300 743 decoder uses to select the composition
+/// (and optional ancillary) pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubtitlingEntry {
+    /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
+    /// coded as one ISO/IEC 8859-1 byte (e.g. `b"eng"`).
+    pub language_code: [u8; 3],
+    /// 8-bit `subtitling_type` (component_type range `0x10..=0x2F` for
+    /// `stream_content == 0x03`, Table 26) — distinguishes normal /
+    /// hard-of-hearing subtitles and the display aspect ratio.
+    pub subtitling_type: u8,
+    /// 16-bit `composition_page_id` — the EN 300 743 page carrying the
+    /// page / region composition segments to decode.
+    pub composition_page_id: u16,
+    /// 16-bit `ancillary_page_id` — the optional page carrying CLUT /
+    /// object segments the composition depends on; equals
+    /// `composition_page_id` when no separate ancillary page exists.
+    pub ancillary_page_id: u16,
+}
+
+/// subtitling_descriptor body (ETSI EN 300 468 §6.2.41 Table 99).
+///
+/// A DVB Service Information extension carried inside a PMT elementary
+/// stream's `ES_info` descriptor loop, marking a stream of `stream_type`
+/// `0x06` (private-data PES) as carrying EN 300 743 DVB subtitles. The
+/// payload is a flat array of fixed 8-byte [`SubtitlingEntry`] records,
+/// one per language / subtitle service multiplexed in the stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitlingDescriptor {
+    /// Per-language subtitle service entries, in wire order.
+    pub entries: Vec<SubtitlingEntry>,
+}
+
+/// One language entry of a `teletext_descriptor`
+/// (ETSI EN 300 468 §6.2.43 Table 101).
+///
+/// Each 5-byte record names one EBU teletext (ETSI EN 300 706) page
+/// inside the elementary stream: its language, the `teletext_type`
+/// (Table 102), and the magazine + page number locating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TeletextEntry {
+    /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
+    /// coded as one ISO/IEC 8859-1 byte.
+    pub language_code: [u8; 3],
+    /// 5-bit `teletext_type` (Table 102). `0x01` initial page, `0x02`
+    /// subtitle page, `0x03` additional information, `0x04` programme
+    /// schedule, `0x05` subtitle page for hearing impaired.
+    pub teletext_type: u8,
+    /// 3-bit `teletext_magazine_number` (ETSI EN 300 706).
+    pub teletext_magazine_number: u8,
+    /// 8-bit `teletext_page_number` — two packed 4-bit hex digits
+    /// identifying the page (ETSI EN 300 706).
+    pub teletext_page_number: u8,
+}
+
+/// teletext_descriptor body (ETSI EN 300 468 §6.2.43 Table 101).
+///
+/// A DVB Service Information extension carried inside a PMT elementary
+/// stream's `ES_info` descriptor loop, marking a stream as carrying EBU
+/// teletext data. The payload is a flat array of fixed 5-byte
+/// [`TeletextEntry`] records, one per language / page multiplexed in the
+/// stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeletextDescriptor {
+    /// Per-language teletext page entries, in wire order.
+    pub entries: Vec<TeletextEntry>,
+}
+
+/// AC-3_descriptor body (ETSI EN 300 468 annex D Table D.6).
+///
+/// A DVB Service Information extension carried inside a PMT elementary
+/// stream's `ES_info` descriptor loop, identifying and configuring an
+/// AC-3 audio stream (ETSI TS 101 154 clause 6.2). After a mandatory
+/// flags byte, four optional 8-bit fields may follow, each gated by its
+/// flag; any remaining bytes are reserved `additional_info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ac3Descriptor<'a> {
+    /// `component_type` — set when `component_type_flag == 0b1`; mirrors
+    /// the `component_descriptor` `component_type` for AC-3 (Table D.1).
+    pub component_type: Option<u8>,
+    /// `bsid` — set when `bsid_flag == 0b1`; the AC-3 coding version (the
+    /// five lsb mirror the elementary stream `bsid`).
+    pub bsid: Option<u8>,
+    /// `mainid` — set when `mainid_flag == 0b1`; identifies a main audio
+    /// service (range 0–7) so associated services can link to it.
+    pub mainid: Option<u8>,
+    /// `asvc` — set when `asvc_flag == 0b1`; a bitmask whose set bits
+    /// name the main services this associated service may accompany.
+    pub asvc: Option<u8>,
+    /// Trailing reserved `additional_info_byte` run, preserved verbatim.
+    pub additional_info: &'a [u8],
+}
+
+/// enhanced_AC-3_descriptor body (ETSI EN 300 468 annex D Table D.7).
+///
+/// A DVB Service Information extension carried inside a PMT elementary
+/// stream's `ES_info` descriptor loop, identifying and configuring an
+/// Enhanced AC-3 (E-AC-3) audio stream (ETSI TS 101 154 clause 6.2). It
+/// extends the AC-3 descriptor's flags byte with a `mixinfoexists` bit
+/// plus three independent-substream flags, each gating an optional
+/// 8-bit field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnhancedAc3Descriptor<'a> {
+    /// `component_type` — set when `component_type_flag == 0b1`; the type
+    /// of audio carried in independent substream 0 (Table D.1).
+    pub component_type: Option<u8>,
+    /// `bsid` — set when `bsid_flag == 0b1`; the E-AC-3 coding version.
+    pub bsid: Option<u8>,
+    /// `mainid` — set when `mainid_flag == 0b1`; identifies a main audio
+    /// service (range 0–7).
+    pub mainid: Option<u8>,
+    /// `asvc` — set when `asvc_flag == 0b1`; associated-service bitmask.
+    pub asvc: Option<u8>,
+    /// `mixinfoexists` — `true` when independent substream 0 carries
+    /// mixing-control metadata for combining with another AC-3 / E-AC-3
+    /// stream.
+    pub mixinfoexists: bool,
+    /// `substream1` — set when `substream1_flag == 0b1`; the audio type
+    /// of independent substream 1 (Table D.8 bit assignments).
+    pub substream1: Option<u8>,
+    /// `substream2` — set when `substream2_flag == 0b1`; the audio type
+    /// of independent substream 2.
+    pub substream2: Option<u8>,
+    /// `substream3` — set when `substream3_flag == 0b1`; the audio type
+    /// of independent substream 3.
+    pub substream3: Option<u8>,
+    /// Trailing reserved `additional_info_byte` run, preserved verbatim.
+    pub additional_info: &'a [u8],
+}
+
+/// DTS_descriptor body (ETSI EN 300 468 annex G Table G.1).
+///
+/// A DVB Service Information extension carried inside a PMT elementary
+/// stream's `ES_info` descriptor loop, identifying and configuring a DTS
+/// Coherent Acoustics audio stream (ETSI TS 101 154 clause 6.3). Unlike
+/// the AC-3 descriptors, the fixed 5-byte head is mandatory — it packs
+/// the sample-rate / bit-rate codes, the frame size, and the surround /
+/// LFE / extended-surround flags as a contiguous bitfield.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtsDescriptor<'a> {
+    /// 4-bit `sample_rate_code` — equivalent to SFREQ (Table G.2):
+    /// `0b1000` = 44,1 kHz, `0b1101` = 48 kHz, `0b1110` = 96 kHz, etc.
+    pub sample_rate_code: u8,
+    /// 6-bit `bit_rate_code` — fixed transmission rate index (Table G.3);
+    /// the top bit is reserved.
+    pub bit_rate_code: u8,
+    /// 7-bit `nblks` — `NBLKS`; the frame holds `(nblks + 1)` blocks of
+    /// 32 PCM samples per channel. Valid range 5–127.
+    pub nblks: u8,
+    /// 14-bit `fsize` — the byte size of the DTS frame.
+    pub fsize: u16,
+    /// 6-bit `surround_mode` — the channel arrangement.
+    pub surround_mode: u8,
+    /// `lfe_flag` — `true` when a low-frequency-effects channel is present.
+    pub lfe_flag: bool,
+    /// 2-bit `extended_surround_flag` — extended surround configuration.
+    pub extended_surround_flag: u8,
+    /// Trailing reserved `additional_info_byte` run, preserved verbatim.
+    pub additional_info: &'a [u8],
 }
 
 /// One genre-classification entry of a `content_descriptor`
@@ -983,8 +1194,14 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
         0x4D => decode_short_event(data).unwrap_or(DescriptorBody::Raw),
         0x4E => decode_extended_event(data).unwrap_or(DescriptorBody::Raw),
+        0x52 => decode_stream_identifier(data).unwrap_or(DescriptorBody::Raw),
         0x54 => decode_content(data).unwrap_or(DescriptorBody::Raw),
+        0x56 => decode_teletext(data).unwrap_or(DescriptorBody::Raw),
         0x58 => decode_local_time_offset(data).unwrap_or(DescriptorBody::Raw),
+        0x59 => decode_subtitling(data).unwrap_or(DescriptorBody::Raw),
+        0x6A => decode_ac3(data).unwrap_or(DescriptorBody::Raw),
+        0x7A => decode_enhanced_ac3(data).unwrap_or(DescriptorBody::Raw),
+        0x7B => decode_dts(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
 }
@@ -1023,6 +1240,203 @@ fn decode_local_time_offset(data: &[u8]) -> Option<DescriptorBody<'_>> {
     }
     Some(DescriptorBody::LocalTimeOffset(LocalTimeOffsetDescriptor {
         entries,
+    }))
+}
+
+fn decode_stream_identifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.39 Table 97 — a single byte:
+    //   component_tag (8)
+    if data.len() != 1 {
+        return None;
+    }
+    Some(DescriptorBody::StreamIdentifier(
+        StreamIdentifierDescriptor {
+            component_tag: data[0],
+        },
+    ))
+}
+
+fn decode_subtitling(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.41 Table 99 — a flat array of 8-byte records:
+    //   ISO_639_language_code (24)
+    //   subtitling_type       (8)
+    //   composition_page_id   (16)
+    //   ancillary_page_id     (16)
+    const ENTRY_LEN: usize = 8;
+    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
+    for chunk in data.chunks_exact(ENTRY_LEN) {
+        entries.push(SubtitlingEntry {
+            language_code: [chunk[0], chunk[1], chunk[2]],
+            subtitling_type: chunk[3],
+            composition_page_id: u16::from_be_bytes([chunk[4], chunk[5]]),
+            ancillary_page_id: u16::from_be_bytes([chunk[6], chunk[7]]),
+        });
+    }
+    Some(DescriptorBody::Subtitling(SubtitlingDescriptor { entries }))
+}
+
+fn decode_teletext(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.43 Table 101 — a flat array of 5-byte records:
+    //   ISO_639_language_code    (24)
+    //   teletext_type            (5)
+    //   teletext_magazine_number (3)
+    //   teletext_page_number     (8)
+    const ENTRY_LEN: usize = 5;
+    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
+    for chunk in data.chunks_exact(ENTRY_LEN) {
+        entries.push(TeletextEntry {
+            language_code: [chunk[0], chunk[1], chunk[2]],
+            teletext_type: chunk[3] >> 3,
+            teletext_magazine_number: chunk[3] & 0b0000_0111,
+            teletext_page_number: chunk[4],
+        });
+    }
+    Some(DescriptorBody::Teletext(TeletextDescriptor { entries }))
+}
+
+fn decode_ac3(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 annex D Table D.6 — a mandatory flags byte, then up
+    // to four flag-gated 8-bit fields, then a reserved additional_info run:
+    //   component_type_flag (1) | bsid_flag (1) | mainid_flag (1)
+    //     | asvc_flag (1) | reserved_flags (4)
+    //   [component_type (8)] [bsid (8)] [mainid (8)] [asvc (8)]
+    //   additional_info_byte ...
+    if data.is_empty() {
+        return None;
+    }
+    let flags = data[0];
+    let component_type_flag = (flags & 0b1000_0000) != 0;
+    let bsid_flag = (flags & 0b0100_0000) != 0;
+    let mainid_flag = (flags & 0b0010_0000) != 0;
+    let asvc_flag = (flags & 0b0001_0000) != 0;
+
+    let mut pos = 1usize;
+    let mut take = |present: bool| -> Option<Option<u8>> {
+        if !present {
+            return Some(None);
+        }
+        let b = *data.get(pos)?;
+        pos += 1;
+        Some(Some(b))
+    };
+    let component_type = take(component_type_flag)?;
+    let bsid = take(bsid_flag)?;
+    let mainid = take(mainid_flag)?;
+    let asvc = take(asvc_flag)?;
+
+    Some(DescriptorBody::Ac3(Ac3Descriptor {
+        component_type,
+        bsid,
+        mainid,
+        asvc,
+        additional_info: &data[pos..],
+    }))
+}
+
+fn decode_enhanced_ac3(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 annex D Table D.7 — like the AC-3 descriptor but the
+    // flags byte's low four bits gate three independent-substream fields
+    // and carry the mixinfoexists bit:
+    //   component_type_flag (1) | bsid_flag (1) | mainid_flag (1)
+    //     | asvc_flag (1) | mixinfoexists (1) | substream1_flag (1)
+    //     | substream2_flag (1) | substream3_flag (1)
+    //   [component_type] [bsid] [mainid] [asvc]
+    //   [substream1] [substream2] [substream3]
+    //   additional_info_byte ...
+    if data.is_empty() {
+        return None;
+    }
+    let flags = data[0];
+    let component_type_flag = (flags & 0b1000_0000) != 0;
+    let bsid_flag = (flags & 0b0100_0000) != 0;
+    let mainid_flag = (flags & 0b0010_0000) != 0;
+    let asvc_flag = (flags & 0b0001_0000) != 0;
+    let mixinfoexists = (flags & 0b0000_1000) != 0;
+    let substream1_flag = (flags & 0b0000_0100) != 0;
+    let substream2_flag = (flags & 0b0000_0010) != 0;
+    let substream3_flag = (flags & 0b0000_0001) != 0;
+
+    let mut pos = 1usize;
+    let mut take = |present: bool| -> Option<Option<u8>> {
+        if !present {
+            return Some(None);
+        }
+        let b = *data.get(pos)?;
+        pos += 1;
+        Some(Some(b))
+    };
+    let component_type = take(component_type_flag)?;
+    let bsid = take(bsid_flag)?;
+    let mainid = take(mainid_flag)?;
+    let asvc = take(asvc_flag)?;
+    let substream1 = take(substream1_flag)?;
+    let substream2 = take(substream2_flag)?;
+    let substream3 = take(substream3_flag)?;
+
+    Some(DescriptorBody::EnhancedAc3(EnhancedAc3Descriptor {
+        component_type,
+        bsid,
+        mainid,
+        asvc,
+        mixinfoexists,
+        substream1,
+        substream2,
+        substream3,
+        additional_info: &data[pos..],
+    }))
+}
+
+fn decode_dts(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 annex G Table G.1 — a fixed 5-byte head followed by
+    // a reserved additional_info run. The head is a contiguous bitfield:
+    //   sample_rate_code       (4)
+    //   bit_rate_code          (6)
+    //   nblks                  (7)
+    //   fsize                  (14)
+    //   surround_mode          (6)
+    //   lfe_flag               (1)
+    //   extended_surround_flag (2)
+    // = 40 bits = bytes 0..5, MSB-first.
+    if data.len() < 5 {
+        return None;
+    }
+    let b0 = data[0];
+    let b1 = data[1];
+    let b2 = data[2];
+    let b3 = data[3];
+    let b4 = data[4];
+
+    // The 40-bit head is a contiguous MSB-first bitfield across b0..b4.
+    // sample_rate_code: bits 0..4.
+    let sample_rate_code = b0 >> 4;
+    // bit_rate_code: bits 4..10 = low nibble of b0 + top 2 bits of b1.
+    let bit_rate_code = ((b0 & 0x0F) << 2) | (b1 >> 6);
+    // nblks: bits 10..17 = low 6 bits of b1 + top bit of b2.
+    let nblks = ((b1 & 0b0011_1111) << 1) | (b2 >> 7);
+    // fsize: bits 17..31 = low 7 bits of b2 + top 7 bits of b3.
+    let fsize = (((b2 & 0b0111_1111) as u16) << 7) | ((b3 >> 1) as u16);
+    // surround_mode: bits 31..37 = bottom bit of b3 + top 5 bits of b4.
+    let surround_mode = ((b3 & 0b0000_0001) << 5) | (b4 >> 3);
+    // lfe_flag: bit 37 = bit 5 of b4 (MSB-first).
+    let lfe_flag = (b4 & 0b0000_0100) != 0;
+    // extended_surround_flag: bits 38..40 = low 2 bits of b4.
+    let extended_surround_flag = b4 & 0b0000_0011;
+
+    Some(DescriptorBody::Dts(DtsDescriptor {
+        sample_rate_code,
+        bit_rate_code,
+        nblks,
+        fsize,
+        surround_mode,
+        lfe_flag,
+        extended_surround_flag,
+        additional_info: &data[5..],
     }))
 }
 
@@ -3119,6 +3533,278 @@ mod tests {
     fn content_descriptor_odd_length_falls_back_to_raw() {
         // Each entry is exactly 2 bytes; an odd-length body is malformed.
         let block = tlv(0x54, &[0x14, 0x00, 0x43]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn stream_identifier_descriptor_decodes_component_tag() {
+        let block = tlv(0x52, &[0x2A]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x52);
+        match d.body {
+            DescriptorBody::StreamIdentifier(s) => assert_eq!(s.component_tag, 0x2A),
+            other => panic!("expected StreamIdentifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_identifier_descriptor_wrong_length_falls_back_to_raw() {
+        // The component_tag is exactly one byte; anything else is malformed.
+        for body in [&[][..], &[0x01, 0x02][..]] {
+            let block = tlv(0x52, body);
+            let d = iter_descriptors(&block).next().unwrap().unwrap();
+            assert!(matches!(d.body, DescriptorBody::Raw));
+        }
+    }
+
+    #[test]
+    fn subtitling_descriptor_two_services() {
+        // Two 8-byte entries: "eng" normal subtitles on composition 0x0001
+        // / ancillary 0x0002, and "deu" hard-of-hearing on 0x0010 / 0x0010.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"eng");
+        body.push(0x10); // subtitling_type
+        body.extend_from_slice(&0x0001u16.to_be_bytes()); // composition
+        body.extend_from_slice(&0x0002u16.to_be_bytes()); // ancillary
+        body.extend_from_slice(b"deu");
+        body.push(0x20);
+        body.extend_from_slice(&0x0010u16.to_be_bytes());
+        body.extend_from_slice(&0x0010u16.to_be_bytes());
+        let block = tlv(0x59, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x59);
+        match d.body {
+            DescriptorBody::Subtitling(s) => {
+                assert_eq!(s.entries.len(), 2);
+                assert_eq!(
+                    s.entries[0],
+                    SubtitlingEntry {
+                        language_code: *b"eng",
+                        subtitling_type: 0x10,
+                        composition_page_id: 0x0001,
+                        ancillary_page_id: 0x0002,
+                    }
+                );
+                assert_eq!(s.entries[1].language_code, *b"deu");
+                assert_eq!(s.entries[1].subtitling_type, 0x20);
+                assert_eq!(s.entries[1].composition_page_id, 0x0010);
+                assert_eq!(s.entries[1].ancillary_page_id, 0x0010);
+            }
+            other => panic!("expected Subtitling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtitling_descriptor_bad_length_falls_back_to_raw() {
+        // Entries are 8 bytes; empty or a non-multiple are malformed.
+        for body in [&[][..], &[0; 7][..], &[0; 9][..]] {
+            let block = tlv(0x59, body);
+            let d = iter_descriptors(&block).next().unwrap().unwrap();
+            assert!(matches!(d.body, DescriptorBody::Raw));
+        }
+    }
+
+    #[test]
+    fn teletext_descriptor_splits_type_and_magazine() {
+        // "fre" page: teletext_type 0x02 (subtitle) in the high 5 bits,
+        // magazine 0x5 in the low 3 bits => 0b00010_101 = 0x15; page 0x88.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fre");
+        body.push(0x15);
+        body.push(0x88);
+        let block = tlv(0x56, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x56);
+        match d.body {
+            DescriptorBody::Teletext(t) => {
+                assert_eq!(t.entries.len(), 1);
+                assert_eq!(
+                    t.entries[0],
+                    TeletextEntry {
+                        language_code: *b"fre",
+                        teletext_type: 0x02,
+                        teletext_magazine_number: 0x5,
+                        teletext_page_number: 0x88,
+                    }
+                );
+            }
+            other => panic!("expected Teletext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn teletext_descriptor_bad_length_falls_back_to_raw() {
+        for body in [&[][..], &[0; 4][..], &[0; 6][..]] {
+            let block = tlv(0x56, body);
+            let d = iter_descriptors(&block).next().unwrap().unwrap();
+            assert!(matches!(d.body, DescriptorBody::Raw));
+        }
+    }
+
+    #[test]
+    fn ac3_descriptor_all_optional_fields_present() {
+        // flags 0xF0: component_type + bsid + mainid + asvc all present,
+        // then a one-byte additional_info trailer.
+        let body = [0xF0, 0x42, 0x08, 0x03, 0x80, 0xAB];
+        let block = tlv(0x6A, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x6A);
+        match d.body {
+            DescriptorBody::Ac3(a) => {
+                assert_eq!(a.component_type, Some(0x42));
+                assert_eq!(a.bsid, Some(0x08));
+                assert_eq!(a.mainid, Some(0x03));
+                assert_eq!(a.asvc, Some(0x80));
+                assert_eq!(a.additional_info, &[0xAB]);
+            }
+            other => panic!("expected Ac3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac3_descriptor_flags_only() {
+        // The minimal AC-3 descriptor is a lone flags byte (all zero).
+        let block = tlv(0x6A, &[0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Ac3(a) => {
+                assert_eq!(a.component_type, None);
+                assert_eq!(a.bsid, None);
+                assert_eq!(a.mainid, None);
+                assert_eq!(a.asvc, None);
+                assert!(a.additional_info.is_empty());
+            }
+            other => panic!("expected Ac3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac3_descriptor_partial_flags() {
+        // flags 0x40: only bsid_flag set => one byte of payload = bsid.
+        let block = tlv(0x6A, &[0x40, 0x06]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Ac3(a) => {
+                assert_eq!(a.component_type, None);
+                assert_eq!(a.bsid, Some(0x06));
+                assert_eq!(a.mainid, None);
+                assert_eq!(a.asvc, None);
+            }
+            other => panic!("expected Ac3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac3_descriptor_truncated_gated_field_falls_back_to_raw() {
+        // bsid_flag set but no byte follows the flags => malformed.
+        let block = tlv(0x6A, &[0x40]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn enhanced_ac3_descriptor_all_fields() {
+        // flags 0xFF: every optional field present + mixinfoexists set.
+        // Order: component_type, bsid, mainid, asvc, substream1..3, then
+        // a one-byte trailer.
+        let body = [0xFF, 0x10, 0x10, 0x02, 0x40, 0x01, 0x02, 0x03, 0x99];
+        let block = tlv(0x7A, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x7A);
+        match d.body {
+            DescriptorBody::EnhancedAc3(e) => {
+                assert_eq!(e.component_type, Some(0x10));
+                assert_eq!(e.bsid, Some(0x10));
+                assert_eq!(e.mainid, Some(0x02));
+                assert_eq!(e.asvc, Some(0x40));
+                assert!(e.mixinfoexists);
+                assert_eq!(e.substream1, Some(0x01));
+                assert_eq!(e.substream2, Some(0x02));
+                assert_eq!(e.substream3, Some(0x03));
+                assert_eq!(e.additional_info, &[0x99]);
+            }
+            other => panic!("expected EnhancedAc3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enhanced_ac3_descriptor_mixinfo_without_substreams() {
+        // flags 0x08: only mixinfoexists set; no gated bytes follow.
+        let block = tlv(0x7A, &[0x08]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::EnhancedAc3(e) => {
+                assert!(e.mixinfoexists);
+                assert_eq!(e.component_type, None);
+                assert_eq!(e.substream1, None);
+                assert_eq!(e.substream2, None);
+                assert_eq!(e.substream3, None);
+                assert!(e.additional_info.is_empty());
+            }
+            other => panic!("expected EnhancedAc3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dts_descriptor_decodes_bitfield_head() {
+        // Build the 40-bit head field by field, MSB-first, then add a
+        // one-byte additional_info trailer:
+        //   sample_rate_code       = 0b1101  (48 kHz)
+        //   bit_rate_code          = 0b001010 (384 kbit/s)
+        //   nblks                  = 0b000_1111 (15)
+        //   fsize                  = 0b00_0001_0000_0000 (256)
+        //   surround_mode          = 0b001001 (9)
+        //   lfe_flag               = 0b1
+        //   extended_surround_flag = 0b10
+        let bits: u64 = (0b1101 << 36)
+            | (0b001010 << 30)
+            | (0b000_1111 << 23)
+            | (0b00_0001_0000_0000 << 9)
+            | (0b001001 << 3)
+            | (0b1 << 2)
+            | 0b10;
+        let head = bits.to_be_bytes();
+        let mut body = head[3..8].to_vec(); // low 40 bits
+        body.push(0x77); // additional_info_byte
+        let block = tlv(0x7B, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x7B);
+        match d.body {
+            DescriptorBody::Dts(dts) => {
+                assert_eq!(dts.sample_rate_code, 0b1101);
+                assert_eq!(dts.bit_rate_code, 0b001010);
+                assert_eq!(dts.nblks, 15);
+                assert_eq!(dts.fsize, 256);
+                assert_eq!(dts.surround_mode, 9);
+                assert!(dts.lfe_flag);
+                assert_eq!(dts.extended_surround_flag, 0b10);
+                assert_eq!(dts.additional_info, &[0x77]);
+            }
+            other => panic!("expected Dts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dts_descriptor_minimum_head_no_trailer() {
+        // The 5-byte head is mandatory; an all-zero head decodes to zeros.
+        let block = tlv(0x7B, &[0, 0, 0, 0, 0]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Dts(dts) => {
+                assert_eq!(dts.sample_rate_code, 0);
+                assert_eq!(dts.fsize, 0);
+                assert!(!dts.lfe_flag);
+                assert!(dts.additional_info.is_empty());
+            }
+            other => panic!("expected Dts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dts_descriptor_truncated_head_falls_back_to_raw() {
+        // Fewer than 5 bytes cannot hold the mandatory head.
+        let block = tlv(0x7B, &[0, 0, 0, 0]);
         let d = iter_descriptors(&block).next().unwrap().unwrap();
         assert!(matches!(d.body, DescriptorBody::Raw));
     }

@@ -86,12 +86,14 @@ pub use clock::{
     PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ,
 };
 pub use descriptor::{
-    iter_descriptors, parse_descriptors, AudioStreamDescriptor, AvcVideoDescriptor, CaDescriptor,
-    DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter,
-    ExtendedEventDescriptor, ExtendedEventItem, HevcVideoDescriptor, Iso639Language,
-    LocalTimeOffsetDescriptor, LocalTimeOffsetEntry, MaximumBitrateDescriptor,
-    NetworkNameDescriptor, ServiceDescriptor, ShortEventDescriptor, SmoothingBufferDescriptor,
-    StdDescriptor, SystemClockDescriptor, VideoStreamDescriptor,
+    iter_descriptors, parse_descriptors, Ac3Descriptor, AudioStreamDescriptor, AvcVideoDescriptor,
+    CaDescriptor, DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter,
+    DtsDescriptor, EnhancedAc3Descriptor, ExtendedEventDescriptor, ExtendedEventItem,
+    HevcVideoDescriptor, Iso639Language, LocalTimeOffsetDescriptor, LocalTimeOffsetEntry,
+    MaximumBitrateDescriptor, NetworkNameDescriptor, ServiceDescriptor, ShortEventDescriptor,
+    SmoothingBufferDescriptor, StdDescriptor, StreamIdentifierDescriptor, SubtitlingDescriptor,
+    SubtitlingEntry, SystemClockDescriptor, TeletextDescriptor, TeletextEntry,
+    VideoStreamDescriptor,
 };
 pub use error::TsError;
 pub use packet::{

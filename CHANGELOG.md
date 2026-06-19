@@ -11,6 +11,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- DVB PMT elementary-stream descriptors (EN 300 468) — the tags a
+  demultiplexer needs to route a private-data PES to the right decoder:
+  `stream_identifier_descriptor` (`0x52`, §6.2.39 → `component_tag`),
+  `teletext_descriptor` (`0x56`, §6.2.43 → per-language EBU teletext
+  pages with split `teletext_type` / `teletext_magazine_number`),
+  `subtitling_descriptor` (`0x59`, §6.2.41 → per-language EN 300 743
+  subtitle services with `composition_page_id` / `ancillary_page_id`),
+  `AC-3_descriptor` (`0x6A`, annex D Table D.6 → flag-gated
+  `component_type` / `bsid` / `mainid` / `asvc`),
+  `enhanced_AC-3_descriptor` (`0x7A`, annex D Table D.7 → the AC-3 set
+  plus `mixinfoexists` and three independent-substream fields), and
+  `DTS_descriptor` (`0x7B`, annex G Table G.1 → the 40-bit
+  `sample_rate_code` / `bit_rate_code` / `nblks` / `fsize` /
+  `surround_mode` / `lfe_flag` / `extended_surround_flag` bitfield head).
+  Each surfaces a new `DescriptorBody` variant; malformed bodies fall
+  back to `Raw`.
 - `content_descriptor` (tag `0x54`, EN 300 468 §6.2.9) decode — the DVB
   genre classifier carried in the EIT event loop alongside the short /
   extended event descriptors. `DescriptorBody::Content` exposes a flat
