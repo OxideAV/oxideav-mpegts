@@ -11,6 +11,18 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- Full ISO/IEC 13818-1 Table 2-29 `stream_type` mapping — [`StreamType`]
+  now names the complete base assignment range `0x01..=0x26` (MPEG-1/2/4
+  video + audio, AAC-ADTS / AAC-LATM, private sections / PES, MHEG,
+  DSM-CC carriers, the `0x15..=0x19` metadata carriers, IPMP, AVC / SVC /
+  MVC / MVCD, JPEG 2000 video, stereoscopic MPEG-2 / AVC views, HEVC and
+  its temporal subset) plus AVS video (`0x42`) — on top of the existing
+  HDMV-extended Blu-ray range. New classification predicates
+  `is_metadata()` and `is_private()` join `is_video` / `is_audio` /
+  `is_subtitle`; `is_subtitle` now also covers MPEG-4 timed text. The
+  demuxer's `stream_type` → `CodecParameters` routing gains MPEG-1 video,
+  MPEG-1/2 audio, AAC, MPEG-4 visual, JPEG 2000, stereoscopic views and
+  MPEG-4 text arms, with an explicit drop for non-A/V payloads.
 - DVB PMT elementary-stream descriptors (EN 300 468) — the tags a
   demultiplexer needs to route a private-data PES to the right decoder:
   `stream_identifier_descriptor` (`0x52`, §6.2.39 → `component_tag`),

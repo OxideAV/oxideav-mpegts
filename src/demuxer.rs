@@ -474,33 +474,41 @@ fn pes_to_packet(stream_index: u32, pes: PesPacket) -> Packet {
 /// interactive graphics, DSM-CC sections, vendor-private codes, etc.
 fn codec_params_for_stream_type(st: u8) -> Option<CodecParameters> {
     let s = StreamType::from_raw(st);
-    let cid: &'static str = match s {
-        StreamType::Mpeg2Video => "mpeg2video",
-        StreamType::AvcVideo => "h264",
-        StreamType::HevcVideo => "hevc",
-        StreamType::Vc1Video => "vc1",
-        StreamType::LpcmAudio => "pcm_s16be",
-        StreamType::Ac3Audio | StreamType::EAc3SecondaryAudio => "ac3",
-        StreamType::EAc3Audio => "eac3",
-        StreamType::TruehdAudio => "truehd",
+    // (codec_id, is_video, is_subtitle); audio is the residual class.
+    let (cid, is_video, is_subtitle): (&'static str, bool, bool) = match s {
+        StreamType::Mpeg1Video => ("mpeg1video", true, false),
+        StreamType::Mpeg2Video | StreamType::Mpeg2StereoView => ("mpeg2video", true, false),
+        StreamType::Mpeg4Visual => ("mpeg4", true, false),
+        StreamType::AvcVideo | StreamType::AvcStereoView => ("h264", true, false),
+        StreamType::HevcVideo | StreamType::HevcTemporalSubset => ("hevc", true, false),
+        StreamType::Jpeg2000Video => ("jpeg2000", true, false),
+        StreamType::Vc1Video => ("vc1", true, false),
+        StreamType::Mpeg1Audio | StreamType::Mpeg2Audio => ("mp2", false, false),
+        StreamType::AacAdts | StreamType::AacLatm | StreamType::Mpeg4AudioRaw => {
+            ("aac", false, false)
+        }
+        StreamType::LpcmAudio => ("pcm_s16be", false, false),
+        StreamType::Ac3Audio | StreamType::EAc3SecondaryAudio => ("ac3", false, false),
+        StreamType::EAc3Audio => ("eac3", false, false),
+        StreamType::TruehdAudio => ("truehd", false, false),
         StreamType::DtsAudio
         | StreamType::DtsHdAudio
         | StreamType::DtsHdMaAudio
-        | StreamType::DtsHdSecondaryAudio => "dts",
-        StreamType::PgsSubtitle => "hdmv_pgs_subtitle",
-        StreamType::TextSubtitle => "hdmv_textst_subtitle",
-        StreamType::IgsInteractive => return None,
-        StreamType::Other(_) => return None,
+        | StreamType::DtsHdSecondaryAudio => ("dts", false, false),
+        StreamType::PgsSubtitle => ("hdmv_pgs_subtitle", false, true),
+        StreamType::TextSubtitle => ("hdmv_textst_subtitle", false, true),
+        StreamType::Mpeg4Text => ("mov_text", false, true),
+        // Interactive graphics, DSM-CC, metadata, private sections, and
+        // every reserved / vendor-private code: drop the stream.
+        _ => return None,
     };
     let codec_id = CodecId::new(cid);
-    Some(match s {
-        StreamType::Mpeg2Video
-        | StreamType::AvcVideo
-        | StreamType::HevcVideo
-        | StreamType::Vc1Video => CodecParameters::video(codec_id),
-        StreamType::PgsSubtitle | StreamType::TextSubtitle => CodecParameters::subtitle(codec_id),
-        StreamType::IgsInteractive | StreamType::Other(_) => unreachable!(),
-        _ => CodecParameters::audio(codec_id),
+    Some(if is_video {
+        CodecParameters::video(codec_id)
+    } else if is_subtitle {
+        CodecParameters::subtitle(codec_id)
+    } else {
+        CodecParameters::audio(codec_id)
     })
 }
 

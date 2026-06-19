@@ -30,9 +30,13 @@
 //!   `PES_extension` body ([`pes::PesExtension`] — private data, pack
 //!   header bytes, program_packet_sequence_counter, P-STD buffer,
 //!   PES_extension_field_2).
-//! - Stream-type → ESID helpers in [`stream_type`] mapping the BD-
-//!   relevant constants (`0x1B AVC`, `0x24 HEVC`, `0x81 AC-3`,
-//!   `0x82 DTS`, `0x90 PGS`, etc.) to a richer enum.
+//! - Stream-type → codec-class helpers in [`stream_type`] covering the
+//!   full ISO/IEC 13818-1 Table 2-29 base assignments (`0x01..=0x26`,
+//!   incl. MPEG-1/2/4 video + audio, AAC-ADTS/LATM, AVC/SVC/MVC, HEVC,
+//!   JPEG 2000, metadata carriers) plus the H.264/HEVC amendments and
+//!   the HDMV-extended Blu-ray range (`0x80..=0xFF`: PCM, AC-3/E-AC-3,
+//!   DTS/-HD, TrueHD, PGS, IGS, TextST). [`StreamType`] classifies each
+//!   as video / audio / subtitle / metadata / private.
 //! - PCR jitter and discontinuity tracking
 //!   ([`clock::PcrTracker`], [`clock::ContinuityTracker`]) —
 //!   per-PCR-PID 27 MHz clock recovery, instantaneous bitrate
