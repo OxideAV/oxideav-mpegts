@@ -44,6 +44,11 @@
 //!   tolerance-exceeded), plus per-PID continuity-counter
 //!   classification (continuous / duplicate / no-payload /
 //!   dropped / discontinuity).
+//! - Per-PID PTS / DTS unwrapping ([`clock::PtsTracker`]) — turns the
+//!   33-bit 90 kHz PES timestamps that wrap every ~26.5 h into a
+//!   monotonic 64-bit extended timeline, while distinguishing a genuine
+//!   `2^33` wrap from a backward splice / seek discontinuity
+//!   ([`clock::TimestampEvent`]).
 //!
 //! The crate ships **no decoders** — every payload byte stays as a
 //! `&[u8]` slice. A downstream pipeline (e.g. `oxideav-cli`'s
@@ -86,8 +91,8 @@ pub mod muxer;
 pub mod registry;
 
 pub use clock::{
-    ContinuityEvent, ContinuityTracker, DiscontinuityReason, Pcr, PcrEvent, PcrTracker,
-    PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ,
+    ContinuityEvent, ContinuityTracker, DiscontinuityReason, Pcr, PcrEvent, PcrTracker, PtsTracker,
+    TimestampEvent, PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ, TIMESTAMP_MODULUS_90KHZ,
 };
 pub use descriptor::{
     iter_descriptors, parse_descriptors, Ac3Descriptor, AudioStreamDescriptor, AvcVideoDescriptor,

@@ -521,6 +521,144 @@ impl ContinuityTracker {
     }
 }
 
+// ----------------------------------------------------------------------
+// PTS / DTS timestamp unwrapping
+// ----------------------------------------------------------------------
+
+/// Modulus of a PES presentation / decode timestamp — the 33-bit
+/// `PTS` / `DTS` field (§2.4.3.7) wraps at `2^33` 90 kHz ticks.
+///
+/// `2^33 / 90_000 ≈ 95443.72 s ≈ 26.5 h`, the same window the composed
+/// 27 MHz PCR value wraps over.
+pub const TIMESTAMP_MODULUS_90KHZ: u64 = 1u64 << 33;
+
+/// Half the timestamp modulus — the threshold past which a raw-timestamp
+/// step is interpreted as a wrap (forward) or a backward jump rather
+/// than ordinary forward progress. A step larger than this in the
+/// "backward" direction is read as a `2^33` forward wrap; a step larger
+/// than this in the "forward" direction is read as a backward
+/// discontinuity.
+const TIMESTAMP_WRAP_THRESHOLD_90KHZ: u64 = TIMESTAMP_MODULUS_90KHZ / 2;
+
+/// Classification of one PTS or DTS observation on a PID, returned by
+/// [`PtsTracker::observe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampEvent {
+    /// The first timestamp seen on the PID — establishes the anchor.
+    First,
+    /// The raw timestamp advanced normally (allowing for a single
+    /// `2^33` wrap). The decoded value is the **extended**, monotonically
+    /// non-decreasing 90 kHz timestamp.
+    Forward,
+    /// The 33-bit field wrapped past `2^33`; the extended timestamp
+    /// continues to increase. Reported separately so a caller can note
+    /// the wrap for diagnostics.
+    Wrapped,
+    /// The raw timestamp moved backward by more than half the modulus —
+    /// a genuine discontinuity (stream splice / seek) rather than a
+    /// wrap. The tracker re-anchors on the new value; the extended
+    /// timestamp is reset to the raw value.
+    Backward,
+}
+
+/// Per-PID PTS / DTS unwrapper per ISO/IEC 13818-1 §2.4.3.7.
+///
+/// PES timestamps are 33-bit 90 kHz values that wrap every ~26.5 hours.
+/// A demuxer that hands raw 33-bit values to a muxer produces a
+/// non-monotonic timeline at the wrap; this tracker watches the raw
+/// values on one PID and produces a **64-bit extended** timestamp that
+/// keeps counting across wraps, while flagging genuine backward
+/// discontinuities (a splice / seek) so the caller can re-base instead
+/// of fabricating a 26-hour jump.
+///
+/// One tracker instance is kept per PID, typically one for PTS and a
+/// second for DTS (the two advance independently — DTS ≤ PTS within a
+/// frame, but the unwrap logic is identical).
+#[derive(Debug, Default, Clone)]
+pub struct PtsTracker {
+    /// Number of completed `2^33` wraps accumulated so far.
+    wrap_count: u64,
+    /// Most recent **raw** 33-bit timestamp, or `None` before the first
+    /// observation (and after a `reset`).
+    last_raw: Option<u64>,
+}
+
+impl PtsTracker {
+    /// Build an empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe one raw 33-bit timestamp and return its classification.
+    ///
+    /// The input is masked to 33 bits, so passing an already-extended
+    /// value is harmless. After this call [`Self::extended`] returns the
+    /// unwrapped 90 kHz timestamp for the just-observed value.
+    pub fn observe(&mut self, raw_timestamp: u64) -> TimestampEvent {
+        let raw = raw_timestamp & (TIMESTAMP_MODULUS_90KHZ - 1);
+        let prev = match self.last_raw {
+            None => {
+                self.last_raw = Some(raw);
+                return TimestampEvent::First;
+            }
+            Some(p) => p,
+        };
+        self.last_raw = Some(raw);
+
+        if raw >= prev {
+            let forward = raw - prev;
+            if forward > TIMESTAMP_WRAP_THRESHOLD_90KHZ {
+                // A large forward raw step is really a backward jump
+                // around the ring: the value went down then wrapped.
+                // Treat it as a genuine discontinuity, re-anchoring.
+                self.wrap_count = 0;
+                TimestampEvent::Backward
+            } else {
+                TimestampEvent::Forward
+            }
+        } else {
+            let backward = prev - raw;
+            if backward > TIMESTAMP_WRAP_THRESHOLD_90KHZ {
+                // The raw value dropped by more than half the ring — the
+                // 33-bit field wrapped forward past 2^33.
+                self.wrap_count += 1;
+                TimestampEvent::Wrapped
+            } else {
+                // A small genuine backward step — discontinuity.
+                self.wrap_count = 0;
+                TimestampEvent::Backward
+            }
+        }
+    }
+
+    /// The extended (unwrapped) 64-bit 90 kHz timestamp for the most
+    /// recently observed raw value, or `None` before the first
+    /// observation.
+    ///
+    /// Equal to `wrap_count × 2^33 + last_raw`.
+    pub fn extended(&self) -> Option<u64> {
+        self.last_raw
+            .map(|raw| self.wrap_count * TIMESTAMP_MODULUS_90KHZ + raw)
+    }
+
+    /// The most recent raw 33-bit timestamp, or `None` before the first
+    /// observation.
+    pub fn last_raw(&self) -> Option<u64> {
+        self.last_raw
+    }
+
+    /// Number of `2^33` wraps accumulated since the last anchor.
+    pub fn wrap_count(&self) -> u64 {
+        self.wrap_count
+    }
+
+    /// Discard accumulated state.
+    pub fn reset(&mut self) {
+        self.wrap_count = 0;
+        self.last_raw = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +909,111 @@ mod tests {
         assert_eq!(t.observe(10, true, true), ContinuityEvent::Discontinuity);
         // Subsequent packets pick up from 10.
         assert_eq!(t.observe(11, true, false), ContinuityEvent::Continuous);
+    }
+
+    #[test]
+    fn pts_tracker_first_then_forward() {
+        let mut t = PtsTracker::new();
+        assert_eq!(t.observe(90_000), TimestampEvent::First);
+        assert_eq!(t.extended(), Some(90_000));
+        assert_eq!(t.observe(180_000), TimestampEvent::Forward);
+        assert_eq!(t.extended(), Some(180_000));
+        assert_eq!(t.wrap_count(), 0);
+        assert_eq!(t.last_raw(), Some(180_000));
+    }
+
+    #[test]
+    fn pts_tracker_unwraps_at_2pow33() {
+        let mut t = PtsTracker::new();
+        // Sit just below the 33-bit ceiling, then step past it.
+        let near_top = TIMESTAMP_MODULUS_90KHZ - 1_000;
+        assert_eq!(t.observe(near_top), TimestampEvent::First);
+        // Next raw value is 2_000 ticks later → wraps to 1_000.
+        assert_eq!(t.observe(1_000), TimestampEvent::Wrapped);
+        assert_eq!(t.wrap_count(), 1);
+        // Extended timestamp must keep increasing across the wrap.
+        assert_eq!(t.extended(), Some(TIMESTAMP_MODULUS_90KHZ + 1_000));
+        // A further normal step stays in the wrapped epoch.
+        assert_eq!(t.observe(2_000), TimestampEvent::Forward);
+        assert_eq!(t.extended(), Some(TIMESTAMP_MODULUS_90KHZ + 2_000));
+    }
+
+    #[test]
+    fn pts_tracker_backward_jump_is_discontinuity_not_wrap() {
+        let mut t = PtsTracker::new();
+        assert_eq!(t.observe(1_000_000), TimestampEvent::First);
+        // A small backward step (seek / splice) re-anchors and resets
+        // the extended timeline rather than fabricating a 26 h wrap.
+        assert_eq!(t.observe(500_000), TimestampEvent::Backward);
+        assert_eq!(t.wrap_count(), 0);
+        assert_eq!(t.extended(), Some(500_000));
+    }
+
+    #[test]
+    fn pts_tracker_large_forward_step_is_backward_around_ring() {
+        let mut t = PtsTracker::new();
+        // Anchor low, then jump forward by more than half the ring —
+        // that is a backward move around the modular ring, classified
+        // as a discontinuity (the value decreased then wrapped).
+        assert_eq!(t.observe(1_000), TimestampEvent::First);
+        let big = TIMESTAMP_WRAP_THRESHOLD_90KHZ + 2_000;
+        assert_eq!(t.observe(big), TimestampEvent::Backward);
+        assert_eq!(t.extended(), Some(big));
+    }
+
+    #[test]
+    fn pts_tracker_two_consecutive_wraps() {
+        // A monotonic 90 kHz stream advancing in fixed steps across two
+        // 2^33 boundaries. The step stays under the 2^32 wrap threshold;
+        // the extended timeline must equal the true accumulated ticks.
+        let m = TIMESTAMP_MODULUS_90KHZ;
+        let step = 1u64 << 20; // 2^20 ticks: many samples per epoch
+        let start = m - 5 * step; // a few steps below the first wrap
+        let mut t = PtsTracker::new();
+        assert_eq!(t.observe(start), TimestampEvent::First);
+
+        let mut wraps_seen = 0u64;
+        // start sits 5 steps below the first 2^33 boundary; the second
+        // boundary is one full modulus (m/step further) on. Stop one step
+        // short of the third boundary so exactly two wraps are crossed.
+        let steps = 2 * (m / step);
+        for i in 1..=steps {
+            let true_ticks = start + i * step;
+            let raw = true_ticks & (m - 1);
+            let ev = t.observe(raw);
+            if ev == TimestampEvent::Wrapped {
+                wraps_seen += 1;
+            }
+            assert!(
+                matches!(ev, TimestampEvent::Forward | TimestampEvent::Wrapped),
+                "step {i} mis-classified as {ev:?}"
+            );
+            assert_eq!(t.extended(), Some(true_ticks), "extended drift at step {i}");
+        }
+        assert_eq!(wraps_seen, 2);
+        assert_eq!(t.wrap_count(), 2);
+    }
+
+    #[test]
+    fn pts_tracker_masks_input_to_33_bits() {
+        let mut t = PtsTracker::new();
+        // A value with bits above bit 32 set is masked down before use.
+        let raw = (1u64 << 40) | 12_345;
+        assert_eq!(t.observe(raw), TimestampEvent::First);
+        assert_eq!(t.last_raw(), Some(12_345));
+        assert_eq!(t.extended(), Some(12_345));
+    }
+
+    #[test]
+    fn pts_tracker_reset_clears_state() {
+        let mut t = PtsTracker::new();
+        t.observe(TIMESTAMP_MODULUS_90KHZ - 1);
+        t.observe(0); // wrap
+        assert_eq!(t.wrap_count(), 1);
+        t.reset();
+        assert_eq!(t.wrap_count(), 0);
+        assert_eq!(t.last_raw(), None);
+        assert_eq!(t.extended(), None);
+        assert_eq!(t.observe(42), TimestampEvent::First);
     }
 }

@@ -11,6 +11,13 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `PtsTracker` (clock module) — per-PID PTS / DTS unwrapper per
+  ISO/IEC 13818-1 §2.4.3.7. PES timestamps are 33-bit 90 kHz values that
+  wrap every ~26.5 h; the tracker turns the raw values seen on one PID
+  into a monotonic 64-bit **extended** timeline (`extended()`), counting
+  `2^33` wraps (`TIMESTAMP_MODULUS_90KHZ`) while distinguishing a genuine
+  wrap from a backward splice / seek discontinuity via the new
+  `TimestampEvent` (`First` / `Forward` / `Wrapped` / `Backward`).
 - Full ISO/IEC 13818-1 Table 2-29 `stream_type` mapping — [`StreamType`]
   now names the complete base assignment range `0x01..=0x26` (MPEG-1/2/4
   video + audio, AAC-ADTS / AAC-LATM, private sections / PES, MHEG,
