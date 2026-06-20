@@ -191,10 +191,20 @@ impl MpegTsDemuxer {
         let mut pid_to_stream: HashMap<u16, u32> = HashMap::new();
         let mut reassemblers: HashMap<u16, PesReassembler> = HashMap::new();
         for pmt_stream in &pmt.streams {
-            let params = match codec_params_for_stream_type(pmt_stream.stream_type) {
+            let mut params = match codec_params_for_stream_type(pmt_stream.stream_type) {
                 Some(p) => p,
                 None => continue,
             };
+            // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
+            // §2.6.18) into the per-stream language tag so a demux →
+            // remux path keeps each track's audio/subtitle language.
+            // The first language entry wins (multi-language audio is
+            // rare and a single tag is what the core surface holds).
+            if params.language.is_none() {
+                if let Some(code) = first_iso639_language(pmt_stream) {
+                    params = params.with_language(code);
+                }
+            }
             let idx = streams.len() as u32;
             streams.push(StreamInfo {
                 index: idx,
@@ -467,6 +477,30 @@ fn pes_to_packet(stream_index: u32, pes: PesPacket) -> Packet {
         pkt = pkt.with_dts(d as i64);
     }
     pkt
+}
+
+/// Walk a PMT stream's ES_info descriptor loop and return the first
+/// `ISO_639_language_descriptor` (tag 0x0A) language code as a UTF-8
+/// string, trimming the spec's space padding. `None` when the loop
+/// carries no language descriptor or the code is empty.
+fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
+    for d in pmt_stream.iter_descriptors().flatten() {
+        if let crate::DescriptorBody::Iso639Language(langs) = &d.body {
+            if let Some(first) = langs.first() {
+                let s: String = first
+                    .language
+                    .iter()
+                    .map(|&b| b as char)
+                    .collect::<String>()
+                    .trim_end_matches([' ', '\0'])
+                    .to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Map an MPEG-TS `stream_type` byte to a [`CodecParameters`] the

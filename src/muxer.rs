@@ -96,6 +96,10 @@ struct TrackState {
     stream_id: u8,
     cc: u8,
     is_video: bool,
+    /// 3-byte ISO 639-2 language code, when the `StreamInfo` carried a
+    /// language tag. Drives an `ISO_639_language_descriptor` (tag 0x0A)
+    /// in this track's PMT ES_info loop. `None` → no language loop.
+    language: Option<[u8; 3]>,
 }
 
 impl MpegTsMuxer {
@@ -116,12 +120,24 @@ impl MpegTsMuxer {
                         s.params.codec_id.as_str()
                     ))
                 })?;
+            // Carry the per-track language tag into the PMT as an
+            // ISO_639_language_descriptor. Only audio and subtitle
+            // streams carry language semantically; a 3-character ISO
+            // 639-2 code is the spec's exact field width — anything
+            // shorter is left-justified and space-padded, anything
+            // longer is truncated to 3.
+            let language = if is_video {
+                None
+            } else {
+                s.params.language.as_deref().map(iso639_code)
+            };
             tracks.push(TrackState {
                 pid: next_pid,
                 stream_type,
                 stream_id,
                 cc: 0,
                 is_video,
+                language,
             });
             idx_to_track.insert(s.index, i);
             // Increment PID with a bit of separation between codec
@@ -247,11 +263,16 @@ impl MpegTsMuxer {
             0x00, // program_info_length low
         ]);
         for t in &self.tracks {
+            // Build this stream's ES descriptor loop first so we can
+            // fill ES_info_length.
+            let es_info = build_es_descriptors(t);
+            let es_info_length = es_info.len() as u16;
             body.push(t.stream_type);
             body.push(0xE0 | ((t.pid >> 8) as u8 & 0x1F));
             body.push(t.pid as u8);
-            body.push(0xF0); // reserved + ES_info_length high
-            body.push(0x00); // ES_info_length low
+            body.push(0xF0 | ((es_info_length >> 8) as u8 & 0x0F));
+            body.push(es_info_length as u8);
+            body.extend_from_slice(&es_info);
         }
         // section_length = body bytes following section_length field
         // (i.e. body.len() - 3 (table_id + 2-byte length field)) + 4 (CRC).
@@ -471,6 +492,37 @@ fn encode_pts_dts(prefix: u8, ts: u64) -> [u8; 5] {
     ]
 }
 
+/// Normalise an arbitrary language tag into the 3-byte ISO 639-2 code
+/// the descriptor field is exactly sized for. Shorter tags are
+/// right-padded with spaces (the conventional `und`-style fill is left
+/// to the caller — we keep their bytes verbatim), longer tags truncate
+/// to the first three ASCII bytes. Non-ASCII bytes pass through as-is;
+/// the spec stores each character as 8 bits with no charset selection.
+fn iso639_code(tag: &str) -> [u8; 3] {
+    let mut out = [b' '; 3];
+    for (i, b) in tag.bytes().take(3).enumerate() {
+        out[i] = b;
+    }
+    out
+}
+
+/// Build the PMT ES_info descriptor loop for one track. Currently this
+/// emits a single `ISO_639_language_descriptor` (tag 0x0A, §2.6.18)
+/// when the track carries a language code; the body is one
+/// `(ISO_639_language_code, audio_type)` entry, with `audio_type = 0x00`
+/// (undefined) since the core `StreamInfo` does not distinguish the
+/// clean-effects / hearing-impaired / visual-impaired sub-types.
+fn build_es_descriptors(track: &TrackState) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(lang) = track.language {
+        out.push(0x0A); // descriptor_tag
+        out.push(0x04); // descriptor_length = 3 (code) + 1 (audio_type)
+        out.extend_from_slice(&lang);
+        out.push(0x00); // audio_type = undefined
+    }
+    out
+}
+
 /// CodecId string → (stream_type byte, PES `stream_id`, is_video).
 ///
 /// `stream_id` is conventional:
@@ -663,6 +715,58 @@ mod tests {
         }
         assert_eq!(&flat[..section.len()], &section[..]);
         let _ = recovered;
+    }
+
+    /// An audio track tagged with a language must surface that language
+    /// in the muxed PMT and round-trip back through the demuxer's
+    /// ISO_639_language_descriptor reader.
+    #[test]
+    fn language_descriptor_round_trips_through_pmt() {
+        let mut audio = stream_info(1, "ac3", false);
+        audio.params = audio.params.with_language("jpn");
+        let streams = vec![stream_info(0, "h264", true), audio];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![1, 2, 3]).with_pts(100))
+                .unwrap();
+            mx.write_packet(&Packet::new(1, TimeBase::new(1, 90_000), vec![4, 5]).with_pts(200))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let langs: Vec<Option<String>> = dmx
+            .streams()
+            .iter()
+            .map(|s| s.params.language.clone())
+            .collect();
+        // The ac3 track must carry "jpn"; the video track must not.
+        assert!(langs.contains(&Some("jpn".to_string())), "langs={langs:?}");
+    }
+
+    /// A video track's language tag is dropped — video streams don't
+    /// carry an ISO_639_language_descriptor in the PMT.
+    #[test]
+    fn video_track_emits_no_language_descriptor() {
+        let mut video = stream_info(0, "h264", true);
+        video.params = video.params.with_language("eng");
+        let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let mx = MpegTsMuxer::new(output, std::slice::from_ref(&video)).expect("open");
+        assert!(mx.tracks[0].language.is_none());
+        assert!(build_es_descriptors(&mx.tracks[0]).is_empty());
+    }
+
+    #[test]
+    fn iso639_code_pads_and_truncates() {
+        assert_eq!(iso639_code("en"), [b'e', b'n', b' ']);
+        assert_eq!(iso639_code("jpn"), [b'j', b'p', b'n']);
+        assert_eq!(iso639_code("english"), [b'e', b'n', b'g']);
+        assert_eq!(iso639_code(""), [b' ', b' ', b' ']);
     }
 
     #[test]
