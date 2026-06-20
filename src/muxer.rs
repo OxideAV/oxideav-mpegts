@@ -15,8 +15,11 @@
 //!   pass so the byte count lands on the 188-byte boundary.
 //! * Per-PID continuity counters increment 0..0xF and wrap.
 //! * The first track marked as video also serves as the PCR PID —
-//!   every PES start on that PID carries a PCR adaptation field so
-//!   downstream players can lock the clock.
+//!   every PES start on that PID carries a PCR adaptation field, and
+//!   standalone PCR-only packets are injected on that PID whenever the
+//!   inter-PCR interval would exceed the §2.7.2 bound (0,1 s), driven
+//!   off the stream's PTS progression so a player locks the clock even
+//!   across a long run of audio-only packets.
 //! * `write_trailer` re-emits the PAT/PMT once so a player that
 //!   joins the stream near the end still sees the program tables.
 //!
@@ -27,8 +30,9 @@
 //!   caller's responsibility.
 //! * MPEG-DASH-style time slicing, PES-CRC, or scrambling.
 //! * Adaptation-field random-access / discontinuity / private-data
-//!   flags beyond `PCR_flag`. Video tracks get PCR at every PES;
-//!   non-video tracks never get adaptation fields.
+//!   flags beyond `PCR_flag`. The PCR PID gets PCR at every PES start
+//!   plus periodic standalone PCR packets; non-PCR-PID tracks get an
+//!   adaptation field only for the tail-packet stuffing pass.
 //!
 //! CodecId → MPEG-TS `stream_type` (Table 2-29 + HDMV extension
 //! 0x80..0xFF). The reverse mapping is performed at `open`; unknown
@@ -53,6 +57,14 @@ const PMT_PID: u16 = 0x0100;
 const FIRST_ES_PID: u16 = 0x1011;
 /// Single-program stream — `program_number` = 1 in PAT and PMT.
 const PROGRAM_NUMBER: u16 = 1;
+/// ISO/IEC 13818-1 §2.7.2 bounds the interval between consecutive PCRs
+/// on the PCR_PID at 0,1 s. We aim well inside it — a PCR at least
+/// every ~40 ms (3600 ticks of the 90 kHz PCR base) — so even a player
+/// that joins mid-stream locks the clock quickly. Driven off PTS, not
+/// wall time: when a packet's PTS has advanced past
+/// `last_pcr_pts + PCR_MAX_INTERVAL_90K`, a standalone PCR-only TS
+/// packet is injected on the PCR_PID ahead of the PES.
+const PCR_MAX_INTERVAL_90K: i64 = 3600;
 
 /// `Open` factory matching `oxideav_core::OpenMuxerFn`. Registered
 /// under the `"mpegts"` container name.
@@ -77,6 +89,10 @@ pub struct MpegTsMuxer {
     pmt_cc: u8,
     /// `true` once `write_header` has run.
     header_written: bool,
+    /// 90 kHz PCR-base value of the last PCR emitted on the PCR_PID, or
+    /// `None` before the first PCR. Used to bound the inter-PCR interval
+    /// per §2.7.2.
+    last_pcr_pts: Option<i64>,
 }
 
 impl std::fmt::Debug for MpegTsMuxer {
@@ -160,6 +176,7 @@ impl MpegTsMuxer {
             pat_cc: 0,
             pmt_cc: 0,
             header_written: false,
+            last_pcr_pts: None,
         })
     }
 
@@ -288,23 +305,84 @@ impl MpegTsMuxer {
         Ok(())
     }
 
+    /// Emit a standalone PCR-only TS packet on the PCR_PID. The packet
+    /// carries no payload — `adaptation_field_control = 0b10` (AF only)
+    /// with the AF spanning the whole 184-byte body: a flags byte with
+    /// `PCR_flag` set, the 6-byte PCR, then 0xFF stuffing. Per §2.4.3.4
+    /// a packet may legally carry an adaptation field and no payload.
+    fn write_pcr_only_packet(&mut self, pts: i64) -> CoreResult<()> {
+        let pcr_track = match self.tracks.iter().position(|t| t.pid == self.pcr_pid) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let cc = self.tracks[pcr_track].cc;
+        self.tracks[pcr_track].cc = (cc + 1) & 0x0F;
+
+        let mut pkt = [0xFFu8; TS_PACKET_LEN];
+        pkt[0] = TS_SYNC_BYTE;
+        // PUSI = 0 (no payload start), PID high.
+        pkt[1] = (self.pcr_pid >> 8) as u8 & 0b0001_1111;
+        pkt[2] = self.pcr_pid as u8;
+        // adaptation_field_control = 0b10 (AF only, no payload).
+        pkt[3] = 0b0010_0000 | (cc & 0x0F);
+        // adaptation_field_length = 183 (rest of the packet).
+        pkt[4] = (TS_PACKET_LEN - 5) as u8;
+        // flags byte: PCR_flag set.
+        pkt[5] = 0b0001_0000;
+        let pcr_bytes = encode_pcr(pts.max(0) as u64, 0);
+        pkt[6..12].copy_from_slice(&pcr_bytes);
+        // pkt[12..] stays 0xFF stuffing (already pre-filled).
+        self.output.write_all(&pkt).map_err(CoreError::Io)?;
+        self.last_pcr_pts = Some(pts);
+        Ok(())
+    }
+
+    /// Inject PCR-only packets ahead of a PES so the gap between
+    /// consecutive PCRs on the PCR_PID stays under
+    /// [`PCR_MAX_INTERVAL_90K`] (§2.7.2's 0,1 s bound, with margin).
+    /// Driven by the PES PTS rather than wall time — the muxer has no
+    /// real-time clock.
+    fn maybe_emit_periodic_pcr(&mut self, pts: i64) -> CoreResult<()> {
+        match self.last_pcr_pts {
+            None => self.write_pcr_only_packet(pts),
+            Some(last) if pts.saturating_sub(last) >= PCR_MAX_INTERVAL_90K => {
+                self.write_pcr_only_packet(pts)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Build one PES packet from a [`Packet`] and fragment it into
     /// TS packets, emitting each. Inserts a PCR adaptation field on
-    /// the first TS packet of a video PES.
+    /// the first TS packet of a video PES, and injects standalone
+    /// PCR-only packets when the inter-PCR interval would be exceeded.
     fn write_pes_packet(&mut self, track_idx: usize, packet: &Packet) -> CoreResult<()> {
         let track = self.tracks[track_idx].clone();
-        let pes = build_pes(track.stream_id, packet);
-        let pcr = if track.is_video {
-            packet.pts.map(|p| {
-                // PCR-base = first PTS - small offset (10ms). Both are
-                // 90kHz units. The 9-bit extension is the 27 MHz
-                // fractional part — we just zero it.
-                let pcr_base = (p.saturating_sub(900)).max(0) as u64;
-                (pcr_base, 0u16)
-            })
+        // Bound the inter-PCR interval (§2.7.2). Any track's PTS can
+        // advance the muxer's notion of time; the PCR is emitted on the
+        // PCR_PID regardless of which track triggered it.
+        let pcr_on_this_pes = if track.pid == self.pcr_pid {
+            // The PCR PID's own PES carries an inline PCR on its first
+            // TS packet — record it so the periodic logic doesn't
+            // double-emit.
+            packet.pts
         } else {
+            if let Some(p) = packet.pts {
+                self.maybe_emit_periodic_pcr(p)?;
+            }
             None
         };
+        let pes = build_pes(track.stream_id, packet);
+        let pcr = pcr_on_this_pes.map(|p| {
+            // PCR-base = PTS - ~10ms guard so the PCR never leads the
+            // first access unit it accompanies. Both are 90 kHz units;
+            // the 9-bit 27 MHz extension is zeroed.
+            let pcr_base = p.saturating_sub(900).max(0) as u64;
+            (pcr_base, 0u16)
+        });
+        if let Some((base, _)) = pcr {
+            self.last_pcr_pts = Some(base as i64);
+        }
         self.write_pes_bytes_as_ts(track.pid, track_idx, &pes, pcr)
     }
 
@@ -350,14 +428,7 @@ impl MpegTsMuxer {
                 if let Some((pcr_base, pcr_ext)) = first_packet_pcr {
                     if first {
                         flags |= 0b0001_0000; // PCR_flag
-                                              // 33-bit PCR base + 6 reserved + 9-bit ext = 48 bits.
-                        let high32 = ((pcr_base >> 1) & 0xFFFF_FFFF) as u32;
-                        let low_bit_of_base = (pcr_base & 1) as u8;
-                        let mut pcr_bytes = [0u8; 6];
-                        pcr_bytes[0..4].copy_from_slice(&high32.to_be_bytes());
-                        pcr_bytes[4] =
-                            (low_bit_of_base << 7) | 0b0111_1110 | ((pcr_ext >> 8) as u8 & 0x01);
-                        pcr_bytes[5] = pcr_ext as u8;
+                        let pcr_bytes = encode_pcr(pcr_base, pcr_ext);
                         af.push(flags);
                         af.extend_from_slice(&pcr_bytes);
                     } else {
@@ -520,6 +591,22 @@ fn build_es_descriptors(track: &TrackState) -> Vec<u8> {
         out.extend_from_slice(&lang);
         out.push(0x00); // audio_type = undefined
     }
+    out
+}
+
+/// Encode a 42-bit PCR (33-bit base + 6 reserved + 9-bit extension)
+/// into the 6-byte adaptation-field field per §2.4.3.4 Table 2-6:
+/// `program_clock_reference_base` (33), `reserved` (6, all 1s),
+/// `program_clock_reference_extension` (9).
+fn encode_pcr(pcr_base: u64, pcr_ext: u16) -> [u8; 6] {
+    let base = pcr_base & 0x1_FFFF_FFFF; // 33 bits
+    let high32 = ((base >> 1) & 0xFFFF_FFFF) as u32;
+    let low_bit_of_base = (base & 1) as u8;
+    let ext = pcr_ext & 0x1FF; // 9 bits
+    let mut out = [0u8; 6];
+    out[0..4].copy_from_slice(&high32.to_be_bytes());
+    out[4] = (low_bit_of_base << 7) | 0b0111_1110 | ((ext >> 8) as u8 & 0x01);
+    out[5] = ext as u8;
     out
 }
 
@@ -759,6 +846,83 @@ mod tests {
         let mx = MpegTsMuxer::new(output, std::slice::from_ref(&video)).expect("open");
         assert!(mx.tracks[0].language.is_none());
         assert!(build_es_descriptors(&mx.tracks[0]).is_empty());
+    }
+
+    /// `encode_pcr` must round-trip through the demuxer-side adaptation
+    /// field PCR decode. Pin the exact bit layout (§2.4.3.4 Table 2-6).
+    #[test]
+    fn encode_pcr_bit_layout() {
+        // base = 0x1_0000_0001 (33 bits, low bit set), ext = 0x155.
+        let b = encode_pcr(0x1_0000_0001, 0x155);
+        // high32 = base >> 1 = 0x8000_0000.
+        assert_eq!(&b[0..4], &0x8000_0000u32.to_be_bytes());
+        // byte4 = (low_bit<<7) | 0b0111_1110 | (ext>>8 & 1)
+        //       = (1<<7) | 0x7E | (1) = 0xFF.
+        assert_eq!(b[4], 0xFF);
+        assert_eq!(b[5], 0x55);
+        // Parse it back through the packet AF decoder.
+        let mut pkt = [0xFFu8; TS_PACKET_LEN];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0x01;
+        pkt[2] = 0x00;
+        pkt[3] = 0b0010_0000; // AF only
+        pkt[4] = 183;
+        pkt[5] = 0b0001_0000; // PCR_flag
+        pkt[6..12].copy_from_slice(&b);
+        let parsed = crate::packet::TsPacket::parse(&pkt).expect("parse");
+        let af = parsed.adaptation_field.expect("af");
+        assert_eq!(af.pcr_base, Some(0x1_0000_0001));
+        assert_eq!(af.pcr_extension, Some(0x155));
+    }
+
+    /// When two PES packets on the same PCR PID are spaced far apart in
+    /// PTS, with intervening audio packets, the muxer must inject extra
+    /// standalone PCR-only packets to keep the inter-PCR interval inside
+    /// the §2.7.2 bound. Count the PCR-bearing packets on the PCR PID.
+    #[test]
+    fn periodic_pcr_injected_for_large_pts_gap() {
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let sink = SharedSink::new();
+        let pcr_pid;
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            pcr_pid = mx.pcr_pid;
+            mx.write_header().expect("hdr");
+            // Video at PTS 0, then a run of audio packets advancing PTS
+            // well past several PCR intervals, then video again.
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![0; 10]).with_pts(0))
+                .unwrap();
+            for k in 1..=10i64 {
+                let pts = k * 4000; // > PCR_MAX_INTERVAL_90K each step
+                mx.write_packet(
+                    &Packet::new(1, TimeBase::new(1, 90_000), vec![0; 8]).with_pts(pts),
+                )
+                .unwrap();
+            }
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![0; 10]).with_pts(44000))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        // Count packets on the PCR PID that carry a PCR_flag.
+        let mut pcr_count = 0;
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
+            if pid != pcr_pid {
+                continue;
+            }
+            let afc = (chunk[3] >> 4) & 0b11;
+            if afc & 0b10 != 0 {
+                let af_len = chunk[4] as usize;
+                if af_len > 0 && (chunk[5] & 0b0001_0000) != 0 {
+                    pcr_count += 1;
+                }
+            }
+        }
+        // 1 (initial video PES) + many standalone audio-driven PCRs +
+        // the final video PES = comfortably more than 2.
+        assert!(pcr_count >= 5, "only {pcr_count} PCRs emitted");
     }
 
     #[test]
