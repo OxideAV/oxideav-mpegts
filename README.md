@@ -1,6 +1,7 @@
 # oxideav-mpegts
 
-Pure-Rust, clean-room **MPEG-TS** (Transport Stream) demuxer per
+Pure-Rust, clean-room **MPEG-TS** (Transport Stream) demuxer and
+single-program muxer per
 [ISO/IEC 13818-1](https://www.iso.org/standard/74427.html). The crate
 is scoped at the bytes Blu-ray Disc ships inside a `.m2ts` file once the
 BDAV `TP_extra_header` has been stripped — i.e. the 188-byte MPEG-TS
