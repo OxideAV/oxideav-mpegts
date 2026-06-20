@@ -23,9 +23,11 @@ language-tagged tracks and chapter marks.
 | `pes`            | PES packet reassembler — joins TS payloads per-PID into complete PES units. Decodes every Table 2-17 optional header field: PES_scrambling_control / PES_priority / data_alignment_indicator / copyright / original_or_copy on flags1, plus the flag-gated bodies ESCR (42-bit 27 MHz tick), ES_rate (50 bytes/s units), DSM_trick_mode (raw 8-bit), additional_copy_info, previous_PES_packet_CRC, and the full PES_extension body (16-byte private data, raw pack_header bytes, program_packet_sequence_counter, P-STD buffer scale/size, PES_extension_field_2). |
 | `stream_type`    | `stream_type` byte → codec class enum covering the full ISO/IEC 13818-1 Table 2-29 base range (`0x01..=0x26`: MPEG-1/2/4 video + audio, AAC-ADTS/LATM, private sections / PES, MHEG, DSM-CC, metadata carriers, IPMP, AVC / SVC / MVC / MVCD, JPEG 2000, stereoscopic views, HEVC + temporal subset) plus AVS video and the HDMV-extended Blu-ray range. Classifies video / audio / subtitle / metadata / private. |
 | `clock`          | Per-PCR-PID 27 MHz clock recovery + per-PID continuity-counter classification (§2.4.2.2 / §2.4.3.3 / §2.4.3.5), plus `PtsTracker` — per-PID 33-bit PTS/DTS unwrapping (§2.4.3.7) into a monotonic 64-bit extended timeline with wrap-vs-discontinuity classification. |
+| `muxer`          | Single-program writer (`MpegTsMuxer`) — synthesises a PAT (PID 0x0000) + PMT (PID 0x0100), wraps each `Packet` in a PES envelope (PTS / DTS per Table 2-22), and fragments it into 188-byte TS packets with per-PID continuity counters and a tail-stuffing pass. PSI sections too long for one packet split across multiple TS packets (§2.4.4 PUSI + pointer_field + continuation). Audio / subtitle tracks carrying a language tag emit an `ISO_639_language_descriptor` (tag 0x0A, §2.6.18) in their PMT ES_info loop, which the demuxer lifts back into `CodecParameters.language` for a lossless demux → remux of track languages. The PCR PID (first video track) carries a PCR on every PES start plus standalone PCR-only packets injected to keep the inter-PCR interval inside the §2.7.2 0,1 s bound. CodecId ↔ stream_type mapping mirrors the demuxer so a round-trip preserves the codec set. |
 
-No decoders. No re-multiplexing. Every payload byte stays as a
-borrowed slice unless reassembly forces a copy.
+No decoders. Every payload byte on the demux path stays as a borrowed
+slice unless reassembly forces a copy; the muxer is the only path that
+re-multiplexes.
 
 `ProgramMapTable::iter_program_descriptors` and
 `PmtStream::iter_descriptors` lift the raw descriptor bytes carried
