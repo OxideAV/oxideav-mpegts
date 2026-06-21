@@ -11,6 +11,21 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- Multi-program demux selection — `MpegTsDemuxer` now collects every
+  non-network program the PAT advertises (§2.4.4.5) into a typed
+  `TsProgram { program_number, pmt_pid }` list exposed via
+  `programs()`. The default `open` path keeps first-program-wins;
+  `MpegTsDemuxer::open_program(input, program_number)` selects any
+  other program (with `selected_program()` reporting the active
+  choice). Previously the parsed PAT was discarded and only the first
+  program was ever reachable.
+- Demux-path timing reconstruction — the selected program's `PCR_PID`
+  (§2.4.4.9) now feeds a `PcrTracker` for 27 MHz clock recovery
+  (`last_pcr()` / `pcr_pid()`), and each emitted packet's 33-bit
+  PTS/DTS is unwrapped through a per-PID `PtsTracker` (§2.4.3.7) onto
+  the monotonic 64-bit extended timeline so a `2^33` ring wrap no
+  longer surfaces as a backward jump. The first observed PTS anchors
+  `StreamInfo.start_time`.
 - `PtsTracker` (clock module) — per-PID PTS / DTS unwrapper per
   ISO/IEC 13818-1 §2.4.3.7. PES timestamps are 33-bit 90 kHz values that
   wrap every ~26.5 h; the tracker turns the raw values seen on one PID

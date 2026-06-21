@@ -42,9 +42,13 @@ use oxideav_core::{
 };
 
 use crate::{
-    PesPacket, PesReassembler, ProgramAssociationTable, ProgramMapTable, PsiSectionAssembler,
-    StreamType, TsPacket, PAT_PID, TS_PACKET_LEN, TS_SYNC_BYTE,
+    Pcr, PcrTracker, PesPacket, PesReassembler, ProgramAssociationTable, ProgramMapTable,
+    PsiSectionAssembler, PtsTracker, StreamType, TsPacket, PAT_PID, TS_PACKET_LEN, TS_SYNC_BYTE,
 };
+
+/// PID value the PMT's `PCR_PID` field carries when no PCR is
+/// associated with the program (§2.4.4.9 / Table 2-3 null PID).
+const NULL_PID: u16 = 0x1FFF;
 
 /// Open factory matching `oxideav_core::OpenDemuxerFn`. Registered
 /// under the `"mpegts"` container name.
@@ -79,11 +83,25 @@ pub struct MpegTsDemuxer {
     /// `program_number` of the program this demuxer is currently
     /// demuxing (its PMT drove `streams`).
     selected_program: u16,
+    /// `PCR_PID` for the selected program (§2.4.4.9), or
+    /// [`NULL_PID`] when the program carries no PCR.
+    pcr_pid: u16,
+    /// 27 MHz clock recovery on the selected program's `PCR_PID`. Fed
+    /// every adaptation field that carries a PCR; supplies the absolute
+    /// clock anchor a remux uses to align the PES timeline.
+    pcr_tracker: PcrTracker,
     streams: Vec<StreamInfo>,
     /// `elementary_pid` → `streams[index]` lookup.
     pid_to_stream: HashMap<u16, u32>,
     /// `elementary_pid` → in-flight PES reassembler.
     reassemblers: HashMap<u16, PesReassembler>,
+    /// `elementary_pid` → 33-bit PTS unwrapper (§2.4.3.7). Turns the
+    /// raw PES timestamps that wrap every ~26.5 h into a monotonic
+    /// 64-bit extended timeline.
+    pts_trackers: HashMap<u16, PtsTracker>,
+    /// `elementary_pid` → 33-bit DTS unwrapper — DTS advances
+    /// independently of PTS so it needs its own ring tracker.
+    dts_trackers: HashMap<u16, PtsTracker>,
     /// Already-reassembled packets waiting to be handed out.
     pending: VecDeque<Packet>,
     /// `true` once `read_one_packet` has returned `Eof` and every
@@ -257,6 +275,8 @@ impl MpegTsDemuxer {
         let mut streams: Vec<StreamInfo> = Vec::new();
         let mut pid_to_stream: HashMap<u16, u32> = HashMap::new();
         let mut reassemblers: HashMap<u16, PesReassembler> = HashMap::new();
+        let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
+        let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         for pmt_stream in &pmt.streams {
             let mut params = match codec_params_for_stream_type(pmt_stream.stream_type) {
                 Some(p) => p,
@@ -282,6 +302,8 @@ impl MpegTsDemuxer {
             });
             pid_to_stream.insert(pmt_stream.elementary_pid, idx);
             reassemblers.insert(pmt_stream.elementary_pid, PesReassembler::new());
+            pts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
+            dts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
         }
         if streams.is_empty() {
             return Err(CoreError::invalid(
@@ -294,9 +316,13 @@ impl MpegTsDemuxer {
             input,
             programs,
             selected_program,
+            pcr_pid: pmt.pcr_pid,
+            pcr_tracker: PcrTracker::new(),
             streams,
             pid_to_stream,
             reassemblers,
+            pts_trackers,
+            dts_trackers,
             pending: VecDeque::new(),
             eof_reached: false,
             bytes_read: probe_bytes,
@@ -319,6 +345,62 @@ impl MpegTsDemuxer {
         self.selected_program
     }
 
+    /// The selected program's `PCR_PID` (§2.4.4.9), or `None` when the
+    /// PMT declared no PCR (the spec's `0x1FFF` null sentinel).
+    pub fn pcr_pid(&self) -> Option<u16> {
+        (self.pcr_pid != NULL_PID).then_some(self.pcr_pid)
+    }
+
+    /// The most recently recovered [`Pcr`] on the program's `PCR_PID`,
+    /// or `None` before the first PCR has been demuxed. This is the
+    /// 27 MHz wall-clock anchor a remux uses to place the PES timeline.
+    pub fn last_pcr(&self) -> Option<Pcr> {
+        self.pcr_tracker.last_pcr()
+    }
+
+    /// Unwrap a freshly reassembled PES into a [`Packet`], carrying the
+    /// monotonic 64-bit extended PTS/DTS (§2.4.3.7) rather than the raw
+    /// 33-bit ring value, and record the stream's `start_time` on its
+    /// first timestamped packet.
+    fn finish_pes(&mut self, pid: u16, stream_idx: u32, pes: PesPacket) -> Packet {
+        let tb = TimeBase::new(1, 90_000);
+        let mut pkt = Packet::new(stream_idx, tb, pes.payload);
+        if let Some(raw) = pes.pts_90k {
+            let ext = if let Some(t) = self.pts_trackers.get_mut(&pid) {
+                t.observe(raw);
+                t.extended().unwrap_or(raw)
+            } else {
+                raw
+            };
+            pkt = pkt.with_pts(ext as i64);
+            let info = &mut self.streams[stream_idx as usize];
+            if info.start_time.is_none() {
+                info.start_time = Some(ext as i64);
+            }
+        }
+        if let Some(raw) = pes.dts_90k {
+            let ext = if let Some(t) = self.dts_trackers.get_mut(&pid) {
+                t.observe(raw);
+                t.extended().unwrap_or(raw)
+            } else {
+                raw
+            };
+            pkt = pkt.with_dts(ext as i64);
+        }
+        pkt
+    }
+
+    /// Feed a TS packet's adaptation field into the PCR clock recovery
+    /// when it lands on the selected program's `PCR_PID`.
+    fn observe_pcr(&mut self, pkt: &TsPacket<'_>, byte_offset: u64) {
+        if pkt.pid != self.pcr_pid {
+            return;
+        }
+        if let Some(af) = &pkt.adaptation_field {
+            self.pcr_tracker.observe(af, byte_offset);
+        }
+    }
+
     /// Pull one TS packet from the input and, if it's for a stream we
     /// track, feed the per-PID reassembler. Returns the number of
     /// `Packet`s pushed into `self.pending` by this call.
@@ -327,8 +409,12 @@ impl MpegTsDemuxer {
             Some(b) => b,
             None => return Ok(0),
         };
+        let pkt_offset = self.bytes_read;
         self.bytes_read += TS_PACKET_LEN as u64;
         let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
+        // PCR recovery runs on the PCR_PID regardless of whether that
+        // PID also carries an elementary stream we track.
+        self.observe_pcr(&pkt, pkt_offset);
         let stream_idx = match self.pid_to_stream.get(&pkt.pid).copied() {
             Some(i) => i,
             None => return Ok(0),
@@ -339,7 +425,8 @@ impl MpegTsDemuxer {
             .expect("pid_to_stream and reassemblers are kept in sync");
         let emitted = reassembler.feed(&pkt).map_err(map_ts_err)?;
         let pushed = if let Some(pes) = emitted {
-            self.pending.push_back(pes_to_packet(stream_idx, pes));
+            let packet = self.finish_pes(pkt.pid, stream_idx, pes);
+            self.pending.push_back(packet);
             1
         } else {
             0
@@ -354,10 +441,13 @@ impl MpegTsDemuxer {
         let pids: Vec<u16> = self.reassemblers.keys().copied().collect();
         for pid in pids {
             let stream_idx = self.pid_to_stream[&pid];
-            if let Some(reassembler) = self.reassemblers.get_mut(&pid) {
-                if let Ok(Some(pes)) = reassembler.flush() {
-                    self.pending.push_back(pes_to_packet(stream_idx, pes));
-                }
+            let flushed = self
+                .reassemblers
+                .get_mut(&pid)
+                .and_then(|r| r.flush().ok().flatten());
+            if let Some(pes) = flushed {
+                let packet = self.finish_pes(pid, stream_idx, pes);
+                self.pending.push_back(packet);
             }
         }
     }
@@ -392,6 +482,7 @@ impl Demuxer for MpegTsDemuxer {
                         self.flush_reassemblers();
                     }
                     Some(buf) => {
+                        let pkt_offset = self.bytes_read;
                         self.bytes_read += TS_PACKET_LEN as u64;
                         // We've already advanced past an EOF earlier
                         // when this branch was taken with pushed=0 but
@@ -399,11 +490,17 @@ impl Demuxer for MpegTsDemuxer {
                         // packet was a non-stream PID (silently
                         // dropped). Re-parse + feed and loop.
                         let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
+                        self.observe_pcr(&pkt, pkt_offset);
                         if let Some(stream_idx) = self.pid_to_stream.get(&pkt.pid).copied() {
-                            if let Some(reassembler) = self.reassemblers.get_mut(&pkt.pid) {
-                                if let Some(pes) = reassembler.feed(&pkt).map_err(map_ts_err)? {
-                                    self.pending.push_back(pes_to_packet(stream_idx, pes));
-                                }
+                            let emitted = self
+                                .reassemblers
+                                .get_mut(&pkt.pid)
+                                .and_then(|r| r.feed(&pkt).transpose())
+                                .transpose()
+                                .map_err(map_ts_err)?;
+                            if let Some(pes) = emitted {
+                                let packet = self.finish_pes(pkt.pid, stream_idx, pes);
+                                self.pending.push_back(packet);
                             }
                         }
                     }
@@ -549,18 +646,6 @@ fn resync(
 
 fn map_ts_err(e: crate::TsError) -> CoreError {
     CoreError::invalid(format!("mpegts: {e}"))
-}
-
-fn pes_to_packet(stream_index: u32, pes: PesPacket) -> Packet {
-    let tb = TimeBase::new(1, 90_000);
-    let mut pkt = Packet::new(stream_index, tb, pes.payload);
-    if let Some(p) = pes.pts_90k {
-        pkt = pkt.with_pts(p as i64);
-    }
-    if let Some(d) = pes.dts_90k {
-        pkt = pkt.with_dts(d as i64);
-    }
-    pkt
 }
 
 /// Walk a PMT stream's ES_info descriptor loop and return the first
@@ -1135,5 +1220,163 @@ mod tests {
             ext: None,
         };
         assert_eq!(probe(&p), 0);
+    }
+
+    /// Encode a 33-bit PTS/DTS field per Table 2-22 with the given
+    /// 4-bit marker nibble (`0b0010` PTS-only, `0b0011` PTS prefix of a
+    /// PTS+DTS pair, `0b0001` the DTS).
+    fn encode_ts33(v: u64, marker_nibble: u8) -> [u8; 5] {
+        let mut b = [0u8; 5];
+        b[0] = (marker_nibble << 4) | (((v >> 29) & 0x0E) as u8) | 1;
+        b[1] = ((v >> 22) & 0xFF) as u8;
+        b[2] = (((v >> 14) & 0xFE) as u8) | 1;
+        b[3] = ((v >> 7) & 0xFF) as u8;
+        b[4] = (((v << 1) & 0xFE) as u8) | 1;
+        b
+    }
+
+    /// Encode a 6-byte adaptation-field program_clock_reference
+    /// (§2.4.3.5): 33-bit base, 6 reserved '1' bits, 9-bit extension.
+    fn encode_pcr(base: u64, ext: u16) -> [u8; 6] {
+        let mut p = [0u8; 6];
+        p[0] = (base >> 25) as u8;
+        p[1] = (base >> 17) as u8;
+        p[2] = (base >> 9) as u8;
+        p[3] = (base >> 1) as u8;
+        // bit7 = base LSB, bits6..1 = reserved '1', bit0 = ext MSB.
+        p[4] = (((base & 1) as u8) << 7) | (0b0011_1111 << 1) | ((ext >> 8) & 1) as u8;
+        p[5] = (ext & 0xFF) as u8;
+        p
+    }
+
+    /// A PES packet body carrying a PTS (Table 2-22) and a short
+    /// payload, with `stream_id = 0xE0`.
+    fn pes_with_pts(pts: u64, payload: &[u8]) -> Vec<u8> {
+        let pts_bytes = encode_ts33(pts, 0b0010);
+        let opt_hdr_len: u8 = 5;
+        let pes_len: u16 = 3 + opt_hdr_len as u16 + payload.len() as u16;
+        let mut pes = vec![
+            0x00,
+            0x00,
+            0x01,
+            0xE0,
+            (pes_len >> 8) as u8,
+            pes_len as u8,
+            0b1000_0000,
+            0b1000_0000, // PTS_DTS_flags = 0b10
+            opt_hdr_len,
+        ];
+        pes.extend_from_slice(&pts_bytes);
+        pes.extend_from_slice(payload);
+        pes
+    }
+
+    /// A TS packet on `pid` carrying a PES payload, optionally with an
+    /// adaptation field holding a PCR. PUSI=1 (each PES is a fresh
+    /// start). `cc` is the continuity counter.
+    fn ts_pes(pid: u16, cc: u8, pcr: Option<(u64, u16)>, pes: &[u8]) -> [u8; TS_PACKET_LEN] {
+        let mut pkt = [0u8; TS_PACKET_LEN];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = 0b0100_0000 | ((pid >> 8) as u8 & 0x1F);
+        pkt[2] = pid as u8;
+        let mut off = 4;
+        if let Some((base, ext)) = pcr {
+            // adaptation_field_control = 0b11 (AF + payload).
+            pkt[3] = 0b0011_0000 | (cc & 0x0F);
+            // adaptation_field_length covers flags(1) + PCR(6) = 7.
+            pkt[4] = 7;
+            pkt[5] = 0b0001_0000; // PCR_flag = 1
+            let p = encode_pcr(base, ext);
+            pkt[6..12].copy_from_slice(&p);
+            off = 12;
+        } else {
+            pkt[3] = 0b0001_0000 | (cc & 0x0F); // payload only
+        }
+        let take = (TS_PACKET_LEN - off).min(pes.len());
+        pkt[off..off + take].copy_from_slice(&pes[..take]);
+        pkt
+    }
+
+    /// Build a single-program TS where the video ES PID (0x101) is also
+    /// the PCR_PID, the first PES carries a PCR plus a PTS near the top
+    /// of the 33-bit ring, and the second PES's PTS has wrapped past
+    /// `2^33`. The demuxer must recover the PCR, set `start_time` to
+    /// the first PTS, and unwrap the second PTS onto the extended
+    /// timeline (so it reads as `first_pts + delta`, not a small
+    /// post-wrap value).
+    fn synth_pcr_and_wrap_ts() -> Vec<u8> {
+        let mut pat = vec![
+            0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,
+        ];
+        let c = crc32_mpeg2(&pat);
+        pat.extend_from_slice(&c.to_be_bytes());
+        // PMT: PCR_PID = 0x101, one AVC stream on 0x101.
+        let mut pmt = vec![
+            0x02, 0xB0, 0x12, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x01, 0xF0, 0x00, 0x1B, 0xE1,
+            0x01, 0xF0, 0x00,
+        ];
+        let cp = crc32_mpeg2(&pmt);
+        pmt.extend_from_slice(&cp.to_be_bytes());
+
+        fn ts_psi(pid: u16, section: &[u8]) -> [u8; TS_PACKET_LEN] {
+            let mut pkt = [0xFFu8; TS_PACKET_LEN];
+            pkt[0] = TS_SYNC_BYTE;
+            pkt[1] = 0b0100_0000 | ((pid >> 8) as u8 & 0x1F);
+            pkt[2] = pid as u8;
+            pkt[3] = 0b0001_0000;
+            pkt[4] = 0;
+            let take = (TS_PACKET_LEN - 5).min(section.len());
+            pkt[5..5 + take].copy_from_slice(&section[..take]);
+            pkt
+        }
+
+        // PTS values: first near the top of the 33-bit ring, second
+        // 90_000 ticks (1 s) later — which lands past the 2^33 wrap.
+        let modulus = crate::TIMESTAMP_MODULUS_90KHZ;
+        let pts0 = modulus - 45_000; // 0.5 s before wrap
+        let pts1 = (pts0 + 90_000) & (modulus - 1); // wrapped to 0.5 s
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ts_psi(0x0000, &pat));
+        buf.extend_from_slice(&ts_psi(0x0100, &pmt));
+        // First PES on 0x101 with a PCR (base=pts0, ext=0).
+        buf.extend_from_slice(&ts_pes(
+            0x0101,
+            0,
+            Some((pts0, 0)),
+            &pes_with_pts(pts0, b"frame0"),
+        ));
+        // Second PES on 0x101, PTS wrapped, no PCR. A different PID
+        // packet in between forces the first PES to flush.
+        buf.extend_from_slice(&ts_pes(0x0101, 1, None, &pes_with_pts(pts1, b"frame1")));
+        buf
+    }
+
+    #[test]
+    fn demux_recovers_pcr_and_unwraps_wrapped_pts() {
+        let bytes = synth_pcr_and_wrap_ts();
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        assert_eq!(dmx.pcr_pid(), Some(0x101));
+
+        let modulus = crate::TIMESTAMP_MODULUS_90KHZ;
+        let pts0 = modulus - 45_000;
+
+        let f0 = dmx.next_packet().expect("frame0");
+        assert_eq!(f0.pts, Some(pts0 as i64));
+        // start_time is anchored on the first PTS.
+        assert_eq!(dmx.streams()[0].start_time, Some(pts0 as i64));
+        // The PCR was recovered from the adaptation field.
+        assert_eq!(dmx.last_pcr().map(|p| p.base_90khz()), Some(pts0));
+
+        let f1 = dmx.next_packet().expect("frame1");
+        // Without unwrapping, f1.pts would read as the small post-wrap
+        // raw value (45_000). With the PtsTracker it continues on the
+        // extended timeline: pts0 + 90_000.
+        assert_eq!(f1.pts, Some((pts0 + 90_000) as i64));
+        assert!(
+            f1.pts.unwrap() > f0.pts.unwrap(),
+            "extended PTS must stay monotonic across the 2^33 wrap"
+        );
     }
 }
