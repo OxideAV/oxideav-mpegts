@@ -9,9 +9,11 @@
 //!
 //! ## Scope
 //!
-//! * Single-program transport streams (BD `.m2ts`, broadcast TS with
-//!   one program). When a PAT advertises multiple programs the first
-//!   one wins; multi-program selection is a [future hook](#future).
+//! * Multi-program transport streams. The PAT's full program list is
+//!   enumerated as [`TsProgram`] records ([`MpegTsDemuxer::programs`]);
+//!   the default [`open`] path demuxes the first program, and
+//!   [`MpegTsDemuxer::open_program`] selects any other by its
+//!   `program_number` (§2.4.4.5).
 //! * Multi-TS-packet PAT / PMT via [`crate::PsiSectionAssembler`] —
 //!   sections that overflow the ~184-byte per-TS payload budget
 //!   (common for PMTs with rich descriptor blocks) are reassembled
@@ -51,11 +53,32 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> CoreResult<
     MpegTsDemuxer::new(input).map(|d| Box::new(d) as Box<dyn Demuxer>)
 }
 
+/// One program advertised by a transport stream's PAT — the
+/// `program_number` label and the `program_map_PID` carrying its PMT
+/// (§2.4.4.5). A `program_number` of `0` (the network PID) is filtered
+/// out before this list is built; every entry here names a real
+/// program whose PMT can be selected via
+/// [`MpegTsDemuxer::open_program`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TsProgram {
+    /// 16-bit program label, unique within the transport stream.
+    pub program_number: u16,
+    /// 13-bit PID of the TS packets carrying this program's PMT.
+    pub pmt_pid: u16,
+}
+
 /// MPEG-TS demuxer state — reads 188-byte packets from a `ReadSeek`,
 /// reassembles PES per PID, hands one [`Packet`] per PES back through
 /// `next_packet`.
 pub struct MpegTsDemuxer {
     input: Box<dyn ReadSeek>,
+    /// Every non-network program the PAT advertised, in PAT order. The
+    /// first entry is the default selection; [`Self::open_program`]
+    /// targets any other by `program_number`.
+    programs: Vec<TsProgram>,
+    /// `program_number` of the program this demuxer is currently
+    /// demuxing (its PMT drove `streams`).
+    selected_program: u16,
     streams: Vec<StreamInfo>,
     /// `elementary_pid` → `streams[index]` lookup.
     pid_to_stream: HashMap<u16, u32>,
@@ -88,15 +111,40 @@ impl std::fmt::Debug for MpegTsDemuxer {
 }
 
 impl MpegTsDemuxer {
-    fn new(mut input: Box<dyn ReadSeek>) -> CoreResult<Self> {
+    /// Open a demuxer on the **first** program the PAT advertises.
+    fn new(input: Box<dyn ReadSeek>) -> CoreResult<Self> {
+        Self::with_selector(input, None)
+    }
+
+    /// Open a demuxer on a **specific** program by its 16-bit
+    /// `program_number` (§2.4.4.5). Use this when a multi-program
+    /// transport stream carries more than one service and the caller
+    /// wants a program other than the first the PAT lists. The
+    /// available programs can be discovered by opening with [`open`]
+    /// (or [`Self::new`]) and reading [`Self::programs`], then
+    /// re-opening a fresh source on the chosen `program_number`.
+    ///
+    /// Returns an error if the PAT advertises no program with that
+    /// number.
+    pub fn open_program(input: Box<dyn ReadSeek>, program_number: u16) -> CoreResult<Self> {
+        Self::with_selector(input, Some(program_number))
+    }
+
+    /// Core constructor. `want` is `None` for "first program wins" or
+    /// `Some(n)` to select the program whose `program_number == n`.
+    fn with_selector(mut input: Box<dyn ReadSeek>, want: Option<u16>) -> CoreResult<Self> {
         // Step 1: scan for the first PAT, reassembling its section
         // across as many same-PID TS packets as the spec permits per
         // §2.4.4. A PUSI=1 packet starts a fresh section; subsequent
         // same-PID packets with PUSI=0 continue it. Real BD `.m2ts`
         // fits the PAT in one TS packet; broadcast TS with many
         // programs needs the assembler.
-        let mut pmt_pid: Option<u16> = None;
-        let mut programs_found: Option<ProgramAssociationTable> = None;
+        //
+        // We collect *every* non-network program the PAT lists so a
+        // caller can enumerate them and re-open on a chosen one
+        // (§2.4.4.5: `program_number == 0` names the network PID, not a
+        // program). The selected program drives the Step-2 PMT scan.
+        let mut programs: Vec<TsProgram> = Vec::new();
         let mut probe_bytes: u64 = 0;
         let mut probe_putback: VecDeque<u8> = VecDeque::new();
         let mut pat_assembler = PsiSectionAssembler::new();
@@ -124,24 +172,43 @@ impl MpegTsDemuxer {
             for section in &sections {
                 if let Ok(pat) = ProgramAssociationTable::parse(section) {
                     for (prog, pid) in &pat.programs {
-                        if *prog != 0 {
-                            pmt_pid = Some(*pid);
-                            break;
+                        if *prog != 0 && !programs.iter().any(|p| p.program_number == *prog) {
+                            programs.push(TsProgram {
+                                program_number: *prog,
+                                pmt_pid: *pid,
+                            });
                         }
-                    }
-                    programs_found = Some(pat);
-                    if pmt_pid.is_some() {
-                        break;
                     }
                 }
             }
-            if pmt_pid.is_some() {
+            if !programs.is_empty() {
                 break;
             }
         }
-        let pmt_pid = pmt_pid
-            .ok_or_else(|| CoreError::invalid("mpegts: PAT carried no program with a PMT PID"))?;
-        let _ = programs_found; // retained for future multi-program selection
+        if programs.is_empty() {
+            return Err(CoreError::invalid(
+                "mpegts: PAT carried no program with a PMT PID",
+            ));
+        }
+        let selected = match want {
+            None => programs[0],
+            Some(n) => *programs
+                .iter()
+                .find(|p| p.program_number == n)
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "mpegts: PAT advertises no program_number {n} \
+                         (available: {})",
+                        programs
+                            .iter()
+                            .map(|p| p.program_number.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?,
+        };
+        let pmt_pid = selected.pmt_pid;
+        let selected_program = selected.program_number;
 
         // Step 2: scan for the matching PMT, again reassembling
         // multi-TS-packet sections. PMTs with rich descriptor blocks
@@ -225,6 +292,8 @@ impl MpegTsDemuxer {
 
         Ok(Self {
             input,
+            programs,
+            selected_program,
             streams,
             pid_to_stream,
             reassemblers,
@@ -233,6 +302,21 @@ impl MpegTsDemuxer {
             bytes_read: probe_bytes,
             putback: probe_putback,
         })
+    }
+
+    /// The list of programs the PAT advertised, in PAT order
+    /// (§2.4.4.5). The network PID (`program_number == 0`) is excluded.
+    /// The first entry is the one a default [`open`] demuxes; pass any
+    /// other's `program_number` to [`Self::open_program`] on a fresh
+    /// source to select it.
+    pub fn programs(&self) -> &[TsProgram] {
+        &self.programs
+    }
+
+    /// The `program_number` whose PMT this demuxer is currently
+    /// reading streams from.
+    pub fn selected_program(&self) -> u16 {
+        self.selected_program
     }
 
     /// Pull one TS packet from the input and, if it's for a stream we
@@ -862,6 +946,119 @@ mod tests {
         assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h264");
         let pkt = dmx.next_packet().expect("first PES across multi-PMT path");
         assert_eq!(pkt.pts, Some(7777));
+    }
+
+    /// PSI CRC-32/MPEG-2 — shared by the multi-program test below.
+    fn crc32_mpeg2(data: &[u8]) -> u32 {
+        let mut c: u32 = 0xFFFF_FFFF;
+        for &b in data {
+            c ^= (b as u32) << 24;
+            for _ in 0..8 {
+                c = if c & 0x8000_0000 != 0 {
+                    (c << 1) ^ 0x04C1_1DB7
+                } else {
+                    c << 1
+                };
+            }
+        }
+        c
+    }
+
+    /// Build a TS whose PAT lists two programs (1 → PMT 0x100, 2 → PMT
+    /// 0x200), each with a distinct elementary stream type. Only the
+    /// selected program's PMT + PES are materialised; the other PMT is
+    /// present so the demuxer must skip it.
+    fn synth_two_program_ts() -> Vec<u8> {
+        fn ts_psi(pid: u16, cc: u8, section: &[u8]) -> [u8; TS_PACKET_LEN] {
+            let mut pkt = [0xFFu8; TS_PACKET_LEN];
+            pkt[0] = TS_SYNC_BYTE;
+            pkt[1] = 0b0100_0000 | ((pid >> 8) as u8 & 0x1F);
+            pkt[2] = pid as u8;
+            pkt[3] = 0b0001_0000 | (cc & 0x0F);
+            pkt[4] = 0; // pointer_field
+            let take = (TS_PACKET_LEN - 5).min(section.len());
+            pkt[5..5 + take].copy_from_slice(&section[..take]);
+            pkt
+        }
+        // PAT: program 1 → 0x100, program 2 → 0x200.
+        let mut pat = vec![
+            0x00, 0xB0, 0x11, // table_id, ssi+len=17
+            0x00, 0x01, // tsid
+            0xC1, 0x00, 0x00, // version/cni, section, last
+            0x00, 0x01, 0xE1, 0x00, // program 1 → 0x100
+            0x00, 0x02, 0xE2, 0x00, // program 2 → 0x200
+        ];
+        let c = crc32_mpeg2(&pat);
+        pat.extend_from_slice(&c.to_be_bytes());
+
+        // PMT for program 2: one MPEG-2 video (0x02) stream on 0x201.
+        let mut pmt2 = vec![
+            0x02, 0xB0, 0x12, 0x00, 0x02, // program_number = 2
+            0xC1, 0x00, 0x00, 0xE2, 0x01, // pcr_pid = 0x201
+            0xF0, 0x00, // program_info_length = 0
+            0x02, 0xE2, 0x01, 0xF0, 0x00, // stream_type 0x02, pid 0x201
+        ];
+        let c2 = crc32_mpeg2(&pmt2);
+        pmt2.extend_from_slice(&c2.to_be_bytes());
+
+        // PMT for program 1: one AVC (0x1B) stream on 0x101.
+        let mut pmt1 = vec![
+            0x02, 0xB0, 0x12, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x01, 0xF0, 0x00, 0x1B, 0xE1,
+            0x01, 0xF0, 0x00,
+        ];
+        let c1 = crc32_mpeg2(&pmt1);
+        pmt1.extend_from_slice(&c1.to_be_bytes());
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ts_psi(0x0000, 0, &pat));
+        buf.extend_from_slice(&ts_psi(0x0100, 0, &pmt1));
+        buf.extend_from_slice(&ts_psi(0x0200, 0, &pmt2));
+        buf
+    }
+
+    #[test]
+    fn default_open_selects_first_program_and_lists_all() {
+        let bytes = synth_two_program_ts();
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let dmx = MpegTsDemuxer::new(cursor).expect("open");
+        // Both programs enumerated, network PID excluded.
+        assert_eq!(
+            dmx.programs(),
+            &[
+                TsProgram {
+                    program_number: 1,
+                    pmt_pid: 0x100
+                },
+                TsProgram {
+                    program_number: 2,
+                    pmt_pid: 0x200
+                },
+            ]
+        );
+        // Default selection is program 1 → AVC.
+        assert_eq!(dmx.selected_program(), 1);
+        assert_eq!(dmx.streams().len(), 1);
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h264");
+    }
+
+    #[test]
+    fn open_program_selects_second_program() {
+        let bytes = synth_two_program_ts();
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let dmx = MpegTsDemuxer::open_program(cursor, 2).expect("open program 2");
+        assert_eq!(dmx.selected_program(), 2);
+        assert_eq!(dmx.streams().len(), 1);
+        // Program 2's stream is MPEG-2 video.
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mpeg2video");
+    }
+
+    #[test]
+    fn open_program_rejects_unknown_program_number() {
+        let bytes = synth_two_program_ts();
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let err = MpegTsDemuxer::open_program(cursor, 9).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("program_number 9"), "got: {msg}");
     }
 
     #[test]
