@@ -73,6 +73,17 @@ pub const TDT_TABLE_ID: u8 = 0x70;
 /// TOT (Time Offset Table) `table_id` (ETSI EN 300 468 §5.2.6 /
 /// Table 9 — `0x73`).
 pub const TOT_TABLE_ID: u8 = 0x73;
+/// BAT (Bouquet Association Table) `table_id` (ETSI EN 300 468 §5.2.2 /
+/// Table 4 — `0x4A`). All BAT sections share this single value; the
+/// `bouquet_id` rides in the `table_id_extension` slot.
+pub const BAT_TABLE_ID: u8 = 0x4A;
+/// RST (Running Status Table) `table_id` (ETSI EN 300 468 §5.2.7 /
+/// Table 10 — `0x71`). The RST is a short-form section.
+pub const RST_TABLE_ID: u8 = 0x71;
+/// ST (Stuffing Table) `table_id` (ETSI EN 300 468 §5.2.8 / Table 11 —
+/// `0x72`). The ST carries `data_byte`s with no meaning and is used to
+/// invalidate sections at a delivery-system boundary.
+pub const ST_TABLE_ID: u8 = 0x72;
 
 /// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
 pub const PAT_PID: u16 = 0x0000;
@@ -93,6 +104,12 @@ pub const NIT_PID: u16 = 0x0010;
 /// Fixed PID carrying the DVB TDT and TOT sections (ETSI EN 300 468
 /// §5.1.3 Table 1 / §5.2.5 / §5.2.6 — `0x0014`).
 pub const TDT_TOT_PID: u16 = 0x0014;
+/// Fixed PID carrying the DVB RST sections (ETSI EN 300 468 §5.1.3
+/// Table 1 / §5.2.7 — `0x0013`).
+pub const RST_PID: u16 = 0x0013;
+/// Fixed PID carrying the DVB BAT sections — shared with the SDT / ST
+/// on PID `0x0011` (ETSI EN 300 468 §5.1.3 Table 1 / §5.2.2).
+pub const BAT_PID: u16 = 0x0011;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
@@ -551,6 +568,184 @@ impl NetworkInformationTable {
     }
 
     /// Walk the network-level descriptor() loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// One `transport_stream_loop` entry of a [`BouquetAssociationTable`]
+/// (ETSI EN 300 468 §5.2.2 Table 4).
+///
+/// Structurally identical to a NIT TS entry: the `(transport_stream_id,
+/// original_network_id)` pair followed by a per-TS descriptor loop.
+#[derive(Debug, Clone)]
+pub struct BatTransportStream {
+    /// 16-bit `transport_stream_id`.
+    pub transport_stream_id: u16,
+    /// 16-bit `original_network_id`.
+    pub original_network_id: u16,
+    /// Raw bytes of this TS entry's descriptor() loop — walk with
+    /// [`Self::iter_descriptors`].
+    pub descriptors: Vec<u8>,
+}
+
+impl BatTransportStream {
+    /// Walk this TS entry's descriptor() loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Parsed Bouquet Association Table per ETSI EN 300 468 §5.2.2 (Table 4).
+///
+/// A *bouquet* is a collection of services that may traverse the
+/// boundary of a network; the BAT groups services into a marketable
+/// package independent of how the underlying TSs are physically
+/// organized (which is what the NIT describes). The BAT shares the SDT's
+/// fixed PID [`BAT_PID`] (`0x0011`) and every BAT section takes
+/// `table_id == 0x4A` ([`BAT_TABLE_ID`]); the `bouquet_id` rides in the
+/// `table_id_extension` slot.
+///
+/// On the wire the section body is byte-for-byte the same shape as the
+/// NIT: a bouquet-level descriptor loop (commonly the
+/// `bouquet_name_descriptor`, tag `0x47`) followed by a
+/// `transport_stream_loop` whose entries each carry their own descriptor
+/// loop. Like the other long-form tables it may be segmented across the
+/// [`BAT_PID`] stream and reassembled with [`PsiSectionAssembler`]
+/// before parsing.
+#[derive(Debug, Default, Clone)]
+pub struct BouquetAssociationTable {
+    /// `bouquet_id` (from `table_id_extension`).
+    pub bouquet_id: u16,
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// `current_next_indicator`.
+    pub current_next_indicator: bool,
+    /// `section_number`.
+    pub section_number: u8,
+    /// `last_section_number`.
+    pub last_section_number: u8,
+    /// Raw bytes of the bouquet-level descriptor() loop — walk with
+    /// [`Self::iter_descriptors`] (e.g. the `bouquet_name_descriptor`).
+    pub descriptors: Vec<u8>,
+    /// Transport-stream entries carried in this section.
+    pub transport_streams: Vec<BatTransportStream>,
+}
+
+impl BouquetAssociationTable {
+    /// `true` when `table_id` is the BAT classification (`0x4A`).
+    pub fn is_bat_table_id(table_id: u8) -> bool {
+        table_id == BAT_TABLE_ID
+    }
+
+    /// Parse a single BAT section. The slice must run from `table_id`
+    /// through the CRC trailer (i.e. the pointer_field has already been
+    /// skipped).
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        if table_id != BAT_TABLE_ID {
+            return Err(TsError::Unsupported(
+                "PSI table_id does not match expected value",
+            ));
+        }
+        let (hdr, body) = parse_section_header(section, BAT_TABLE_ID)?;
+        // Body layout (Table 4): reserved_future_use (4) +
+        // bouquet_descriptors_length (12) + bouquet descriptors +
+        // reserved_future_use (4) + transport_stream_loop_length (12) +
+        // TS loop.
+        if body.len() < 2 {
+            return Err(TsError::Truncated {
+                what: "BAT body",
+                have: body.len(),
+                need: 2,
+            });
+        }
+        let bouquet_descriptors_length =
+            (u16::from_be_bytes([body[0] & 0b0000_1111, body[1]])) as usize;
+        let bd_start = 2usize;
+        let bd_end = bd_start.checked_add(bouquet_descriptors_length).ok_or(
+            TsError::SectionLengthOverrun {
+                claimed: bouquet_descriptors_length,
+                have: body.len() - bd_start,
+            },
+        )?;
+        if bd_end > body.len() {
+            return Err(TsError::SectionLengthOverrun {
+                claimed: bouquet_descriptors_length,
+                have: body.len() - bd_start,
+            });
+        }
+        let descriptors = body[bd_start..bd_end].to_vec();
+
+        // transport_stream_loop_length (12 bits) gates the TS loop.
+        if bd_end + 2 > body.len() {
+            return Err(TsError::Truncated {
+                what: "BAT transport_stream_loop_length",
+                have: body.len() - bd_end,
+                need: 2,
+            });
+        }
+        let ts_loop_length =
+            (u16::from_be_bytes([body[bd_end] & 0b0000_1111, body[bd_end + 1]])) as usize;
+        let loop_start = bd_end + 2;
+        let loop_end =
+            loop_start
+                .checked_add(ts_loop_length)
+                .ok_or(TsError::SectionLengthOverrun {
+                    claimed: ts_loop_length,
+                    have: body.len() - loop_start,
+                })?;
+        if loop_end > body.len() {
+            return Err(TsError::SectionLengthOverrun {
+                claimed: ts_loop_length,
+                have: body.len() - loop_start,
+            });
+        }
+        let ts_loop = &body[loop_start..loop_end];
+
+        let mut transport_streams = Vec::new();
+        let mut i = 0;
+        // Each TS entry: transport_stream_id (16) + original_network_id
+        // (16) + reserved_future_use (4) + transport_descriptors_length
+        // (12) + descriptor loop. Fixed head = 6 bytes before descriptors.
+        while i + 6 <= ts_loop.len() {
+            let transport_stream_id = u16::from_be_bytes([ts_loop[i], ts_loop[i + 1]]);
+            let original_network_id = u16::from_be_bytes([ts_loop[i + 2], ts_loop[i + 3]]);
+            let transport_descriptors_length =
+                (u16::from_be_bytes([ts_loop[i + 4] & 0b0000_1111, ts_loop[i + 5]])) as usize;
+            let descr_start = i + 6;
+            let descr_end = descr_start
+                .checked_add(transport_descriptors_length)
+                .ok_or(TsError::SectionLengthOverrun {
+                    claimed: transport_descriptors_length,
+                    have: ts_loop.len() - descr_start,
+                })?;
+            if descr_end > ts_loop.len() {
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: transport_descriptors_length,
+                    have: ts_loop.len() - descr_start,
+                });
+            }
+            transport_streams.push(BatTransportStream {
+                transport_stream_id,
+                original_network_id,
+                descriptors: ts_loop[descr_start..descr_end].to_vec(),
+            });
+            i = descr_end;
+        }
+
+        Ok(Self {
+            bouquet_id: hdr.table_id_extension,
+            version_number: hdr.version_number,
+            current_next_indicator: hdr.current_next_indicator,
+            section_number: hdr.section_number,
+            last_section_number: hdr.last_section_number,
+            descriptors,
+            transport_streams,
+        })
+    }
+
+    /// Walk the bouquet-level descriptor() loop as typed TLV records.
     pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
         iter_descriptors(&self.descriptors)
     }
@@ -2557,6 +2752,128 @@ mod tests {
             SDT_ACTUAL_TABLE_ID
         ));
         assert!(!NetworkInformationTable::is_nit_table_id(PMT_TABLE_ID));
+    }
+
+    fn build_bouquet_name_descriptor(name: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x47u8, name.len() as u8];
+        v.extend_from_slice(name);
+        v
+    }
+
+    /// Build a full BAT section (table_id through CRC). The body is the
+    /// same shape as the NIT, so the NIT builders are reused for the TS
+    /// loop entries.
+    fn build_bat_section(
+        bouquet_id: u16,
+        version: u8,
+        bouquet_descriptors: &[u8],
+        ts_entries: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let ts_loop_len: usize = ts_entries.iter().map(|e| e.len()).sum();
+        let body_len = 2 + bouquet_descriptors.len() + 2 + ts_loop_len;
+        let section_length = 5 + body_len + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(BAT_TABLE_ID);
+        let len_hi = 0b1011_0000 | ((section_length >> 8) & 0x0F) as u8;
+        s.push(len_hi);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(&bouquet_id.to_be_bytes());
+        s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
+        s.push(0); // section_number
+        s.push(0); // last_section_number
+                   // reserved_future_use (4) | bouquet_descriptors_length (12).
+        let bd_len = bouquet_descriptors.len() as u16;
+        s.push(0b1111_0000 | ((bd_len >> 8) & 0x0F) as u8);
+        s.push((bd_len & 0xFF) as u8);
+        s.extend_from_slice(bouquet_descriptors);
+        // reserved_future_use (4) | transport_stream_loop_length (12).
+        let tsl = ts_loop_len as u16;
+        s.push(0b1111_0000 | ((tsl >> 8) & 0x0F) as u8);
+        s.push((tsl & 0xFF) as u8);
+        for e in ts_entries {
+            s.extend_from_slice(e);
+        }
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    #[test]
+    fn bat_with_bouquet_name_and_ts_loop() {
+        let bn = build_bouquet_name_descriptor(b"Sky Sports");
+        let ts0 = build_nit_ts(0x0010, 0x2024, &[]);
+        let ts1 = build_nit_ts(0x0011, 0x2024, &[]);
+        let section = build_bat_section(0x0042, 9, &bn, &[ts0, ts1]);
+        let bat = BouquetAssociationTable::parse(&section).unwrap();
+        assert_eq!(bat.bouquet_id, 0x0042);
+        assert_eq!(bat.version_number, 9);
+        assert!(bat.current_next_indicator);
+        // bouquet-level descriptor decodes to a BouquetName body.
+        let d = bat.iter_descriptors().next().unwrap().unwrap();
+        match d.body {
+            crate::descriptor::DescriptorBody::BouquetName(n) => {
+                assert_eq!(n.bouquet_name, b"Sky Sports");
+            }
+            other => panic!("expected BouquetName, got {other:?}"),
+        }
+        assert_eq!(bat.transport_streams.len(), 2);
+        assert_eq!(bat.transport_streams[0].transport_stream_id, 0x0010);
+        assert_eq!(bat.transport_streams[0].original_network_id, 0x2024);
+        assert_eq!(bat.transport_streams[1].transport_stream_id, 0x0011);
+    }
+
+    #[test]
+    fn bat_empty_loops() {
+        let section = build_bat_section(0x0001, 0, &[], &[]);
+        let bat = BouquetAssociationTable::parse(&section).unwrap();
+        assert_eq!(bat.bouquet_id, 0x0001);
+        assert!(bat.descriptors.is_empty());
+        assert!(bat.transport_streams.is_empty());
+    }
+
+    #[test]
+    fn bat_per_ts_descriptor_loop() {
+        // A TS entry carrying a descriptor in its own loop is parsed and
+        // the per-TS descriptor block is walkable.
+        let raw = vec![0x83u8, 0x02, 0xDE, 0xAD]; // tag 0x83 (raw) len 2
+        let ts0 = build_nit_ts(0x00C8, 0x1000, &raw);
+        let section = build_bat_section(0x0002, 1, &[], &[ts0]);
+        let bat = BouquetAssociationTable::parse(&section).unwrap();
+        assert_eq!(bat.transport_streams.len(), 1);
+        let entry = &bat.transport_streams[0];
+        let d = entry.iter_descriptors().next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x83);
+        assert_eq!(d.data, &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn bat_rejects_wrong_table_id() {
+        // A NIT section fed to the BAT parser must be rejected.
+        let section = build_nit_section(NIT_ACTUAL_TABLE_ID, 0x0001, 1, &[], &[]);
+        assert!(BouquetAssociationTable::parse(&section).is_err());
+    }
+
+    #[test]
+    fn bat_crc_mismatch_rejected() {
+        let bn = build_bouquet_name_descriptor(b"Pkg");
+        let mut section = build_bat_section(0x1234, 1, &bn, &[]);
+        let last = section.len() - 1;
+        section[last] ^= 0xFF;
+        assert!(matches!(
+            BouquetAssociationTable::parse(&section),
+            Err(TsError::PsiCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn bat_is_bat_table_id() {
+        assert!(BouquetAssociationTable::is_bat_table_id(BAT_TABLE_ID));
+        assert!(!BouquetAssociationTable::is_bat_table_id(
+            NIT_ACTUAL_TABLE_ID
+        ));
+        assert!(!BouquetAssociationTable::is_bat_table_id(
+            SDT_ACTUAL_TABLE_ID
+        ));
     }
 
     #[test]

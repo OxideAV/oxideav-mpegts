@@ -11,6 +11,28 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `BouquetAssociationTable` — the DVB Bouquet Association Table (BAT,
+  ETSI EN 300 468 §5.2.2 / Table 4) carried on the SDT's fixed PID
+  `0x0011` (`BAT_PID`) with `table_id == 0x4A` (`BAT_TABLE_ID`). A
+  *bouquet* groups services into a marketable package that may cross
+  network boundaries, independent of the physical multiplex layout the
+  NIT describes. `BouquetAssociationTable::parse` reads a section into
+  the `bouquet_id` (from `table_id_extension`), the standard version /
+  section bookkeeping, the bouquet-level descriptor loop, and a typed
+  `transport_stream_loop` of `BatTransportStream` entries — each pairing
+  `(transport_stream_id, original_network_id)` with its own descriptor
+  loop (`BatTransportStream::iter_descriptors`). The body is byte-for-
+  byte the same shape as the NIT, so sections may be reassembled with
+  `PsiSectionAssembler` before parsing and a wrong `table_id` / bad CRC
+  is rejected with `TsError`.
+- `BouquetNameDescriptor` — typed view of the DVB
+  `bouquet_name_descriptor` (tag `0x47`, ETSI EN 300 468 §6.2.4 /
+  Table 21). The entire descriptor payload is the `bouquet_name` run
+  (no inner length prefix), exposed as raw bytes — the annex-A
+  character-table selection is left to the caller, consistent with the
+  `network_name_descriptor`. This is the bouquet-level descriptor a BAT
+  usually carries to name the bouquet, lifted through
+  `BouquetAssociationTable::iter_descriptors`.
 - Multi-program demux selection — `MpegTsDemuxer` now collects every
   non-network program the PAT advertises (§2.4.4.5) into a typed
   `TsProgram { program_number, pmt_pid }` list exposed via

@@ -58,7 +58,7 @@
 //! ## What's NOT in scope
 //!
 //! - PSIP / DVB SI tables beyond PAT + PMT + CAT + TSDT + SDT + EIT +
-//!   NIT + TDT + TOT (no BAT / RST yet). The SDT
+//!   NIT + BAT + TDT + TOT (no RST yet). The SDT
 //!   ([`psi::ServiceDescriptionTable`], ETSI EN 300 468 §5.2.3) is
 //!   parsed including its per-service `service_descriptor` (tag `0x48`)
 //!   for human-readable service / provider names. The EIT
@@ -96,13 +96,13 @@ pub use clock::{
 };
 pub use descriptor::{
     iter_descriptors, parse_descriptors, Ac3Descriptor, AudioStreamDescriptor, AvcVideoDescriptor,
-    CaDescriptor, DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter,
-    DtsDescriptor, EnhancedAc3Descriptor, ExtendedEventDescriptor, ExtendedEventItem,
-    HevcVideoDescriptor, Iso639Language, LocalTimeOffsetDescriptor, LocalTimeOffsetEntry,
-    MaximumBitrateDescriptor, NetworkNameDescriptor, ServiceDescriptor, ShortEventDescriptor,
-    SmoothingBufferDescriptor, StdDescriptor, StreamIdentifierDescriptor, SubtitlingDescriptor,
-    SubtitlingEntry, SystemClockDescriptor, TeletextDescriptor, TeletextEntry,
-    VideoStreamDescriptor,
+    BouquetNameDescriptor, CaDescriptor, DataStreamAlignmentDescriptor, Descriptor, DescriptorBody,
+    DescriptorIter, DtsDescriptor, EnhancedAc3Descriptor, ExtendedEventDescriptor,
+    ExtendedEventItem, HevcVideoDescriptor, Iso639Language, LocalTimeOffsetDescriptor,
+    LocalTimeOffsetEntry, MaximumBitrateDescriptor, NetworkNameDescriptor, ServiceDescriptor,
+    ShortEventDescriptor, SmoothingBufferDescriptor, StdDescriptor, StreamIdentifierDescriptor,
+    SubtitlingDescriptor, SubtitlingEntry, SystemClockDescriptor, TeletextDescriptor,
+    TeletextEntry, VideoStreamDescriptor,
 };
 pub use error::TsError;
 pub use packet::{
@@ -111,16 +111,17 @@ pub use packet::{
 };
 pub use pes::{PStdBuffer, PesExtension, PesPacket, PesReassembler, ProgramPacketSequenceCounter};
 pub use psi::{
-    decode_utc_time, iter_sections, mpeg2_crc32, ConditionalAccessTable, EitDateTime, EitDuration,
-    EitEvent, EventInformationTable, NetworkInformationTable, NitTransportStream, PmtStream,
-    ProgramAssociationTable, ProgramMapTable, PsiSectionAssembler, RunningStatus, SdtService,
-    SectionIter, ServiceDescriptionTable, TimeDateTable, TimeOffsetTable,
-    TransportStreamDescriptionTable, CAT_PID, CAT_TABLE_ID, EIT_ACTUAL_PF_TABLE_ID,
+    decode_utc_time, iter_sections, mpeg2_crc32, BatTransportStream, BouquetAssociationTable,
+    ConditionalAccessTable, EitDateTime, EitDuration, EitEvent, EventInformationTable,
+    NetworkInformationTable, NitTransportStream, PmtStream, ProgramAssociationTable,
+    ProgramMapTable, PsiSectionAssembler, RunningStatus, SdtService, SectionIter,
+    ServiceDescriptionTable, TimeDateTable, TimeOffsetTable, TransportStreamDescriptionTable,
+    BAT_PID, BAT_TABLE_ID, CAT_PID, CAT_TABLE_ID, EIT_ACTUAL_PF_TABLE_ID,
     EIT_ACTUAL_SCHEDULE_FIRST, EIT_ACTUAL_SCHEDULE_LAST, EIT_OTHER_PF_TABLE_ID,
     EIT_OTHER_SCHEDULE_FIRST, EIT_OTHER_SCHEDULE_LAST, EIT_PID, MAX_PSI_SECTION_LEN,
-    NIT_ACTUAL_TABLE_ID, NIT_OTHER_TABLE_ID, NIT_PID, PAT_PID, PAT_TABLE_ID, PMT_TABLE_ID,
-    SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SDT_PID, TDT_TABLE_ID, TDT_TOT_PID, TOT_TABLE_ID,
-    TSDT_PID, TSDT_TABLE_ID,
+    NIT_ACTUAL_TABLE_ID, NIT_OTHER_TABLE_ID, NIT_PID, PAT_PID, PAT_TABLE_ID, PMT_TABLE_ID, RST_PID,
+    RST_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SDT_PID, ST_TABLE_ID, TDT_TABLE_ID,
+    TDT_TOT_PID, TOT_TABLE_ID, TSDT_PID, TSDT_TABLE_ID,
 };
 pub use stream_type::StreamType;
 

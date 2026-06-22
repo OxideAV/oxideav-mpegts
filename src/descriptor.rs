@@ -43,6 +43,7 @@
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
 //! | `0x40` | network_name_descriptor (EN 300 468 §6.2.27) | [`DescriptorBody::NetworkName`]  |
+//! | `0x47` | bouquet_name_descriptor (EN 300 468 §6.2.4) | [`DescriptorBody::BouquetName`]  |
 //! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
 //! | `0x4D` | short_event_descriptor (EN 300 468 §6.2.37) | [`DescriptorBody::ShortEvent`]     |
 //! | `0x52` | stream_identifier_descriptor (EN 300 468 §6.2.39) | [`DescriptorBody::StreamIdentifier`] |
@@ -145,6 +146,10 @@ pub enum DescriptorBody<'a> {
     /// §6.2.27 Table 81). Carried in the NIT network-level descriptor
     /// loop; names the delivery system the NIT informs about.
     NetworkName(NetworkNameDescriptor<'a>),
+    /// `0x47` bouquet_name_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.4 Table 21). Carried in the BAT bouquet-level descriptor
+    /// loop; names the bouquet the BAT sub_table informs about.
+    BouquetName(BouquetNameDescriptor<'a>),
     /// `0x58` local_time_offset_descriptor — DVB SI extension (ETSI
     /// EN 300 468 §6.2.20 Table 69). Carried in the TOT descriptor loop;
     /// describes country-specific local-time-offset transitions.
@@ -572,6 +577,25 @@ pub struct NetworkNameDescriptor<'a> {
     /// Raw `network_name` bytes (DVB text string, annex A) — the entire
     /// descriptor payload.
     pub network_name: &'a [u8],
+}
+
+/// bouquet_name_descriptor body (ETSI EN 300 468 §6.2.4 Table 21).
+///
+/// A DVB Service Information extension to the ISO/IEC 13818-1 descriptor
+/// space, carried inside the bouquet-level descriptor loop of a
+/// [`crate::psi::BouquetAssociationTable`] section. It carries the
+/// human-readable name of the bouquet the BAT sub_table informs about.
+///
+/// Like the `network_name_descriptor` the whole descriptor payload is
+/// the name run — there is no length-prefix or terminator inside it; the
+/// `descriptor_length` of the TLV envelope bounds the field. The bytes
+/// are exposed **raw** (DVB text string, annex A) so the caller chooses
+/// the character-table interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BouquetNameDescriptor<'a> {
+    /// Raw `bouquet_name` bytes (DVB text string, annex A) — the entire
+    /// descriptor payload.
+    pub bouquet_name: &'a [u8],
 }
 
 /// video_stream_descriptor body (§2.6.2 Table 2-46).
@@ -1191,6 +1215,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
         0x40 => DescriptorBody::NetworkName(NetworkNameDescriptor { network_name: data }),
+        0x47 => DescriptorBody::BouquetName(BouquetNameDescriptor { bouquet_name: data }),
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
         0x4D => decode_short_event(data).unwrap_or(DescriptorBody::Raw),
         0x4E => decode_extended_event(data).unwrap_or(DescriptorBody::Raw),
@@ -3460,6 +3485,30 @@ mod tests {
                 assert_eq!(n.network_name, b"Example Network");
             }
             other => panic!("expected NetworkName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bouquet_name_descriptor_decodes_whole_payload() {
+        // The whole descriptor payload is the name run (no inner length).
+        let block = tlv(0x47, b"Movie Bouquet");
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x47);
+        match d.body {
+            DescriptorBody::BouquetName(n) => {
+                assert_eq!(n.bouquet_name, b"Movie Bouquet");
+            }
+            other => panic!("expected BouquetName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bouquet_name_descriptor_empty_is_legal() {
+        let block = tlv(0x47, b"");
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::BouquetName(n) => assert!(n.bouquet_name.is_empty()),
+            other => panic!("expected BouquetName, got {other:?}"),
         }
     }
 
