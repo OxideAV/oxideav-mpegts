@@ -788,6 +788,89 @@ impl RunningStatus {
     }
 }
 
+/// One entry from the Running Status Table loop (ETSI EN 300 468 §5.2.7
+/// Table 10).
+///
+/// Each entry locates a single event by the `(transport_stream_id,
+/// original_network_id, service_id, event_id)` tuple and carries the
+/// updated [`RunningStatus`] for it. The `service_id` equals the
+/// `program_number` in the corresponding program_map_section (except for
+/// NVOD reference services), exactly as in the SDT/EIT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RstEntry {
+    /// 16-bit `transport_stream_id`.
+    pub transport_stream_id: u16,
+    /// 16-bit `original_network_id`.
+    pub original_network_id: u16,
+    /// 16-bit `service_id`.
+    pub service_id: u16,
+    /// 16-bit `event_id`.
+    pub event_id: u16,
+    /// 3-bit `running_status` (Table 6).
+    pub running_status: RunningStatus,
+}
+
+/// Parsed Running Status Table per ETSI EN 300 468 §5.2.7 (Table 10).
+///
+/// The RST allows accurate and rapid updating of the timing status of
+/// one or more events — useful when an event starts early or late due to
+/// scheduling changes, since a dedicated table updates faster than a full
+/// EIT refresh. It is carried on the fixed PID [`RST_PID`] (`0x0013`)
+/// with `table_id == 0x71` ([`RST_TABLE_ID`]).
+///
+/// Unlike the long-form tables the RST is a **short-form** section:
+/// `section_syntax_indicator == 0`, so there is no `table_id_extension`
+/// / `version_number` / `section_number` header and **no CRC-32**. The
+/// body is a flat run of fixed 9-byte [`RstEntry`] records that begins
+/// immediately after the 12-bit `section_length`.
+#[derive(Debug, Default, Clone)]
+pub struct RunningStatusTable {
+    /// Event status entries carried in this section.
+    pub entries: Vec<RstEntry>,
+}
+
+impl RunningStatusTable {
+    /// Length of one Table-10 entry: 4 × 16-bit fields + reserved/
+    /// running_status byte = 9 bytes.
+    const ENTRY_LEN: usize = 9;
+
+    /// Parse a single RST section. The slice must run from `table_id`
+    /// through the end of the section (the pointer_field has already been
+    /// skipped). The RST has no CRC, so the whole body is entries.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        if table_id != RST_TABLE_ID {
+            return Err(TsError::Unsupported(
+                "PSI table_id does not match expected value",
+            ));
+        }
+        let body = parse_short_section_body(section)?;
+        // The body is a flat run of 9-byte entries; any trailing partial
+        // entry is a malformed section.
+        if body.len() % Self::ENTRY_LEN != 0 {
+            return Err(TsError::Truncated {
+                what: "RST entry",
+                have: body.len() % Self::ENTRY_LEN,
+                need: Self::ENTRY_LEN,
+            });
+        }
+        let mut entries = Vec::with_capacity(body.len() / Self::ENTRY_LEN);
+        let mut i = 0;
+        while i + Self::ENTRY_LEN <= body.len() {
+            entries.push(RstEntry {
+                transport_stream_id: u16::from_be_bytes([body[i], body[i + 1]]),
+                original_network_id: u16::from_be_bytes([body[i + 2], body[i + 3]]),
+                service_id: u16::from_be_bytes([body[i + 4], body[i + 5]]),
+                event_id: u16::from_be_bytes([body[i + 6], body[i + 7]]),
+                // reserved_future_use (5) | running_status (3).
+                running_status: RunningStatus::from_bits(body[i + 8]),
+            });
+            i += Self::ENTRY_LEN;
+        }
+        Ok(Self { entries })
+    }
+}
+
 /// One service entry from the SDT service loop (ETSI EN 300 468
 /// §5.2.3 Table 5).
 #[derive(Debug, Clone)]
@@ -3267,5 +3350,101 @@ mod tests {
         // section_length claims 5 but a TOT needs UTC(5)+declen(2)+CRC(4).
         let section = vec![TOT_TABLE_ID, 0b0011_0000, 0x05, 0, 0, 0, 0, 0];
         assert!(TimeOffsetTable::parse(&section).is_err());
+    }
+
+    fn build_rst_entry(tsid: u16, onid: u16, sid: u16, eid: u16, status: u8) -> Vec<u8> {
+        let mut e = Vec::with_capacity(9);
+        e.extend_from_slice(&tsid.to_be_bytes());
+        e.extend_from_slice(&onid.to_be_bytes());
+        e.extend_from_slice(&sid.to_be_bytes());
+        e.extend_from_slice(&eid.to_be_bytes());
+        // reserved_future_use (5) | running_status (3).
+        e.push(0b1111_1000 | (status & 0b0000_0111));
+        e
+    }
+
+    fn build_rst_section(entries: &[Vec<u8>]) -> Vec<u8> {
+        // Short-form section (no CRC): table_id, ssi=0 + '0' + reserved +
+        // 12-bit section_length, then the flat entry run.
+        let body_len: usize = entries.iter().map(|e| e.len()).sum();
+        let section_length = body_len;
+        let mut s = Vec::new();
+        s.push(RST_TABLE_ID);
+        s.push(0b0011_0000 | ((section_length >> 8) & 0x0F) as u8);
+        s.push((section_length & 0xFF) as u8);
+        for e in entries {
+            s.extend_from_slice(e);
+        }
+        s
+    }
+
+    #[test]
+    fn rst_single_entry() {
+        let e = build_rst_entry(0x0001, 0x2024, 0x0064, 0x1234, 4);
+        let section = build_rst_section(&[e]);
+        let rst = RunningStatusTable::parse(&section).unwrap();
+        assert_eq!(rst.entries.len(), 1);
+        let entry = rst.entries[0];
+        assert_eq!(entry.transport_stream_id, 0x0001);
+        assert_eq!(entry.original_network_id, 0x2024);
+        assert_eq!(entry.service_id, 0x0064);
+        assert_eq!(entry.event_id, 0x1234);
+        assert_eq!(entry.running_status, RunningStatus::Running);
+    }
+
+    #[test]
+    fn rst_multiple_entries() {
+        let e0 = build_rst_entry(0x0001, 0x2024, 0x0064, 0x1111, 1);
+        let e1 = build_rst_entry(0x0002, 0x2024, 0x0065, 0x2222, 5);
+        let section = build_rst_section(&[e0, e1]);
+        let rst = RunningStatusTable::parse(&section).unwrap();
+        assert_eq!(rst.entries.len(), 2);
+        assert_eq!(rst.entries[0].running_status, RunningStatus::NotRunning);
+        assert_eq!(rst.entries[0].event_id, 0x1111);
+        assert_eq!(rst.entries[1].running_status, RunningStatus::OffAir);
+        assert_eq!(rst.entries[1].service_id, 0x0065);
+    }
+
+    #[test]
+    fn rst_empty_is_legal() {
+        let section = build_rst_section(&[]);
+        let rst = RunningStatusTable::parse(&section).unwrap();
+        assert!(rst.entries.is_empty());
+    }
+
+    #[test]
+    fn rst_partial_entry_rejected() {
+        // section_length claims 9 entry bytes but only 5 are present.
+        let section = vec![RST_TABLE_ID, 0b0011_0000, 0x09, 0, 0, 0, 0, 0];
+        assert!(matches!(
+            RunningStatusTable::parse(&section),
+            Err(TsError::SectionLengthOverrun { .. })
+        ));
+    }
+
+    #[test]
+    fn rst_trailing_partial_entry_rejected() {
+        // A full 9-byte entry plus 3 trailing bytes — not a whole entry.
+        let mut section = build_rst_section(&[build_rst_entry(1, 1, 1, 1, 4)]);
+        // Bump section_length by 3 and append 3 bytes.
+        section[2] += 3;
+        section.extend_from_slice(&[0, 0, 0]);
+        assert!(matches!(
+            RunningStatusTable::parse(&section),
+            Err(TsError::Truncated {
+                what: "RST entry",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rst_wrong_table_id_rejected() {
+        let mut section = build_rst_section(&[build_rst_entry(1, 1, 1, 1, 4)]);
+        section[0] = TDT_TABLE_ID;
+        assert!(matches!(
+            RunningStatusTable::parse(&section),
+            Err(TsError::Unsupported(_))
+        ));
     }
 }

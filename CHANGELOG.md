@@ -11,6 +11,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `RunningStatusTable` — the DVB Running Status Table (RST, ETSI
+  EN 300 468 §5.2.7 / Table 10) carried on the fixed PID `0x0013`
+  (`RST_PID`) with `table_id == 0x71` (`RST_TABLE_ID`). The RST is the
+  fast event-status update channel — a dedicated table refreshes the
+  running status of one or more events quicker than a full EIT cycle
+  when an event starts early or late. Unlike the long-form tables it is
+  a **short-form** section (`section_syntax_indicator == 0`, no version
+  / section header and **no CRC**), so the whole body is a flat run of
+  fixed 9-byte `RstEntry` records, each locating an event by the
+  `(transport_stream_id, original_network_id, service_id, event_id)`
+  tuple and carrying its updated `RunningStatus`. A wrong `table_id`, a
+  body that isn't a whole number of entries, or a `section_length` that
+  overruns the section are all rejected with `TsError`.
 - `BouquetAssociationTable` — the DVB Bouquet Association Table (BAT,
   ETSI EN 300 468 §5.2.2 / Table 4) carried on the SDT's fixed PID
   `0x0011` (`BAT_PID`) with `table_id == 0x4A` (`BAT_TABLE_ID`). A
