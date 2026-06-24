@@ -11,6 +11,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `SelectionInformationTable` — the DVB Selection Information Table
+  (SIT, ETSI EN 300 468 §5.2.10 / §7.1.2 / Table 164) carried on the
+  fixed PID `0x001F` (`SIT_PID`) with `table_id == 0x7F`
+  (`SIT_TABLE_ID`). The SIT describes the services and events carried by
+  a **partial** TS — the kind produced when a single service is
+  extracted from a full multiplex (e.g. a personal-video recording).
+  Unlike the DIT it is a **long-form** section: `parse` CRC-verifies the
+  standard `version_number` / `section_number` / `last_section_number`
+  header (the same way as PAT/PMT/SDT), reads the SIT-wide
+  transmission-info descriptor loop (lifted by
+  `SelectionInformationTable::iter_descriptors` — the SIT-only
+  `partial_transport_stream_descriptor`, tag `0x63`, rides here), then a
+  loop of `SitService` entries each pairing a `service_id` and the
+  original present event's typed `running_status` with its own
+  descriptor loop (`SitService::iter_descriptors`). A wrong `table_id`,
+  a bad CRC, or a descriptor-length overrun is rejected with `TsError`.
 - `StuffingTable` — the DVB Stuffing Table (ST, ETSI EN 300 468 §5.2.8
   / Table 11) with `table_id == 0x72` (`ST_TABLE_ID`). The ST is the
   mechanism that **invalidates** existing sections at a delivery-system

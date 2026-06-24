@@ -987,6 +987,156 @@ impl DiscontinuityInformationTable {
     }
 }
 
+/// One service entry from the SIT service loop (ETSI EN 300 468
+/// §7.1.2 Table 164).
+///
+/// Each entry describes a service carried in the partial TS by its
+/// `service_id` (equal to the corresponding PMT `program_number` for
+/// normal services), the `running_status` of the **original present
+/// event** in that service, and a per-service descriptor loop carrying
+/// SI-related information on the service and event.
+#[derive(Debug, Clone)]
+pub struct SitService {
+    /// 16-bit `service_id` — equals the corresponding PMT
+    /// `program_number` for normal services (except NVOD reference
+    /// services with `service_type` 0x04 / 0x18 / 0x1B).
+    pub service_id: u16,
+    /// 3-bit `running_status` of the original present event. If no
+    /// present event exists in the original stream the status is
+    /// considered "not running".
+    pub running_status: RunningStatus,
+    /// Raw bytes of this service's `descriptor()` loop — walk with
+    /// [`Self::iter_descriptors`].
+    pub descriptors: Vec<u8>,
+}
+
+impl SitService {
+    /// Walk this service's descriptor loop as typed TLV records.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.descriptors)
+    }
+}
+
+/// Parsed DVB Selection Information Table per ETSI EN 300 468 §5.2.10 /
+/// §7.1.2 (Table 164).
+///
+/// The SIT describes the services and events carried by a **partial**
+/// TS — the kind produced when a single service is extracted from a
+/// full multiplex (e.g. a personal-video recording). It is carried on
+/// the fixed PID [`SIT_PID`] (`0x001F`) with `table_id == 0x7F`
+/// ([`SIT_TABLE_ID`]).
+///
+/// Unlike the DIT it is a **long-form** section: it carries the standard
+/// `version_number` / `section_number` / `last_section_number`
+/// bookkeeping and a CRC-32 (verified the same way as PAT/PMT/SDT).
+/// After the 8-byte header the body opens with a transmission-info
+/// descriptor loop (the SIT-only `partial_transport_stream_descriptor`,
+/// tag `0x63`, usually rides here), then a loop of [`SitService`]
+/// entries each with its own descriptor block. `section_number` and
+/// `last_section_number` are fixed at `0x00` per §7.1.2.
+#[derive(Debug, Default, Clone)]
+pub struct SelectionInformationTable {
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// `current_next_indicator`.
+    pub current_next_indicator: bool,
+    /// `section_number` (fixed at `0x00`).
+    pub section_number: u8,
+    /// `last_section_number` (fixed at `0x00`).
+    pub last_section_number: u8,
+    /// Raw bytes of the transmission-info descriptor loop (the SIT-wide
+    /// `descriptor()` loop describing the partial TS) — walk with
+    /// [`Self::iter_descriptors`].
+    pub transmission_info_descriptors: Vec<u8>,
+    /// Per-service entries.
+    pub services: Vec<SitService>,
+}
+
+impl SelectionInformationTable {
+    /// `table_id` this parser accepts (`0x7F`).
+    pub const TABLE_ID: u8 = SIT_TABLE_ID;
+
+    /// Parse a single SIT section. The slice must run from `table_id`
+    /// through the CRC trailer (the pointer_field has already been
+    /// skipped). The CRC-32 is verified the same way as a PAT/PMT/SDT
+    /// section.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let (hdr, body) = parse_section_header(section, SIT_TABLE_ID)?;
+        // Table 164 body after the long-form header:
+        //   reserved_future_use (4) | transmission_info_descriptors_length (12)
+        //   { descriptor() } ...
+        //   { service_id (16) | reserved (1) | running_status (3)
+        //     | service_descriptors_length (12) | descriptor() ... } ...
+        if body.len() < 2 {
+            return Err(TsError::Truncated {
+                what: "SIT transmission_info_descriptors_length",
+                have: body.len(),
+                need: 2,
+            });
+        }
+        let ti_len = (((body[0] as usize) & 0x0F) << 8) | body[1] as usize;
+        let ti_start = 2usize;
+        let ti_end = ti_start + ti_len;
+        if ti_end > body.len() {
+            return Err(TsError::SectionLengthOverrun {
+                claimed: ti_len,
+                have: body.len() - ti_start,
+            });
+        }
+        let transmission_info_descriptors = body[ti_start..ti_end].to_vec();
+
+        let mut services = Vec::new();
+        let mut i = ti_end;
+        while i < body.len() {
+            // 16-bit service_id + 1 byte (reserved|running_status) + 1 byte
+            // (running_status spillover|desc_len_hi) — the running_status
+            // and 12-bit service_descriptors_length share two bytes after
+            // service_id, so the fixed prefix is 4 bytes.
+            if i + 4 > body.len() {
+                return Err(TsError::Truncated {
+                    what: "SIT service entry",
+                    have: body.len() - i,
+                    need: 4,
+                });
+            }
+            let service_id = u16::from_be_bytes([body[i], body[i + 1]]);
+            // reserved_future_use (1) | running_status (3) | desc_len (12).
+            let running_status = RunningStatus::from_bits((body[i + 2] >> 4) & 0b0000_0111);
+            let desc_len = (((body[i + 2] as usize) & 0x0F) << 8) | body[i + 3] as usize;
+            let desc_start = i + 4;
+            let desc_end = desc_start + desc_len;
+            if desc_end > body.len() {
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: desc_len,
+                    have: body.len() - desc_start,
+                });
+            }
+            services.push(SitService {
+                service_id,
+                running_status,
+                descriptors: body[desc_start..desc_end].to_vec(),
+            });
+            i = desc_end;
+        }
+
+        Ok(Self {
+            version_number: hdr.version_number,
+            current_next_indicator: hdr.current_next_indicator,
+            section_number: hdr.section_number,
+            last_section_number: hdr.last_section_number,
+            transmission_info_descriptors,
+            services,
+        })
+    }
+
+    /// Walk the SIT's transmission-info descriptor loop as typed TLV
+    /// records. The `partial_transport_stream_descriptor` (tag `0x63`)
+    /// decodes to `DescriptorBody::PartialTransportStream`.
+    pub fn iter_descriptors(&self) -> DescriptorIter<'_> {
+        iter_descriptors(&self.transmission_info_descriptors)
+    }
+}
+
 /// One service entry from the SDT service loop (ETSI EN 300 468
 /// §5.2.3 Table 5).
 #[derive(Debug, Clone)]
@@ -3668,6 +3818,143 @@ mod tests {
         section[0] = SIT_TABLE_ID;
         assert!(matches!(
             DiscontinuityInformationTable::parse(&section),
+            Err(TsError::Unsupported(_))
+        ));
+    }
+
+    fn build_sit_service(service_id: u16, running_status: u8, descriptors: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(&service_id.to_be_bytes());
+        // reserved_future_use (1) | running_status (3) | desc_len (12).
+        let dlen = descriptors.len() as u16;
+        let b2 = 0b1000_0000 | ((running_status & 0b111) << 4) | ((dlen >> 8) & 0x0F) as u8;
+        s.push(b2);
+        s.push((dlen & 0xFF) as u8);
+        s.extend_from_slice(descriptors);
+        s
+    }
+
+    fn build_sit_section(
+        version: u8,
+        transmission_descriptors: &[u8],
+        services: &[Vec<u8>],
+    ) -> Vec<u8> {
+        // body = reserved|ti_len(2) + ti descriptors + Σ service entries.
+        let body_len: usize =
+            2 + transmission_descriptors.len() + services.iter().map(|s| s.len()).sum::<usize>();
+        // long-form section: 5 header bytes after section_length + body + CRC.
+        let section_length = 5 + body_len + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(SIT_TABLE_ID);
+        // section_syntax_indicator=1, '1', reserved=11, 12-bit length.
+        s.push(0b1111_0000 | ((section_length >> 8) & 0x0F) as u8);
+        s.push((section_length & 0xFF) as u8);
+        // table_id_extension = reserved_future_use (16 bits).
+        s.push(0xFF);
+        s.push(0xFF);
+        // reserved(2) | version(5) | current_next_indicator(1).
+        s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
+        s.push(0); // section_number (fixed 0x00)
+        s.push(0); // last_section_number (fixed 0x00)
+                   // reserved_future_use (4) | transmission_info_descriptors_length (12).
+        let ti = transmission_descriptors.len() as u16;
+        s.push(0xF0 | ((ti >> 8) & 0x0F) as u8);
+        s.push((ti & 0xFF) as u8);
+        s.extend_from_slice(transmission_descriptors);
+        for svc in services {
+            s.extend_from_slice(svc);
+        }
+        let crc = mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+
+    #[test]
+    fn sit_single_service_round_trip() {
+        let svc = build_sit_service(0x0064, 4, &[]);
+        let section = build_sit_section(3, &[], &[svc]);
+        let sit = SelectionInformationTable::parse(&section).unwrap();
+        assert_eq!(sit.version_number, 3);
+        assert!(sit.current_next_indicator);
+        assert_eq!(sit.section_number, 0);
+        assert_eq!(sit.last_section_number, 0);
+        assert!(sit.transmission_info_descriptors.is_empty());
+        assert_eq!(sit.services.len(), 1);
+        assert_eq!(sit.services[0].service_id, 0x0064);
+        assert_eq!(sit.services[0].running_status, RunningStatus::Running);
+        assert!(sit.services[0].descriptors.is_empty());
+    }
+
+    #[test]
+    fn sit_transmission_and_service_descriptors() {
+        // A transmission-info descriptor (tag 0x63, 8-byte body) plus a
+        // service whose loop carries one arbitrary descriptor.
+        let ti_desc = {
+            let mut d = vec![0x63u8, 0x08];
+            d.extend_from_slice(&[0; 8]);
+            d
+        };
+        let svc_desc = vec![0x48u8, 0x02, 0x01, 0x00];
+        let svc0 = build_sit_service(0x0001, 1, &svc_desc);
+        let svc1 = build_sit_service(0x0002, 5, &[]);
+        let section = build_sit_section(7, &ti_desc, &[svc0, svc1]);
+        let sit = SelectionInformationTable::parse(&section).unwrap();
+        assert_eq!(sit.transmission_info_descriptors, ti_desc);
+        assert_eq!(sit.iter_descriptors().count(), 1);
+        assert_eq!(sit.services.len(), 2);
+        assert_eq!(sit.services[0].service_id, 0x0001);
+        assert_eq!(sit.services[0].running_status, RunningStatus::NotRunning);
+        assert_eq!(sit.services[0].descriptors, svc_desc);
+        assert_eq!(sit.services[1].service_id, 0x0002);
+        assert_eq!(sit.services[1].running_status, RunningStatus::OffAir);
+    }
+
+    #[test]
+    fn sit_empty_service_loop_is_legal() {
+        let section = build_sit_section(0, &[], &[]);
+        let sit = SelectionInformationTable::parse(&section).unwrap();
+        assert!(sit.services.is_empty());
+        assert!(sit.transmission_info_descriptors.is_empty());
+    }
+
+    #[test]
+    fn sit_crc_mismatch_rejected() {
+        let mut section = build_sit_section(1, &[], &[build_sit_service(0x0001, 4, &[])]);
+        let last = section.len() - 1;
+        section[last] ^= 0xFF;
+        assert!(matches!(
+            SelectionInformationTable::parse(&section),
+            Err(TsError::PsiCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn sit_service_descriptor_overrun_rejected() {
+        // Build a valid section, then bump a service's desc_len past the
+        // body and re-CRC so only the overrun check can reject it.
+        let svc = build_sit_service(0x0001, 4, &[]);
+        let mut section = build_sit_section(1, &[], &[svc]);
+        // The service entry sits right after the 8-byte header + 2-byte
+        // ti-length field: indices 10 (sid hi), 11 (sid lo), 12 (b2),
+        // 13 (desc_len lo). Bump desc_len to 0x10 (16 bytes, past end).
+        section[13] = 0x10;
+        // Re-CRC over everything but the trailing 4 CRC bytes.
+        let crc_pos = section.len() - 4;
+        let crc = mpeg2_crc32(&section[..crc_pos]);
+        section[crc_pos..].copy_from_slice(&crc.to_be_bytes());
+        assert!(matches!(
+            SelectionInformationTable::parse(&section),
+            Err(TsError::SectionLengthOverrun { .. })
+        ));
+    }
+
+    #[test]
+    fn sit_wrong_table_id_rejected() {
+        let mut section = build_sit_section(1, &[], &[]);
+        section[0] = DIT_TABLE_ID;
+        // CRC check would also fail, but table_id check is first.
+        assert!(matches!(
+            SelectionInformationTable::parse(&section),
             Err(TsError::Unsupported(_))
         ));
     }
