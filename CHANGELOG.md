@@ -11,6 +11,30 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `StuffingTable` — the DVB Stuffing Table (ST, ETSI EN 300 468 §5.2.8
+  / Table 11) with `table_id == 0x72` (`ST_TABLE_ID`). The ST is the
+  mechanism that **invalidates** existing sections at a delivery-system
+  boundary (e.g. a cable head-end): when one section of a sub_table is
+  overwritten every section of that sub_table is stuffed out so the
+  `section_number` integrity is retained. It is a **short-form** section
+  whose `section_syntax_indicator` may be `0` or `1`, with no version /
+  section header and **no CRC**, so `StuffingTable::parse` surfaces the
+  `section_syntax_indicator` flag plus the raw `data_byte` run (which
+  has no meaning per §5.2.8). The ST may appear on any SI PID; a wrong
+  `table_id` or a `section_length` overrun is rejected with `TsError`.
+- `DiscontinuityInformationTable` — the DVB Discontinuity Information
+  Table (DIT, ETSI EN 300 468 §5.2.9 / §7.1.1 / Table 163) carried on
+  the fixed PID `0x001E` (`DIT_PID`) with `table_id == 0x7E`
+  (`DIT_TABLE_ID`). The DIT is inserted at transition points in a
+  **partial** TS where SI information may be discontinuous. It is a
+  **short-form** section (no version / section header, **no CRC**) with
+  a `section_length` fixed at `0x001`; `parse` decodes the single body
+  byte's top bit into `transition_flag` — `true` for a change of the
+  originating source (originating TS / position change, e.g. a
+  time-shift), `false` for a change of the selection only — and ignores
+  the 7 `reserved_future_use` bits. A wrong `table_id` or an empty body
+  is rejected with `TsError`. New public constants `DIT_TABLE_ID` /
+  `DIT_PID` / `SIT_TABLE_ID` / `SIT_PID`.
 - `RunningStatusTable` — the DVB Running Status Table (RST, ETSI
   EN 300 468 §5.2.7 / Table 10) carried on the fixed PID `0x0013`
   (`RST_PID`) with `table_id == 0x71` (`RST_TABLE_ID`). The RST is the

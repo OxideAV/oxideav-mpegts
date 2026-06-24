@@ -84,6 +84,15 @@ pub const RST_TABLE_ID: u8 = 0x71;
 /// `0x72`). The ST carries `data_byte`s with no meaning and is used to
 /// invalidate sections at a delivery-system boundary.
 pub const ST_TABLE_ID: u8 = 0x72;
+/// DIT (Discontinuity Information Table) `table_id` (ETSI EN 300 468
+/// §5.2.9 / §7.1.1 / Table 2 — `0x7E`). A short-form section inserted at
+/// transition points in a partial TS where SI information may be
+/// discontinuous.
+pub const DIT_TABLE_ID: u8 = 0x7E;
+/// SIT (Selection Information Table) `table_id` (ETSI EN 300 468 §5.2.10
+/// / §7.1.2 / Table 2 — `0x7F`). A long-form section describing the
+/// services and events carried by a partial TS.
+pub const SIT_TABLE_ID: u8 = 0x7F;
 
 /// PID reserved for the Program Association Table per §2.4.4.3 / Table 2-3.
 pub const PAT_PID: u16 = 0x0000;
@@ -110,6 +119,12 @@ pub const RST_PID: u16 = 0x0013;
 /// Fixed PID carrying the DVB BAT sections — shared with the SDT / ST
 /// on PID `0x0011` (ETSI EN 300 468 §5.1.3 Table 1 / §5.2.2).
 pub const BAT_PID: u16 = 0x0011;
+/// Fixed PID carrying the DVB DIT sections (ETSI EN 300 468 §5.1.3
+/// Table 1 — `0x001E`).
+pub const DIT_PID: u16 = 0x001E;
+/// Fixed PID carrying the DVB SIT sections (ETSI EN 300 468 §5.1.3
+/// Table 1 — `0x001F`).
+pub const SIT_PID: u16 = 0x001F;
 
 /// Header bytes common to every long-form PSI section (table_id +
 /// section_length field through last_section_number).
@@ -868,6 +883,107 @@ impl RunningStatusTable {
             i += Self::ENTRY_LEN;
         }
         Ok(Self { entries })
+    }
+}
+
+/// Parsed DVB Stuffing Table per ETSI EN 300 468 §5.2.8 (Table 11).
+///
+/// The ST is used to **invalidate** existing sections at a delivery-
+/// system boundary (e.g. a cable head-end). When one section of a
+/// sub_table is overwritten, every section of that sub_table must also
+/// be overwritten so that the `section_number` integrity is retained —
+/// the overwriting payload is an ST whose `data_byte`s carry no meaning.
+///
+/// The ST may appear on any of the SI PIDs (`0x0010`, `0x0011`,
+/// `0x0012`, `0x0013`, `0x0014`) — wherever an existing section is being
+/// stuffed out — with `table_id == 0x72` ([`ST_TABLE_ID`]). It is a
+/// **short-form** section: the `section_syntax_indicator` may be `0` or
+/// `1`, and there is no `version` / `section` header and **no CRC**, so
+/// the body is the raw run of `data_byte`s after the 12-bit
+/// `section_length`. The maximum section length is 4 096 bytes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StuffingTable {
+    /// `section_syntax_indicator` — may be `0` or `1` for the ST.
+    pub section_syntax_indicator: bool,
+    /// Raw `data_byte`s carried in this section. They have no meaning
+    /// per §5.2.8 and are surfaced verbatim only so a caller can confirm
+    /// the section was consumed (and skip the equivalent number of
+    /// bytes).
+    pub data_bytes: Vec<u8>,
+}
+
+impl StuffingTable {
+    /// `table_id` this parser accepts (`0x72`).
+    pub const TABLE_ID: u8 = ST_TABLE_ID;
+
+    /// Parse a single ST section. The slice must run from `table_id`
+    /// through the end of the section (the pointer_field has already been
+    /// skipped). The ST has no CRC, so the whole body is `data_byte`s.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        if table_id != ST_TABLE_ID {
+            return Err(TsError::Unsupported(
+                "PSI table_id does not match expected value",
+            ));
+        }
+        let section_syntax_indicator = (section[1] & 0b1000_0000) != 0;
+        let body = parse_short_section_body(section)?;
+        Ok(Self {
+            section_syntax_indicator,
+            data_bytes: body.to_vec(),
+        })
+    }
+}
+
+/// Parsed DVB Discontinuity Information Table per ETSI EN 300 468
+/// §5.2.9 / §7.1.1 (Table 163).
+///
+/// The DIT is inserted at transition points in a **partial** transport
+/// stream — for example a recording boundary — at which the SI
+/// information may be discontinuous. It is carried on the fixed PID
+/// [`DIT_PID`] (`0x001E`) with `table_id == 0x7E` ([`DIT_TABLE_ID`]).
+///
+/// It is a **short-form** section (`section_syntax_indicator == 0`, no
+/// version / section header and **no CRC**), and the `section_length` is
+/// fixed at `0x001`: the single body byte carries the
+/// [`Self::transition_flag`] in its top bit followed by 7
+/// `reserved_future_use` bits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DiscontinuityInformationTable {
+    /// `transition_flag` — when `true` the transition is due to a change
+    /// of the **originating source** (a change of originating TS and/or
+    /// of the position within the TS, e.g. a time-shift). When `false`
+    /// the transition is due to a change of the **selection** only,
+    /// staying within the same originating TS at the same position.
+    pub transition_flag: bool,
+}
+
+impl DiscontinuityInformationTable {
+    /// `table_id` this parser accepts (`0x7E`).
+    pub const TABLE_ID: u8 = DIT_TABLE_ID;
+
+    /// Parse a single DIT section. The slice must run from `table_id`
+    /// through the end of the section (the pointer_field has already been
+    /// skipped). The DIT has no CRC and a fixed one-byte body.
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let table_id = section.first().copied().unwrap_or(0);
+        if table_id != DIT_TABLE_ID {
+            return Err(TsError::Unsupported(
+                "PSI table_id does not match expected value",
+            ));
+        }
+        let body = parse_short_section_body(section)?;
+        // Table 163 body: transition_flag (1) + reserved_future_use (7).
+        if body.is_empty() {
+            return Err(TsError::Truncated {
+                what: "DIT body",
+                have: 0,
+                need: 1,
+            });
+        }
+        Ok(Self {
+            transition_flag: (body[0] & 0b1000_0000) != 0,
+        })
     }
 }
 
@@ -3444,6 +3560,114 @@ mod tests {
         section[0] = TDT_TABLE_ID;
         assert!(matches!(
             RunningStatusTable::parse(&section),
+            Err(TsError::Unsupported(_))
+        ));
+    }
+
+    fn build_st_section(ssi: bool, data: &[u8]) -> Vec<u8> {
+        // Short-form section (no CRC): table_id, ssi + '0' + reserved +
+        // 12-bit section_length, then the data_byte run.
+        let section_length = data.len();
+        let mut s = Vec::new();
+        s.push(ST_TABLE_ID);
+        let ssi_bit = if ssi { 0b1000_0000 } else { 0 };
+        s.push(ssi_bit | 0b0011_0000 | ((section_length >> 8) & 0x0F) as u8);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(data);
+        s
+    }
+
+    #[test]
+    fn st_data_bytes_round_trip() {
+        let section = build_st_section(false, &[0xFF, 0xFF, 0x00, 0x42]);
+        let st = StuffingTable::parse(&section).unwrap();
+        assert!(!st.section_syntax_indicator);
+        assert_eq!(st.data_bytes, vec![0xFF, 0xFF, 0x00, 0x42]);
+    }
+
+    #[test]
+    fn st_ssi_set_is_accepted() {
+        // §5.2.8: the ST's section_syntax_indicator may be 0b1 or 0b0.
+        let section = build_st_section(true, &[0x01, 0x02]);
+        let st = StuffingTable::parse(&section).unwrap();
+        assert!(st.section_syntax_indicator);
+        assert_eq!(st.data_bytes, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn st_empty_is_legal() {
+        let section = build_st_section(false, &[]);
+        let st = StuffingTable::parse(&section).unwrap();
+        assert!(st.data_bytes.is_empty());
+    }
+
+    #[test]
+    fn st_overrun_rejected() {
+        // section_length claims 4 data bytes but only 1 is present.
+        let section = vec![ST_TABLE_ID, 0b0011_0000, 0x04, 0x00];
+        assert!(matches!(
+            StuffingTable::parse(&section),
+            Err(TsError::SectionLengthOverrun { .. })
+        ));
+    }
+
+    #[test]
+    fn st_wrong_table_id_rejected() {
+        let mut section = build_st_section(false, &[0x00]);
+        section[0] = RST_TABLE_ID;
+        assert!(matches!(
+            StuffingTable::parse(&section),
+            Err(TsError::Unsupported(_))
+        ));
+    }
+
+    fn build_dit_section(transition: bool) -> Vec<u8> {
+        // Table 163: section_length is fixed at 0x001; the one body byte
+        // holds transition_flag (1) + reserved_future_use (7).
+        let body = if transition { 0b1111_1111 } else { 0b0111_1111 };
+        vec![DIT_TABLE_ID, 0b0000_0000, 0x01, body]
+    }
+
+    #[test]
+    fn dit_transition_flag_set() {
+        let dit = DiscontinuityInformationTable::parse(&build_dit_section(true)).unwrap();
+        assert!(dit.transition_flag);
+    }
+
+    #[test]
+    fn dit_transition_flag_clear() {
+        let dit = DiscontinuityInformationTable::parse(&build_dit_section(false)).unwrap();
+        assert!(!dit.transition_flag);
+    }
+
+    #[test]
+    fn dit_reserved_bits_ignored() {
+        // Only the top bit of the body byte is meaningful; the low 7 are
+        // reserved_future_use and must not influence transition_flag.
+        let section = vec![DIT_TABLE_ID, 0b0000_0000, 0x01, 0b0000_0000];
+        let dit = DiscontinuityInformationTable::parse(&section).unwrap();
+        assert!(!dit.transition_flag);
+    }
+
+    #[test]
+    fn dit_empty_body_rejected() {
+        // section_length 0 → no body byte → truncated.
+        let section = vec![DIT_TABLE_ID, 0b0000_0000, 0x00];
+        assert!(matches!(
+            DiscontinuityInformationTable::parse(&section),
+            Err(TsError::Truncated {
+                what: "DIT body",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dit_wrong_table_id_rejected() {
+        let mut section = build_dit_section(true);
+        section[0] = SIT_TABLE_ID;
+        assert!(matches!(
+            DiscontinuityInformationTable::parse(&section),
             Err(TsError::Unsupported(_))
         ));
     }
