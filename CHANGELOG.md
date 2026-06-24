@@ -11,6 +11,20 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `partial_transport_stream_descriptor` (tag `0x63`, ETSI EN 300 468
+  §7.2.1 / Table 165) decode — the SIT-only descriptor that conveys the
+  rate / smoothing parameters for controlling play-out and copying of a
+  partial TS. `DescriptorBody::PartialTransportStream` exposes the
+  22-bit `peak_rate` (with a `peak_rate_bits_per_second` helper), the
+  22-bit `minimum_overall_smoothing_rate`, and the 14-bit
+  `maximum_overall_smoothing_buffer`, both with `*_undefined` predicates
+  for the §7.2.1 all-ones sentinels (`0x3F_FFFF` / `0x3FFF`). Bodies
+  shorter than the 8-byte fixed payload fall back to `Raw`.
+- `stuffing_descriptor` (tag `0x42`, ETSI EN 300 468 §6.2.40 / Table 98)
+  decode — the descriptor-loop padding / invalidation mechanism that may
+  ride in any of the NIT / BAT / SDT / EIT / SIT loops.
+  `DescriptorBody::Stuffing` surfaces the raw `stuffing_byte` run (no
+  meaning per §6.2.40); a zero-length body is legal.
 - `SelectionInformationTable` — the DVB Selection Information Table
   (SIT, ETSI EN 300 468 §5.2.10 / §7.1.2 / Table 164) carried on the
   fixed PID `0x001F` (`SIT_PID`) with `table_id == 0x7F`

@@ -42,6 +42,7 @@
 //! | `0x12` | IBP_descriptor (§2.6.34)          | [`DescriptorBody::Ibp`]                      |
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
+//! | `0x42` | stuffing_descriptor (EN 300 468 §6.2.40) | [`DescriptorBody::Stuffing`]         |
 //! | `0x40` | network_name_descriptor (EN 300 468 §6.2.27) | [`DescriptorBody::NetworkName`]  |
 //! | `0x47` | bouquet_name_descriptor (EN 300 468 §6.2.4) | [`DescriptorBody::BouquetName`]  |
 //! | `0x48` | service_descriptor (EN 300 468 §6.2.33) | [`DescriptorBody::Service`]            |
@@ -51,6 +52,7 @@
 //! | `0x56` | teletext_descriptor (EN 300 468 §6.2.43) | [`DescriptorBody::Teletext`]          |
 //! | `0x58` | local_time_offset_descriptor (EN 300 468 §6.2.20) | [`DescriptorBody::LocalTimeOffset`] |
 //! | `0x59` | subtitling_descriptor (EN 300 468 §6.2.41) | [`DescriptorBody::Subtitling`]      |
+//! | `0x63` | partial_transport_stream_descriptor (EN 300 468 §7.2.1) | [`DescriptorBody::PartialTransportStream`] |
 //! | `0x6A` | AC-3_descriptor (EN 300 468 annex D)  | [`DescriptorBody::Ac3`]                      |
 //! | `0x7A` | enhanced_AC-3_descriptor (EN 300 468 annex D) | [`DescriptorBody::EnhancedAc3`]      |
 //! | `0x7B` | DTS_descriptor (EN 300 468 annex G)   | [`DescriptorBody::Dts`]                      |
@@ -178,6 +180,17 @@ pub enum DescriptorBody<'a> {
     /// Table G.1). Carried in a PMT `ES_info` loop; configures a DTS
     /// Coherent Acoustics audio stream.
     Dts(DtsDescriptor<'a>),
+    /// `0x42` stuffing_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.40 Table 98). May be carried in the NIT / BAT / SDT / EIT /
+    /// SIT descriptor loops; its sole purpose is to invalidate
+    /// previously-coded descriptors or to insert dummy padding. The body
+    /// is a run of `stuffing_byte`s with no meaning.
+    Stuffing(StuffingDescriptor<'a>),
+    /// `0x63` partial_transport_stream_descriptor — DVB SI extension
+    /// (ETSI EN 300 468 §7.2.1 Table 165). Carried only in the SIT
+    /// transmission-info descriptor loop; describes the rate / smoothing
+    /// parameters of the partial TS.
+    PartialTransportStream(PartialTransportStreamDescriptor),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -993,6 +1006,66 @@ impl SmoothingBufferDescriptor {
     }
 }
 
+/// stuffing_descriptor body (ETSI EN 300 468 §6.2.40 Table 98).
+///
+/// The descriptor invalidates previously-coded descriptors or inserts
+/// dummy descriptors for table stuffing. The whole payload is a run of
+/// `stuffing_byte`s that may take any value and have no meaning; an IRD
+/// may discard them. This typed view simply surfaces the raw bytes so a
+/// caller can confirm the descriptor was consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StuffingDescriptor<'a> {
+    /// Raw `stuffing_byte` run — no meaning per §6.2.40.
+    pub stuffing_bytes: &'a [u8],
+}
+
+/// partial_transport_stream_descriptor body (ETSI EN 300 468 §7.2.1
+/// Table 165).
+///
+/// Carried only in the SIT transmission-info descriptor loop, this
+/// descriptor conveys the rate / smoothing parameters needed to control
+/// and manage the play-out and copying of a partial TS. On the wire
+/// (8-byte body) the fields are three big-endian values each preceded by
+/// 2 reserved bits: `peak_rate` (22-bit), `minimum_overall_smoothing_rate`
+/// (22-bit, both in units of 400 bit/s), and
+/// `maximum_overall_smoothing_buffer` (14-bit, in units of 1 byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialTransportStreamDescriptor {
+    /// 22-bit `peak_rate` — the maximum momentary TS-packet rate
+    /// (188 bytes ÷ inter-packet interval), coded in units of 400 bit/s.
+    pub peak_rate: u32,
+    /// 22-bit `minimum_overall_smoothing_rate` — minimum smoothing-buffer
+    /// leak rate for the overall TS, in units of 400 bit/s. The all-ones
+    /// value `0x3F_FFFF` marks the rate as undefined
+    /// ([`Self::minimum_overall_smoothing_rate_undefined`]).
+    pub minimum_overall_smoothing_rate: u32,
+    /// 14-bit `maximum_overall_smoothing_buffer` — maximum smoothing-
+    /// buffer size for the overall TS, in units of 1 byte. The all-ones
+    /// value `0x3FFF` marks the size as undefined
+    /// ([`Self::maximum_overall_smoothing_buffer_undefined`]).
+    pub maximum_overall_smoothing_buffer: u16,
+}
+
+impl PartialTransportStreamDescriptor {
+    /// `peak_rate` in bits per second (the wire field is in 400 bit/s
+    /// units).
+    pub fn peak_rate_bits_per_second(self) -> u64 {
+        (self.peak_rate as u64) * 400
+    }
+
+    /// `true` when `minimum_overall_smoothing_rate` is the §7.2.1
+    /// "undefined" sentinel (`0x3F_FFFF`).
+    pub fn minimum_overall_smoothing_rate_undefined(self) -> bool {
+        self.minimum_overall_smoothing_rate == 0x3F_FFFF
+    }
+
+    /// `true` when `maximum_overall_smoothing_buffer` is the §7.2.1
+    /// "undefined" sentinel (`0x3FFF`).
+    pub fn maximum_overall_smoothing_buffer_undefined(self) -> bool {
+        self.maximum_overall_smoothing_buffer == 0x3FFF
+    }
+}
+
 /// STD_descriptor body (§2.6.32 Table 2-60).
 ///
 /// When `leak_valid_flag == true`, the transfer of data from buffer
@@ -1214,6 +1287,9 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x12 => decode_ibp(data).unwrap_or(DescriptorBody::Raw),
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
+        0x42 => DescriptorBody::Stuffing(StuffingDescriptor {
+            stuffing_bytes: data,
+        }),
         0x40 => DescriptorBody::NetworkName(NetworkNameDescriptor { network_name: data }),
         0x47 => DescriptorBody::BouquetName(BouquetNameDescriptor { bouquet_name: data }),
         0x48 => decode_service(data).unwrap_or(DescriptorBody::Raw),
@@ -1227,8 +1303,36 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x6A => decode_ac3(data).unwrap_or(DescriptorBody::Raw),
         0x7A => decode_enhanced_ac3(data).unwrap_or(DescriptorBody::Raw),
         0x7B => decode_dts(data).unwrap_or(DescriptorBody::Raw),
+        0x63 => decode_partial_transport_stream(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
+}
+
+fn decode_partial_transport_stream(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §7.2.1 Table 165 — fixed 8-byte body:
+    //   byte 0: 2 reserved bits | top 6 bits of peak_rate
+    //   bytes 1-2: remaining 16 bits of peak_rate (22-bit total)
+    //   byte 3: 2 reserved bits | top 6 bits of minimum_overall_smoothing_rate
+    //   bytes 4-5: remaining 16 bits (22-bit total)
+    //   byte 6: 2 reserved bits | top 6 bits of maximum_overall_smoothing_buffer
+    //   byte 7: low 8 bits (14-bit total)
+    // All three fields are big-endian unsigned.
+    if data.len() < 8 {
+        return None;
+    }
+    let peak_rate =
+        (((data[0] & 0b0011_1111) as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
+    let minimum_overall_smoothing_rate =
+        (((data[3] & 0b0011_1111) as u32) << 16) | ((data[4] as u32) << 8) | (data[5] as u32);
+    let maximum_overall_smoothing_buffer =
+        (((data[6] & 0b0011_1111) as u16) << 8) | (data[7] as u16);
+    Some(DescriptorBody::PartialTransportStream(
+        PartialTransportStreamDescriptor {
+            peak_rate,
+            minimum_overall_smoothing_rate,
+            maximum_overall_smoothing_buffer,
+        },
+    ))
 }
 
 fn decode_local_time_offset(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -2026,9 +2130,11 @@ mod tests {
 
     #[test]
     fn unknown_tag_passes_through_as_raw() {
-        let block = tlv(0x42, &[0xAA, 0xBB, 0xCC]);
+        // 0xFE is unassigned in this crate's dispatch (the EN 300 468
+        // user-defined range), so it must surface as Raw.
+        let block = tlv(0xFE, &[0xAA, 0xBB, 0xCC]);
         let d = iter_descriptors(&block).next().unwrap().unwrap();
-        assert_eq!(d.tag, 0x42);
+        assert_eq!(d.tag, 0xFE);
         assert_eq!(d.data, &[0xAA, 0xBB, 0xCC]);
         assert!(matches!(d.body, DescriptorBody::Raw));
     }
@@ -3856,5 +3962,90 @@ mod tests {
         let block = tlv(0x7B, &[0, 0, 0, 0]);
         let d = iter_descriptors(&block).next().unwrap().unwrap();
         assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn stuffing_descriptor_surfaces_raw_bytes() {
+        let block = tlv(0x42, &[0xFF, 0xFF, 0x00, 0x12]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Stuffing(s) => {
+                assert_eq!(s.stuffing_bytes, &[0xFF, 0xFF, 0x00, 0x12]);
+            }
+            other => panic!("expected Stuffing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stuffing_descriptor_empty_body() {
+        // A zero-length stuffing run is legal — the descriptor exists
+        // only to occupy bytes / invalidate prior descriptors.
+        let block = tlv(0x42, &[]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Stuffing(s) => assert!(s.stuffing_bytes.is_empty()),
+            other => panic!("expected Stuffing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_transport_stream_descriptor_typical_values() {
+        // peak_rate = 0x12_3456, min_smoothing = 0x00_ABCD,
+        // max_buffer = 0x1234 (14-bit). Reserved bits set to 1 to confirm
+        // the parser masks them off.
+        let peak: u32 = 0x12_3456;
+        let minr: u32 = 0x00_ABCD;
+        let maxb: u16 = 0x1234;
+        let body = [
+            0b1100_0000 | ((peak >> 16) as u8 & 0b0011_1111),
+            (peak >> 8) as u8,
+            peak as u8,
+            0b1100_0000 | ((minr >> 16) as u8 & 0b0011_1111),
+            (minr >> 8) as u8,
+            minr as u8,
+            0b1100_0000 | ((maxb >> 8) as u8 & 0b0011_1111),
+            maxb as u8,
+        ];
+        let block = tlv(0x63, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::PartialTransportStream(p) => {
+                assert_eq!(p.peak_rate, peak);
+                assert_eq!(p.minimum_overall_smoothing_rate, minr);
+                assert_eq!(p.maximum_overall_smoothing_buffer, maxb);
+                // 0x12_3456 = 1_193_046 × 400 = 477_218_400 bits/s.
+                assert_eq!(p.peak_rate_bits_per_second(), 477_218_400);
+                assert!(!p.minimum_overall_smoothing_rate_undefined());
+                assert!(!p.maximum_overall_smoothing_buffer_undefined());
+            }
+            other => panic!("expected PartialTransportStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_transport_stream_descriptor_undefined_sentinels() {
+        // §7.2.1: min rate 0x3F_FFFF and max buffer 0x3FFF are the
+        // "undefined" sentinels.
+        let block = tlv(0x63, &[0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::PartialTransportStream(p) => {
+                assert_eq!(p.peak_rate, 0);
+                assert_eq!(p.minimum_overall_smoothing_rate, 0x3F_FFFF);
+                assert_eq!(p.maximum_overall_smoothing_buffer, 0x3FFF);
+                assert!(p.minimum_overall_smoothing_rate_undefined());
+                assert!(p.maximum_overall_smoothing_buffer_undefined());
+            }
+            other => panic!("expected PartialTransportStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_transport_stream_descriptor_short_body_falls_back_to_raw() {
+        // Seven bytes is one short of the 8-byte fixed payload.
+        let block = tlv(0x63, &[0u8; 7]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+        assert_eq!(d.data.len(), 7);
     }
 }

@@ -99,8 +99,9 @@ pub use descriptor::{
     BouquetNameDescriptor, CaDescriptor, DataStreamAlignmentDescriptor, Descriptor, DescriptorBody,
     DescriptorIter, DtsDescriptor, EnhancedAc3Descriptor, ExtendedEventDescriptor,
     ExtendedEventItem, HevcVideoDescriptor, Iso639Language, LocalTimeOffsetDescriptor,
-    LocalTimeOffsetEntry, MaximumBitrateDescriptor, NetworkNameDescriptor, ServiceDescriptor,
-    ShortEventDescriptor, SmoothingBufferDescriptor, StdDescriptor, StreamIdentifierDescriptor,
+    LocalTimeOffsetEntry, MaximumBitrateDescriptor, NetworkNameDescriptor,
+    PartialTransportStreamDescriptor, ServiceDescriptor, ShortEventDescriptor,
+    SmoothingBufferDescriptor, StdDescriptor, StreamIdentifierDescriptor, StuffingDescriptor,
     SubtitlingDescriptor, SubtitlingEntry, SystemClockDescriptor, TeletextDescriptor,
     TeletextEntry, VideoStreamDescriptor,
 };
