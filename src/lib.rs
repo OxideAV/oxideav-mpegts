@@ -58,7 +58,12 @@
 //! ## What's NOT in scope
 //!
 //! - PSIP / DVB SI tables beyond PAT + PMT + CAT + TSDT + SDT + EIT +
-//!   NIT + BAT + TDT + TOT + RST. The SDT
+//!   NIT + BAT + TDT + TOT + RST + ST + DIT + SIT. The ST
+//!   ([`psi::StuffingTable`], §5.2.8) is the section-invalidation
+//!   channel; the DIT ([`psi::DiscontinuityInformationTable`], §5.2.9)
+//!   marks partial-TS transition points; and the SIT
+//!   ([`psi::SelectionInformationTable`], §5.2.10 / §7.1.2) describes
+//!   the services and events of a partial TS. The SDT
 //!   ([`psi::ServiceDescriptionTable`], ETSI EN 300 468 §5.2.3) is
 //!   parsed including its per-service `service_descriptor` (tag `0x48`)
 //!   for human-readable service / provider names. The EIT
