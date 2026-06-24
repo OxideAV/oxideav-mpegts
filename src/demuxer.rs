@@ -1832,6 +1832,49 @@ mod tests {
         }
     }
 
+    /// A null-PID (0x1FFF) padding packet — present in real streams
+    /// between PCR-bearing ES packets. The duration / seek probes must
+    /// skip these (they carry no PCR) without losing alignment.
+    fn ts_null_packet(cc: u8) -> [u8; TS_PACKET_LEN] {
+        let mut pkt = [0xFFu8; TS_PACKET_LEN];
+        pkt[0] = TS_SYNC_BYTE;
+        // PID = 0x1FFF (null), no PUSI.
+        pkt[1] = 0x1F;
+        pkt[2] = 0xFF;
+        pkt[3] = 0b0001_0000 | (cc & 0x0F); // payload-only
+        pkt
+    }
+
+    #[test]
+    fn duration_and_seek_skip_interleaved_null_packets() {
+        // Build 6 PCR-bearing PES packets 0.5 s (45_000 tick) apart,
+        // each followed by two null-PID padding packets — so PCRs are
+        // sparse (1 in 3 packets). Head-to-tail span = 5 × 0.5 s = 2.5 s.
+        let mut buf = pat_pmt_header();
+        for i in 0..6u64 {
+            let base = 3_000_000 + i * 45_000;
+            buf.extend_from_slice(&ts_pes(
+                0x0101,
+                (i & 0x0F) as u8,
+                Some((base, 0)),
+                &pes_with_pts(base, b"f"),
+            ));
+            buf.extend_from_slice(&ts_null_packet(i as u8));
+            buf.extend_from_slice(&ts_null_packet(i as u8));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+
+        // 5 × 45_000 ticks @ 90 kHz = 225_000 / 90_000 = 2.5 s.
+        assert_eq!(dmx.duration_micros(), Some(2_500_000));
+
+        // Seek between PCR #2 (3_090_000) and #3 (3_135_000) → land on #2.
+        let landed = dmx.seek_to(0, 3_100_000).expect("seek");
+        assert_eq!(landed, 3_090_000);
+        let pkt = dmx.next_packet().expect("PES after seek over nulls");
+        assert_eq!(pkt.pts, Some(3_090_000));
+    }
+
     #[test]
     fn seek_unsupported_without_two_pcrs() {
         // Single PCR → no bracket → seeking is Unsupported.

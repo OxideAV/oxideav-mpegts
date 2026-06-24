@@ -49,6 +49,13 @@
 //!   monotonic 64-bit extended timeline, while distinguishing a genuine
 //!   `2^33` wrap from a backward splice / seek discontinuity
 //!   ([`clock::TimestampEvent`]).
+//! - Duration + time-based seeking on the `demuxer::MpegTsDemuxer`.
+//!   `duration_micros()` is probed once at open from the head-to-tail
+//!   PCR span (§2.4.2.2); `seek_to()` is a PCR-anchored binary search
+//!   over the byte stream (no in-container index — the demuxer brackets
+//!   the target PTS between the head/tail PCR anchors and bisects),
+//!   landing on the packet boundary of the last PCR at or before the
+//!   request and resetting the per-PID reassembler + timestamp state.
 //!
 //! The crate ships **no decoders** — every payload byte stays as a
 //! `&[u8]` slice. A downstream pipeline (e.g. `oxideav-cli`'s
