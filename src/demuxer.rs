@@ -122,6 +122,15 @@ pub struct MpegTsDemuxer {
     /// stream carries fewer than two PCR samples, or the source is not
     /// seekable to its end.
     duration_micros: Option<i64>,
+    /// Head-anchor PCR and its byte offset, captured by the same
+    /// open-time probe that filled `duration_micros`. Reused as the
+    /// lower bracket of the [`Self::seek_to`] binary search. `None`
+    /// when no PCR was found (an unseekable / PCR-less stream — seeking
+    /// is then unsupported).
+    first_pcr: Option<(Pcr, u64)>,
+    /// Tail-anchor PCR and its byte offset; the upper bracket of the
+    /// seek search.
+    last_pcr: Option<(Pcr, u64)>,
 }
 
 impl std::fmt::Debug for MpegTsDemuxer {
@@ -334,6 +343,8 @@ impl MpegTsDemuxer {
             bytes_read: probe_bytes,
             putback: probe_putback,
             duration_micros: None,
+            first_pcr: None,
+            last_pcr: None,
         };
 
         // Probe the container duration from the PCR span (§2.4.2.2).
@@ -388,17 +399,14 @@ impl MpegTsDemuxer {
         self.pcr_tracker.last_pcr()
     }
 
-    /// Estimate the container's wall-clock duration from the PCR span
-    /// on the selected program's `PCR_PID` (§2.4.2.2). Anchors on the
-    /// first PCR at the head of the stream and the last PCR before the
-    /// tail, then converts the 27 MHz tick delta to microseconds.
+    /// Probe the head and tail PCR anchors on the selected `PCR_PID`,
+    /// recording them in `first_pcr` / `last_pcr` for reuse by
+    /// [`Self::seek_to`], and return the container duration in
+    /// microseconds from their 27 MHz span (§2.4.2.2).
     ///
-    /// Returns `None` when the program declares no PCR_PID, when the
-    /// stream is so short it carries fewer than two PCR samples, or
-    /// when the input is not seekable to its end.
-    ///
-    /// The result is memoized — the byte scans this performs are
-    /// repeated only on the first call.
+    /// Returns `None` when the program declares no PCR_PID, the stream
+    /// is so short it carries fewer than two PCR samples, or the input
+    /// is not seekable to its end. The byte scans run once (at open).
     fn compute_duration_micros(&mut self) -> Option<i64> {
         if self.pcr_pid == NULL_PID {
             return None;
@@ -409,11 +417,13 @@ impl MpegTsDemuxer {
         if len < (2 * TS_PACKET_LEN) as u64 {
             return None;
         }
+        let aligned_len = (len / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
 
         // First PCR from the head: align to a packet boundary and scan
         // forward. Real BD/broadcast streams carry a PCR within the
         // first handful of packets on the PCR_PID.
         let (first_pcr, first_off) = self.scan_pcr_forward(0, len)?;
+        self.first_pcr = Some((first_pcr, first_off));
 
         // Last PCR from the tail: walk a trailing window backward in
         // packet-sized steps so we don't read the whole file. A 1 MiB
@@ -421,7 +431,6 @@ impl MpegTsDemuxer {
         // inter-PCR gap (§2.7.2 caps it at 100 ms; even a 50 Mbit/s
         // stream fits dozens of PCRs in that window).
         const TAIL_WINDOW: u64 = 1 << 20;
-        let aligned_len = (len / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
         let mut window = TAIL_WINDOW;
         let (last_pcr, last_off) = loop {
             let start = aligned_len.saturating_sub(window);
@@ -441,12 +450,109 @@ impl MpegTsDemuxer {
         if last_off <= first_off {
             return None;
         }
+        self.last_pcr = Some((last_pcr, last_off));
         let span_ticks = pcr_span_27mhz(first_pcr, first_off, last_pcr, last_off)?;
         // 27 MHz ticks → microseconds: ticks × 1_000_000 / 27_000_000
         // = ticks / 27. Use 128-bit to avoid overflow on multi-hour
         // streams (span can exceed 2^33 × 300 ≈ 2.6e12 ticks).
         let micros = (span_ticks as i128 * 1_000_000) / 27_000_000;
         i64::try_from(micros).ok()
+    }
+
+    /// Seek the demux position to the PCR nearest `target_90k` (a
+    /// presentation time in the stream's 90 kHz time base) by a
+    /// PCR-anchored binary search over the byte stream (§2.4.2.2).
+    ///
+    /// MPEG-TS has no in-container random-access index, so this brackets
+    /// the target between the open-time head/tail PCR anchors and
+    /// bisects the byte range, at each step scanning forward to the next
+    /// PCR on the `PCR_PID` and steering the search by its
+    /// `base_90khz`. It lands on the packet boundary of the last PCR at
+    /// or before the target, resets every per-PID reassembler and the
+    /// PTS/PCR trackers (so the next `next_packet` starts a fresh PES at
+    /// the landing point), and returns that PCR's `base_90khz`.
+    ///
+    /// PCR carries the program *system* clock, whose epoch matches the
+    /// PTS epoch up to the constant T-STD buffering delay (§2.4.2.2); a
+    /// PCR-accurate landing is the random-access granularity an
+    /// index-free TS demuxer can offer. The caller decodes forward to
+    /// the first frame whose PTS reaches its exact request.
+    fn seek_by_pcr(&mut self, target_90k: i64) -> CoreResult<i64> {
+        let (first_pcr, first_off) = self.first_pcr.ok_or_else(|| {
+            CoreError::unsupported("mpegts: stream carries no PCR to seek against")
+        })?;
+        let (last_pcr, last_off) = self
+            .last_pcr
+            .ok_or_else(|| CoreError::unsupported("mpegts: stream carries only one PCR"))?;
+
+        let first_base = first_pcr.base_90khz() as i64;
+        let last_base = last_pcr.base_90khz() as i64;
+
+        // Clamp the request to the bracket. A target at or before the
+        // head lands on the first PCR; at or after the tail, the last.
+        if target_90k <= first_base {
+            self.reposition(first_off);
+            return Ok(first_base);
+        }
+        if target_90k >= last_base {
+            self.reposition(last_off);
+            return Ok(last_base);
+        }
+
+        // Binary search the byte range [lo, hi) (packet-aligned) for the
+        // last PCR with base ≤ target. `best` tracks the closest landing
+        // found so far that does not overshoot.
+        let mut lo = first_off;
+        let mut hi = last_off;
+        let mut best = (first_off, first_base);
+        while hi - lo > TS_PACKET_LEN as u64 {
+            let mid_raw = lo + (hi - lo) / 2;
+            let mid = (mid_raw / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+            let mid = mid.max(lo);
+            // Find the next PCR at or after `mid`. If none lies before
+            // `hi`, the target sits in this packet-sparse tail — shrink
+            // `hi` to `mid` and keep bisecting the lower half.
+            match self.scan_pcr_forward(mid, hi) {
+                Some((pcr, off)) => {
+                    let base = pcr.base_90khz() as i64;
+                    if base <= target_90k {
+                        best = (off, base);
+                        // Advance past this PCR's packet so we don't
+                        // re-find the same one and stall.
+                        lo = off + TS_PACKET_LEN as u64;
+                    } else {
+                        hi = off;
+                    }
+                }
+                None => {
+                    hi = mid;
+                }
+            }
+        }
+        self.reposition(best.0);
+        Ok(best.1)
+    }
+
+    /// Re-home the streaming state at byte `offset` (packet-aligned):
+    /// seek the input cursor, drop every in-flight PES and the pending
+    /// queue, and reset the PCR / PTS / DTS trackers so the timeline
+    /// rebuilds from the landing point.
+    fn reposition(&mut self, offset: u64) {
+        let _ = self.input.seek(std::io::SeekFrom::Start(offset));
+        self.bytes_read = offset;
+        self.putback.clear();
+        self.pending.clear();
+        self.eof_reached = false;
+        self.pcr_tracker.reset();
+        for r in self.reassemblers.values_mut() {
+            *r = PesReassembler::new();
+        }
+        for t in self.pts_trackers.values_mut() {
+            t.reset();
+        }
+        for t in self.dts_trackers.values_mut() {
+            t.reset();
+        }
     }
 
     /// Scan forward from byte offset `from` (must be packet-aligned)
@@ -596,6 +702,14 @@ impl Demuxer for MpegTsDemuxer {
 
     fn duration_micros(&self) -> Option<i64> {
         self.duration_micros
+    }
+
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> CoreResult<i64> {
+        // MPEG-TS time base is 90 kHz for every stream, and PTS / PCR
+        // share that base, so the requested `pts` is already in the
+        // units the PCR search compares against — no per-stream
+        // rescale is needed.
+        self.seek_by_pcr(pts)
     }
 
     fn next_packet(&mut self) -> CoreResult<Packet> {
@@ -1664,6 +1778,70 @@ mod tests {
         let dmx = MpegTsDemuxer::new(cursor).expect("open");
         assert_eq!(dmx.duration_micros(), None);
         assert_eq!(dmx.streams()[0].duration, None);
+    }
+
+    #[test]
+    fn seek_lands_on_pcr_at_or_before_target() {
+        // 21 PCRs, 0.1 s (9_000 tick) apart, starting at base 1_000_000.
+        // Bases: 1_000_000, 1_009_000, … 1_180_000.
+        let bytes = synth_pcr_span_ts(21, 9_000, 1_000_000);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+
+        // Target lands between PCR #5 (1_045_000) and #6 (1_054_000):
+        // seek must land on the one at-or-before → 1_045_000.
+        let landed = dmx.seek_to(0, 1_050_000).expect("seek");
+        assert_eq!(landed, 1_045_000);
+        // The next demuxed PES is the one whose PTS == the landed PCR.
+        let pkt = dmx.next_packet().expect("PES after seek");
+        assert_eq!(pkt.pts, Some(1_045_000));
+    }
+
+    #[test]
+    fn seek_clamps_before_first_and_after_last_pcr() {
+        let bytes = synth_pcr_span_ts(11, 9_000, 2_000_000);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+
+        // Target before the head → first PCR (2_000_000).
+        let landed = dmx.seek_to(0, 0).expect("seek-head");
+        assert_eq!(landed, 2_000_000);
+        let pkt = dmx.next_packet().expect("first PES");
+        assert_eq!(pkt.pts, Some(2_000_000));
+
+        // Target past the tail → last PCR (2_090_000).
+        let landed = dmx.seek_to(0, i64::MAX).expect("seek-tail");
+        assert_eq!(landed, 2_090_000);
+        let pkt = dmx.next_packet().expect("last PES");
+        assert_eq!(pkt.pts, Some(2_090_000));
+    }
+
+    #[test]
+    fn seek_is_repeatable_and_lands_exactly_on_a_pcr() {
+        let bytes = synth_pcr_span_ts(11, 9_000, 0);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+
+        // Seek to each exact PCR base; expect to land precisely on it
+        // and read it back, twice, to prove the search resets cleanly.
+        for &base in &[18_000i64, 45_000, 72_000, 9_000, 90_000] {
+            let landed = dmx.seek_to(0, base).expect("seek");
+            assert_eq!(landed, base, "seek to {base} landed on {landed}");
+            let pkt = dmx.next_packet().expect("PES");
+            assert_eq!(pkt.pts, Some(base));
+        }
+    }
+
+    #[test]
+    fn seek_unsupported_without_two_pcrs() {
+        // Single PCR → no bracket → seeking is Unsupported.
+        let bytes = synth_pcr_span_ts(1, 9_000, 1_000_000);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        assert!(matches!(
+            dmx.seek_to(0, 500_000),
+            Err(CoreError::Unsupported(_))
+        ));
     }
 
     #[test]

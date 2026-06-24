@@ -11,6 +11,18 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `MpegTsDemuxer` now supports time-based seeking. `Demuxer::seek_to`
+  performs a PCR-anchored binary search over the byte stream
+  (ISO/IEC 13818-1 §2.4.2.2) — MPEG-TS carries no in-container index, so
+  the demuxer brackets the requested PTS between the open-time head/tail
+  PCR anchors and bisects the byte range, scanning forward to the next
+  PCR on the `PCR_PID` at each step and steering by its `base_90khz`. It
+  lands on the packet boundary of the last PCR at or before the target,
+  resets every per-PID PES reassembler and the PTS/DTS/PCR trackers, and
+  returns the landed PCR base. Targets outside the bracket clamp to the
+  first / last PCR; a stream with fewer than two PCRs returns
+  `Error::Unsupported`. PTS and PCR share the 90 kHz time base so no
+  per-stream rescale is needed.
 - `MpegTsDemuxer` now reports container duration. `Demuxer::duration_micros`
   is computed once at open from the head-to-tail PCR span on the selected
   program's `PCR_PID` (ISO/IEC 13818-1 §2.4.2.2): the first PCR is scanned
