@@ -116,6 +116,12 @@ pub struct MpegTsDemuxer {
     /// subsequent read through another resync). Holds at most a few
     /// bytes in practice.
     putback: VecDeque<u8>,
+    /// Container duration in microseconds, probed once at open from the
+    /// first and last PCR on the selected program's `PCR_PID`
+    /// (§2.4.2.2). `None` when the program declares no PCR_PID, the
+    /// stream carries fewer than two PCR samples, or the source is not
+    /// seekable to its end.
+    duration_micros: Option<i64>,
 }
 
 impl std::fmt::Debug for MpegTsDemuxer {
@@ -312,7 +318,7 @@ impl MpegTsDemuxer {
             ));
         }
 
-        Ok(Self {
+        let mut demuxer = Self {
             input,
             programs,
             selected_program,
@@ -327,7 +333,31 @@ impl MpegTsDemuxer {
             eof_reached: false,
             bytes_read: probe_bytes,
             putback: probe_putback,
-        })
+            duration_micros: None,
+        };
+
+        // Probe the container duration from the PCR span (§2.4.2.2).
+        // This seeks the input to its end and back; restore the
+        // streaming cursor afterwards so the first `next_packet`
+        // resumes exactly where the header scan stopped. A
+        // non-seekable source (or one too short to carry two PCRs)
+        // leaves `duration_micros` at `None`.
+        demuxer.duration_micros = demuxer.compute_duration_micros();
+        let _ = demuxer
+            .input
+            .seek(std::io::SeekFrom::Start(demuxer.bytes_read));
+        if let Some(total) = demuxer.duration_micros {
+            // Surface the same figure per stream so a consumer reading
+            // `StreamInfo.duration` (90 kHz units) sees it too.
+            let ticks = (total as i128 * 90_000 / 1_000_000) as i64;
+            for s in &mut demuxer.streams {
+                if s.duration.is_none() {
+                    s.duration = Some(ticks);
+                }
+            }
+        }
+
+        Ok(demuxer)
     }
 
     /// The list of programs the PAT advertised, in PAT order
@@ -356,6 +386,108 @@ impl MpegTsDemuxer {
     /// 27 MHz wall-clock anchor a remux uses to place the PES timeline.
     pub fn last_pcr(&self) -> Option<Pcr> {
         self.pcr_tracker.last_pcr()
+    }
+
+    /// Estimate the container's wall-clock duration from the PCR span
+    /// on the selected program's `PCR_PID` (§2.4.2.2). Anchors on the
+    /// first PCR at the head of the stream and the last PCR before the
+    /// tail, then converts the 27 MHz tick delta to microseconds.
+    ///
+    /// Returns `None` when the program declares no PCR_PID, when the
+    /// stream is so short it carries fewer than two PCR samples, or
+    /// when the input is not seekable to its end.
+    ///
+    /// The result is memoized — the byte scans this performs are
+    /// repeated only on the first call.
+    fn compute_duration_micros(&mut self) -> Option<i64> {
+        if self.pcr_pid == NULL_PID {
+            return None;
+        }
+        // Length of the input, for the tail scan. A non-seekable or
+        // zero-length source gives up (no end to scan toward).
+        let len = self.input.seek(std::io::SeekFrom::End(0)).ok()?;
+        if len < (2 * TS_PACKET_LEN) as u64 {
+            return None;
+        }
+
+        // First PCR from the head: align to a packet boundary and scan
+        // forward. Real BD/broadcast streams carry a PCR within the
+        // first handful of packets on the PCR_PID.
+        let (first_pcr, first_off) = self.scan_pcr_forward(0, len)?;
+
+        // Last PCR from the tail: walk a trailing window backward in
+        // packet-sized steps so we don't read the whole file. A 1 MiB
+        // window (≈5500 packets) comfortably spans the longest realistic
+        // inter-PCR gap (§2.7.2 caps it at 100 ms; even a 50 Mbit/s
+        // stream fits dozens of PCRs in that window).
+        const TAIL_WINDOW: u64 = 1 << 20;
+        let aligned_len = (len / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+        let mut window = TAIL_WINDOW;
+        let (last_pcr, last_off) = loop {
+            let start = aligned_len.saturating_sub(window);
+            // Snap the window start to a packet boundary measured from
+            // the aligned end so each candidate packet starts on `0x47`.
+            let start = (start / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+            if let Some(found) = self.scan_pcr_backward(start, aligned_len) {
+                break found;
+            }
+            if start == 0 {
+                // Scanned the whole stream and found at most one PCR.
+                return None;
+            }
+            window = window.saturating_mul(2);
+        };
+
+        if last_off <= first_off {
+            return None;
+        }
+        let span_ticks = pcr_span_27mhz(first_pcr, first_off, last_pcr, last_off)?;
+        // 27 MHz ticks → microseconds: ticks × 1_000_000 / 27_000_000
+        // = ticks / 27. Use 128-bit to avoid overflow on multi-hour
+        // streams (span can exceed 2^33 × 300 ≈ 2.6e12 ticks).
+        let micros = (span_ticks as i128 * 1_000_000) / 27_000_000;
+        i64::try_from(micros).ok()
+    }
+
+    /// Scan forward from byte offset `from` (must be packet-aligned)
+    /// toward `len`, returning the first PCR on the selected `PCR_PID`
+    /// and the byte offset of the packet that carried it. Restores the
+    /// input cursor to where it found the match is *not* required — the
+    /// caller treats this as an out-of-band probe.
+    fn scan_pcr_forward(&mut self, from: u64, len: u64) -> Option<(Pcr, u64)> {
+        self.input.seek(std::io::SeekFrom::Start(from)).ok()?;
+        let mut off = from;
+        let mut buf = [0u8; TS_PACKET_LEN];
+        while off + TS_PACKET_LEN as u64 <= len {
+            if read_exact_packet(&mut self.input, &mut buf).is_err() {
+                return None;
+            }
+            if let Some(pcr) = pcr_from_packet(&buf, self.pcr_pid) {
+                return Some((pcr, off));
+            }
+            off += TS_PACKET_LEN as u64;
+        }
+        None
+    }
+
+    /// Scan the half-open packet-aligned byte range `[from, to)` and
+    /// return the **last** PCR on the selected `PCR_PID` together with
+    /// its packet offset. `from` and `to` must be packet-aligned.
+    fn scan_pcr_backward(&mut self, from: u64, to: u64) -> Option<(Pcr, u64)> {
+        self.input.seek(std::io::SeekFrom::Start(from)).ok()?;
+        let mut off = from;
+        let mut buf = [0u8; TS_PACKET_LEN];
+        let mut found: Option<(Pcr, u64)> = None;
+        while off + TS_PACKET_LEN as u64 <= to {
+            if read_exact_packet(&mut self.input, &mut buf).is_err() {
+                break;
+            }
+            if let Some(pcr) = pcr_from_packet(&buf, self.pcr_pid) {
+                found = Some((pcr, off));
+            }
+            off += TS_PACKET_LEN as u64;
+        }
+        found
     }
 
     /// Unwrap a freshly reassembled PES into a [`Packet`], carrying the
@@ -460,6 +592,10 @@ impl Demuxer for MpegTsDemuxer {
 
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
+    }
+
+    fn duration_micros(&self) -> Option<i64> {
+        self.duration_micros
     }
 
     fn next_packet(&mut self) -> CoreResult<Packet> {
@@ -646,6 +782,74 @@ fn resync(
 
 fn map_ts_err(e: crate::TsError) -> CoreError {
     CoreError::invalid(format!("mpegts: {e}"))
+}
+
+/// Read exactly `TS_PACKET_LEN` bytes into `buf` from `input`,
+/// retrying on short reads. Used by the seek / duration probes, which
+/// always start on a packet boundary and want a hard error rather than
+/// the streaming reader's resync behaviour.
+fn read_exact_packet(
+    input: &mut Box<dyn ReadSeek>,
+    buf: &mut [u8; TS_PACKET_LEN],
+) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut filled = 0;
+    while filled < TS_PACKET_LEN {
+        match input.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "mpegts: short read during PCR probe",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Extract the [`Pcr`] from a 188-byte TS packet buffer iff the packet
+/// is on `want_pid`, carries an adaptation field, and the field sets
+/// `PCR_flag`. Returns `None` otherwise — including for a non-`0x47`
+/// buffer (an unaligned probe window) or a malformed adaptation field.
+fn pcr_from_packet(buf: &[u8; TS_PACKET_LEN], want_pid: u16) -> Option<Pcr> {
+    if buf[0] != TS_SYNC_BYTE {
+        return None;
+    }
+    let pkt = TsPacket::parse(buf).ok()?;
+    if pkt.pid != want_pid {
+        return None;
+    }
+    let af = pkt.adaptation_field.as_ref()?;
+    let base = af.pcr_base?;
+    let ext = af.pcr_extension.unwrap_or(0);
+    Some(Pcr::from_base_ext(base, ext))
+}
+
+/// Compute the 27 MHz tick span between a head PCR (`first`, at byte
+/// `first_off`) and a tail PCR (`last`, at byte `last_off`),
+/// correcting for the `PCR_MODULUS_27MHZ` wrap(s) a stream longer than
+/// ~26.5 h crosses.
+///
+/// The naive `last - first` is ambiguous once the value wraps. We
+/// report the zero-wrap modular delta (`(last - first) mod modulus`),
+/// which is the exact span for every stream shorter than one PCR wrap
+/// (≈26.5 h) — i.e. all realistic `.m2ts` / broadcast inputs. Telling
+/// wrap count apart from two PCRs alone needs a transport-rate
+/// estimate (§2.4.2.2, eq. 2-5) and is defeated by any mid-stream PCR
+/// discontinuity, so the zero-wrap delta is the safe report.
+fn pcr_span_27mhz(first: Pcr, first_off: u64, last: Pcr, last_off: u64) -> Option<i64> {
+    if last_off <= first_off {
+        return None;
+    }
+    let modulus = crate::PCR_MODULUS_27MHZ as i128;
+    // Modular delta in [0, modulus): how far `last` is "after" `first`
+    // on the PCR ring, ignoring whole wraps.
+    let raw = last.ticks_27mhz as i128 - first.ticks_27mhz as i128;
+    let modular = ((raw % modulus) + modulus) % modulus;
+    i64::try_from(modular).ok()
 }
 
 /// Walk a PMT stream's ES_info descriptor loop and return the first
@@ -1378,5 +1582,112 @@ mod tests {
             f1.pts.unwrap() > f0.pts.unwrap(),
             "extended PTS must stay monotonic across the 2^33 wrap"
         );
+    }
+
+    /// PAT/PMT pair where the program's PCR_PID is the video ES PID
+    /// `0x101`. Returned as raw bytes the caller appends PES packets
+    /// after.
+    fn pat_pmt_header() -> Vec<u8> {
+        let mut pat = vec![
+            0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,
+        ];
+        let c = crc32_mpeg2(&pat);
+        pat.extend_from_slice(&c.to_be_bytes());
+        let mut pmt = vec![
+            0x02, 0xB0, 0x12, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x01, 0xF0, 0x00, 0x1B, 0xE1,
+            0x01, 0xF0, 0x00,
+        ];
+        let cp = crc32_mpeg2(&pmt);
+        pmt.extend_from_slice(&cp.to_be_bytes());
+
+        fn ts_psi(pid: u16, section: &[u8]) -> [u8; TS_PACKET_LEN] {
+            let mut pkt = [0xFFu8; TS_PACKET_LEN];
+            pkt[0] = TS_SYNC_BYTE;
+            pkt[1] = 0b0100_0000 | ((pid >> 8) as u8 & 0x1F);
+            pkt[2] = pid as u8;
+            pkt[3] = 0b0001_0000;
+            pkt[4] = 0;
+            let take = (TS_PACKET_LEN - 5).min(section.len());
+            pkt[5..5 + take].copy_from_slice(&section[..take]);
+            pkt
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ts_psi(0x0000, &pat));
+        buf.extend_from_slice(&ts_psi(0x0100, &pmt));
+        buf
+    }
+
+    /// Build a TS that carries `pcr_count` PES packets on PID `0x101`,
+    /// each with its own PCR. The PCR base advances by `step_90k` ticks
+    /// (90 kHz units) per packet, so the head-to-tail PCR span is
+    /// `(pcr_count - 1) × step_90k × 300` 27 MHz ticks — i.e.
+    /// `(pcr_count - 1) × step_90k / 90_000` seconds.
+    fn synth_pcr_span_ts(pcr_count: u64, step_90k: u64, base0: u64) -> Vec<u8> {
+        let mut buf = pat_pmt_header();
+        for i in 0..pcr_count {
+            let base = base0 + i * step_90k;
+            let cc = (i & 0x0F) as u8;
+            buf.extend_from_slice(&ts_pes(
+                0x0101,
+                cc,
+                Some((base, 0)),
+                &pes_with_pts(base, b"frame"),
+            ));
+        }
+        buf
+    }
+
+    #[test]
+    fn duration_from_pcr_span_is_microseconds() {
+        // 11 PCRs, 0.1 s apart → 1.0 s head-to-tail span.
+        let bytes = synth_pcr_span_ts(11, 9_000, 1_000_000);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let dmx = MpegTsDemuxer::new(cursor).expect("open");
+        // 10 × 9_000 ticks at 90 kHz = 90_000 / 90_000 = 1 s.
+        assert_eq!(dmx.duration_micros(), Some(1_000_000));
+        // The same figure lands on the stream in 90 kHz units (90_000).
+        assert_eq!(dmx.streams()[0].duration, Some(90_000));
+        // A successful duration probe must leave the streaming cursor
+        // where the header scan stopped: the first demuxed packet is
+        // still the very first PES, with PTS = base0.
+        let mut dmx = dmx;
+        let first = dmx.next_packet().expect("first PES after probe");
+        assert_eq!(first.pts, Some(1_000_000));
+    }
+
+    #[test]
+    fn duration_none_with_single_pcr() {
+        // Only one PCR-bearing packet — no span to measure.
+        let bytes = synth_pcr_span_ts(1, 9_000, 1_000_000);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let dmx = MpegTsDemuxer::new(cursor).expect("open");
+        assert_eq!(dmx.duration_micros(), None);
+        assert_eq!(dmx.streams()[0].duration, None);
+    }
+
+    #[test]
+    fn duration_handles_pcr_extension_in_span() {
+        // Two PCRs 2.0 s apart with a non-zero extension on the tail to
+        // confirm the 27 MHz composition (base × 300 + ext) is used.
+        let mut buf = pat_pmt_header();
+        buf.extend_from_slice(&ts_pes(
+            0x0101,
+            0,
+            Some((5_000_000, 0)),
+            &pes_with_pts(5_000_000, b"a"),
+        ));
+        buf.extend_from_slice(&ts_pes(
+            0x0101,
+            1,
+            // +180_000 ticks (2.0 s) of base, +150 of extension.
+            Some((5_180_000, 150)),
+            &pes_with_pts(5_180_000, b"b"),
+        ));
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = MpegTsDemuxer::new(cursor).expect("open");
+        // span = 180_000 × 300 + 150 = 54_000_150 ticks.
+        // micros = 54_000_150 × 1_000_000 / 27_000_000 = 2_000_005.
+        assert_eq!(dmx.duration_micros(), Some(2_000_005));
     }
 }

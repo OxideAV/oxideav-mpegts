@@ -11,6 +11,15 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `MpegTsDemuxer` now reports container duration. `Demuxer::duration_micros`
+  is computed once at open from the head-to-tail PCR span on the selected
+  program's `PCR_PID` (ISO/IEC 13818-1 §2.4.2.2): the first PCR is scanned
+  forward from the start of the stream and the last from a growing trailing
+  window, and the 27 MHz tick delta (`base × 300 + extension`, wrap-aware
+  via the modular delta) converts to microseconds. The same figure is
+  mirrored onto every `StreamInfo.duration` in 90 kHz units. Returns
+  `None` when the program declares no PCR_PID, the stream carries fewer
+  than two PCR samples, or the source is not seekable to its end.
 - `partial_transport_stream_descriptor` (tag `0x63`, ETSI EN 300 468
   §7.2.1 / Table 165) decode — the SIT-only descriptor that conveys the
   rate / smoothing parameters for controlling play-out and copying of a
