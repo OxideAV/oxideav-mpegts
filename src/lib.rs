@@ -107,15 +107,22 @@ pub use clock::{
     TimestampEvent, PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ, TIMESTAMP_MODULUS_90KHZ,
 };
 pub use descriptor::{
-    iter_descriptors, parse_descriptors, Ac3Descriptor, AudioStreamDescriptor, AvcVideoDescriptor,
-    BouquetNameDescriptor, CaDescriptor, DataStreamAlignmentDescriptor, Descriptor, DescriptorBody,
-    DescriptorIter, DtsDescriptor, EnhancedAc3Descriptor, ExtendedEventDescriptor,
-    ExtendedEventItem, HevcVideoDescriptor, Iso639Language, LocalTimeOffsetDescriptor,
-    LocalTimeOffsetEntry, MaximumBitrateDescriptor, NetworkNameDescriptor,
-    PartialTransportStreamDescriptor, ServiceDescriptor, ShortEventDescriptor,
-    SmoothingBufferDescriptor, StdDescriptor, StreamIdentifierDescriptor, StuffingDescriptor,
-    SubtitlingDescriptor, SubtitlingEntry, SystemClockDescriptor, TeletextDescriptor,
-    TeletextEntry, VideoStreamDescriptor,
+    iter_descriptors, parse_descriptors, AacDescriptor, Ac3Descriptor, AncillaryDataDescriptor,
+    AudioStreamDescriptor, AvcVideoDescriptor, BouquetNameDescriptor, CaDescriptor,
+    CaIdentifierDescriptor, CableDeliverySystemDescriptor, ComponentDescriptor, ContentDescriptor,
+    ContentNibble, CopyrightDescriptor, CountryAvailabilityDescriptor, DataBroadcastIdDescriptor,
+    DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, DtsDescriptor,
+    EnhancedAc3Descriptor, ExtendedEventDescriptor, ExtendedEventItem, FrequencyListDescriptor,
+    HevcVideoDescriptor, HierarchyDescriptor, HierarchyType, IbpDescriptor, Iso639Language,
+    LinkageDescriptor, LocalTimeOffsetDescriptor, LocalTimeOffsetEntry, MaximumBitrateDescriptor,
+    MultiplexBufferUtilizationDescriptor, NetworkNameDescriptor, ParentalRatingDescriptor,
+    ParentalRatingEntry, PartialTransportStreamDescriptor, PrivateDataSpecifierDescriptor,
+    SatelliteDeliverySystemDescriptor, ScramblingDescriptor, ServiceDescriptor,
+    ServiceListDescriptor, ServiceListEntry, ServiceMoveDescriptor, ShortEventDescriptor,
+    ShortSmoothingBufferDescriptor, SmoothingBufferDescriptor, StdDescriptor,
+    StreamIdentifierDescriptor, StuffingDescriptor, SubtitlingDescriptor, SubtitlingEntry,
+    SystemClockDescriptor, TargetBackgroundGridDescriptor, TeletextDescriptor, TeletextEntry,
+    TerrestrialDeliverySystemDescriptor, VideoStreamDescriptor, VideoWindowDescriptor,
 };
 pub use error::TsError;
 pub use packet::{
