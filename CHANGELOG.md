@@ -11,6 +11,25 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- Seven more DVB SI descriptors now decode to typed bodies (ETSI
+  EN 300 468): `service_list_descriptor` (tag `0x41`, §6.2.35 — the
+  NIT/BAT `(service_id, service_type)` channel list),
+  `country_availability_descriptor` (tag `0x49`, §6.2.10 — the
+  intended/not-intended country list with its polarity flag),
+  `linkage_descriptor` (tag `0x4A`, §6.2.19 — the
+  `(transport_stream_id, original_network_id, service_id, linkage_type)`
+  header plus the type-specific body + private-data run as raw
+  `link_data`), `component_descriptor` (tag `0x50`, §6.2.8 — the
+  `(stream_content, stream_content_ext, component_type)` editorial
+  classification with `component_tag`, language, and free text),
+  `CA_identifier_descriptor` (tag `0x53`, §6.2.5 — the associated
+  `CA_system_id` list), `parental_rating_descriptor` (tag `0x55`,
+  §6.2.28 — per-country `(country_code, rating)` entries with a
+  `minimum_age_years()` Table-83 helper), and
+  `private_data_specifier_descriptor` (tag `0x5F`, §6.2.31 — the 32-bit
+  specifier that scopes following private descriptors). Each surfaces a
+  new `DescriptorBody` variant; malformed bodies still fall back to
+  `Raw`.
 - `MpegTsDemuxer` now supports time-based seeking. `Demuxer::seek_to`
   performs a PCR-anchored binary search over the byte stream
   (ISO/IEC 13818-1 §2.4.2.2) — MPEG-TS carries no in-container index, so

@@ -53,6 +53,13 @@
 //! | `0x58` | local_time_offset_descriptor (EN 300 468 §6.2.20) | [`DescriptorBody::LocalTimeOffset`] |
 //! | `0x59` | subtitling_descriptor (EN 300 468 §6.2.41) | [`DescriptorBody::Subtitling`]      |
 //! | `0x63` | partial_transport_stream_descriptor (EN 300 468 §7.2.1) | [`DescriptorBody::PartialTransportStream`] |
+//! | `0x41` | service_list_descriptor (EN 300 468 §6.2.35) | [`DescriptorBody::ServiceList`] |
+//! | `0x49` | country_availability_descriptor (EN 300 468 §6.2.10) | [`DescriptorBody::CountryAvailability`] |
+//! | `0x4A` | linkage_descriptor (EN 300 468 §6.2.19) | [`DescriptorBody::Linkage`] |
+//! | `0x50` | component_descriptor (EN 300 468 §6.2.8) | [`DescriptorBody::Component`] |
+//! | `0x53` | CA_identifier_descriptor (EN 300 468 §6.2.5) | [`DescriptorBody::CaIdentifier`] |
+//! | `0x55` | parental_rating_descriptor (EN 300 468 §6.2.28) | [`DescriptorBody::ParentalRating`] |
+//! | `0x5F` | private_data_specifier_descriptor (EN 300 468 §6.2.31) | [`DescriptorBody::PrivateDataSpecifier`] |
 //! | `0x6A` | AC-3_descriptor (EN 300 468 annex D)  | [`DescriptorBody::Ac3`]                      |
 //! | `0x7A` | enhanced_AC-3_descriptor (EN 300 468 annex D) | [`DescriptorBody::EnhancedAc3`]      |
 //! | `0x7B` | DTS_descriptor (EN 300 468 annex G)   | [`DescriptorBody::Dts`]                      |
@@ -191,6 +198,41 @@ pub enum DescriptorBody<'a> {
     /// transmission-info descriptor loop; describes the rate / smoothing
     /// parameters of the partial TS.
     PartialTransportStream(PartialTransportStreamDescriptor),
+    /// `0x41` service_list_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.35 Table 91). Carried in the NIT / BAT transport-stream
+    /// descriptor loops; lists the services carried in a TS by
+    /// `(service_id, service_type)`.
+    ServiceList(ServiceListDescriptor),
+    /// `0x49` country_availability_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.10 Table 30). Carried in the BAT / SDT / SIT
+    /// descriptor loops; lists the countries where reception of a service
+    /// is (or is not) intended.
+    CountryAvailability(CountryAvailabilityDescriptor),
+    /// `0x4A` linkage_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.19 Table 59). Carried in the NIT / BAT / SDT / EIT / SIT
+    /// descriptor loops; points at a service offering additional
+    /// information about the entity the descriptor's location describes.
+    Linkage(LinkageDescriptor<'a>),
+    /// `0x50` component_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.8 Table 25). Carried in the SDT / EIT / SIT descriptor loops;
+    /// describes the editorial characteristics of one component stream
+    /// (its `(stream_content, stream_content_ext, component_type)`
+    /// classification, `component_tag`, language, and free text).
+    Component(ComponentDescriptor<'a>),
+    /// `0x53` CA_identifier_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.5 Table 22). Carried in the BAT / SDT / EIT / SIT descriptor
+    /// loops; lists the `CA_system_id`s a bouquet / service / event is
+    /// associated with.
+    CaIdentifier(CaIdentifierDescriptor),
+    /// `0x55` parental_rating_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.28 Table 82). Carried in the EIT event loop; gives
+    /// a per-country minimum-age rating for the event.
+    ParentalRating(ParentalRatingDescriptor),
+    /// `0x5F` private_data_specifier_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.31 Table 85). May be carried in the NIT / BAT /
+    /// SDT / EIT / PMT / SIT descriptor loops; scopes the interpretation
+    /// of any private descriptors / fields that follow it.
+    PrivateDataSpecifier(PrivateDataSpecifierDescriptor),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -1066,6 +1108,174 @@ impl PartialTransportStreamDescriptor {
     }
 }
 
+/// One `(service_id, service_type)` entry of a
+/// [`ServiceListDescriptor`] (ETSI EN 300 468 §6.2.35 Table 91).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceListEntry {
+    /// 16-bit `service_id` — equal to the `program_number` of the
+    /// corresponding `program_map_section` for normal services.
+    pub service_id: u16,
+    /// 8-bit `service_type` (Table 89). Common values: `0x01` digital
+    /// television, `0x02` digital radio, `0x16` advanced-codec SD digital
+    /// television, `0x19` advanced-codec HD digital television.
+    pub service_type: u8,
+}
+
+/// service_list_descriptor body (ETSI EN 300 468 §6.2.35 Table 91).
+///
+/// Carried in the transport-stream descriptor loop of a NIT or BAT
+/// sub_table, it enumerates the services a particular TS carries as a
+/// flat list of `(service_id, service_type)` pairs. A demuxer building
+/// a channel map from a NIT/BAT can read it without first opening every
+/// PMT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceListDescriptor {
+    /// The `(service_id, service_type)` entries, in wire order.
+    pub entries: Vec<ServiceListEntry>,
+}
+
+/// country_availability_descriptor body (ETSI EN 300 468 §6.2.10
+/// Table 30).
+///
+/// The single `country_availability_flag` decides whether the listed
+/// `country_code`s are countries where reception of the service is
+/// *intended* (`true`) or *not intended* (`false`). The descriptor may
+/// appear twice for one service — once for each polarity — with the
+/// "not intended" list overriding the "intended" list.
+///
+/// Each `country_code` is a 24-bit field of three ISO/IEC 8859-1 bytes:
+/// an ISO 3166 alpha-3 country code, or the decimal string of a
+/// 900..=999 country-group identifier (ETSI TS 101 162).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountryAvailabilityDescriptor {
+    /// `true` when the listed countries are those where reception is
+    /// intended; `false` when they are countries where it is not.
+    pub country_availability: bool,
+    /// The 3-byte country / country-group codes, in wire order.
+    pub country_codes: Vec<[u8; 3]>,
+}
+
+/// linkage_descriptor body (ETSI EN 300 468 §6.2.19 Table 59).
+///
+/// Identifies a service that can be presented if the consumer requests
+/// additional information about the entity the descriptor's *location*
+/// describes (the network for a NIT, the bouquet for a BAT, the service
+/// for an SDT, the event for an EIT). The common header carries the
+/// `(transport_stream_id, original_network_id, service_id)` triple that
+/// addresses the linked service plus an 8-bit `linkage_type` (Table 60).
+///
+/// `linkage_type` values `0x08` (mobile hand-over), `0x0D` (event
+/// linkage), and `0x0E..=0x1F` (extended event linkage) introduce a
+/// type-specific sub-structure before the `private_data_byte` run.
+/// Rather than decode each variant, the bytes following the header are
+/// surfaced verbatim as [`Self::link_data`] — the specialised body (if
+/// any) followed by the private-data run — so no information is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkageDescriptor<'a> {
+    /// 16-bit `transport_stream_id` of the TS carrying the linked
+    /// service.
+    pub transport_stream_id: u16,
+    /// 16-bit `original_network_id` of the originating delivery system.
+    pub original_network_id: u16,
+    /// 16-bit `service_id` of the linked service. When `linkage_type`
+    /// is `0x04` this field is not relevant and shall be `0x0000`.
+    pub service_id: u16,
+    /// 8-bit `linkage_type` (Table 60).
+    pub linkage_type: u8,
+    /// Everything after the fixed 7-byte header — the type-specific body
+    /// (mobile hand-over / event-linkage / extended-event-linkage info)
+    /// for `linkage_type` `0x08` / `0x0D` / `0x0E..=0x1F`, followed by
+    /// the `private_data_byte` run, verbatim.
+    pub link_data: &'a [u8],
+}
+
+/// component_descriptor body (ETSI EN 300 468 §6.2.8 Table 25).
+///
+/// Describes the editorial characteristics of one component stream. The
+/// `(stream_content, stream_content_ext, component_type)` triple
+/// classifies the component per Table 26 (e.g. MPEG-2 / H.264 / HEVC
+/// video at a given aspect ratio, or an audio mode); `component_tag`
+/// matches the `stream_identifier_descriptor` of the corresponding PMT
+/// `ES_info` loop. The trailing `text` is a free-text description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentDescriptor<'a> {
+    /// 4-bit `stream_content_ext` — combined with `stream_content` per
+    /// Table 26. For `stream_content` in `0x1..=0x8` this is `0xF` for
+    /// backward compatibility.
+    pub stream_content_ext: u8,
+    /// 4-bit `stream_content` — combined with `stream_content_ext` per
+    /// Table 26.
+    pub stream_content: u8,
+    /// 8-bit `component_type` (Table 26).
+    pub component_type: u8,
+    /// 8-bit `component_tag` — matches the `stream_identifier_descriptor`
+    /// `component_tag` of the same component in the PMT.
+    pub component_tag: u8,
+    /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
+    /// an ISO/IEC 8859-1 byte.
+    pub language_code: [u8; 3],
+    /// Raw `text` bytes — a free-text description of the component (DVB
+    /// text string, annex A).
+    pub text: &'a [u8],
+}
+
+/// CA_identifier_descriptor body (ETSI EN 300 468 §6.2.5 Table 22).
+///
+/// Lists the `CA_system_id`s a bouquet / service / event is associated
+/// with. Each id is coded per ETSI TS 101 162.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaIdentifierDescriptor {
+    /// The 16-bit `CA_system_id`s, in wire order.
+    pub ca_system_ids: Vec<u16>,
+}
+
+/// One `(country_code, rating)` entry of a
+/// [`ParentalRatingDescriptor`] (ETSI EN 300 468 §6.2.28 Table 82).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentalRatingEntry {
+    /// 24-bit `country_code` — three ISO/IEC 8859-1 bytes (ISO 3166
+    /// alpha-3, or a 900..=999 country-group decimal string).
+    pub country_code: [u8; 3],
+    /// 8-bit `rating` (Table 83): `0x00` undefined, `0x01..=0x0F`
+    /// minimum age = `rating + 3` years, `0x10..=0xFF` broadcaster
+    /// defined.
+    pub rating: u8,
+}
+
+impl ParentalRatingEntry {
+    /// The recommended minimum age in years per Table 83, or `None`
+    /// when the rating is `0x00` (undefined) or in the broadcaster-
+    /// defined range `0x10..=0xFF`.
+    pub fn minimum_age_years(self) -> Option<u8> {
+        match self.rating {
+            0x01..=0x0F => Some(self.rating + 3),
+            _ => None,
+        }
+    }
+}
+
+/// parental_rating_descriptor body (ETSI EN 300 468 §6.2.28 Table 82).
+///
+/// A flat array of `(country_code, rating)` entries giving the
+/// recommended minimum age per country for an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentalRatingDescriptor {
+    /// The `(country_code, rating)` entries, in wire order.
+    pub entries: Vec<ParentalRatingEntry>,
+}
+
+/// private_data_specifier_descriptor body (ETSI EN 300 468 §6.2.31
+/// Table 85).
+///
+/// Carries a single 32-bit `private_data_specifier` (coded per ETSI
+/// TS 101 162) that scopes the interpretation of any private
+/// descriptors / fields appearing after it in the same loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivateDataSpecifierDescriptor {
+    /// 32-bit `private_data_specifier`.
+    pub private_data_specifier: u32,
+}
+
 /// STD_descriptor body (§2.6.32 Table 2-60).
 ///
 /// When `leak_valid_flag == true`, the transfer of data from buffer
@@ -1304,6 +1514,13 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x7A => decode_enhanced_ac3(data).unwrap_or(DescriptorBody::Raw),
         0x7B => decode_dts(data).unwrap_or(DescriptorBody::Raw),
         0x63 => decode_partial_transport_stream(data).unwrap_or(DescriptorBody::Raw),
+        0x41 => decode_service_list(data).unwrap_or(DescriptorBody::Raw),
+        0x49 => decode_country_availability(data).unwrap_or(DescriptorBody::Raw),
+        0x4A => decode_linkage(data).unwrap_or(DescriptorBody::Raw),
+        0x50 => decode_component(data).unwrap_or(DescriptorBody::Raw),
+        0x53 => decode_ca_identifier(data).unwrap_or(DescriptorBody::Raw),
+        0x55 => decode_parental_rating(data).unwrap_or(DescriptorBody::Raw),
+        0x5F => decode_private_data_specifier(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
 }
@@ -1331,6 +1548,135 @@ fn decode_partial_transport_stream(data: &[u8]) -> Option<DescriptorBody<'_>> {
             peak_rate,
             minimum_overall_smoothing_rate,
             maximum_overall_smoothing_buffer,
+        },
+    ))
+}
+
+fn decode_service_list(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.35 Table 91 — a flat array of 3-byte records:
+    //   service_id   (16)
+    //   service_type (8)
+    const ENTRY_LEN: usize = 3;
+    if data.len() % ENTRY_LEN != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
+    for chunk in data.chunks_exact(ENTRY_LEN) {
+        entries.push(ServiceListEntry {
+            service_id: u16::from_be_bytes([chunk[0], chunk[1]]),
+            service_type: chunk[2],
+        });
+    }
+    Some(DescriptorBody::ServiceList(ServiceListDescriptor {
+        entries,
+    }))
+}
+
+fn decode_country_availability(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.10 Table 30:
+    //   country_availability_flag (1) | reserved_future_use (7)
+    //   then N × country_code (24)
+    if data.is_empty() {
+        return None;
+    }
+    let country_availability = (data[0] & 0b1000_0000) != 0;
+    let rest = &data[1..];
+    if rest.len() % 3 != 0 {
+        return None;
+    }
+    let mut country_codes = Vec::with_capacity(rest.len() / 3);
+    for chunk in rest.chunks_exact(3) {
+        country_codes.push([chunk[0], chunk[1], chunk[2]]);
+    }
+    Some(DescriptorBody::CountryAvailability(
+        CountryAvailabilityDescriptor {
+            country_availability,
+            country_codes,
+        },
+    ))
+}
+
+fn decode_linkage(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.19 Table 59 — fixed 7-byte header:
+    //   transport_stream_id  (16)
+    //   original_network_id  (16)
+    //   service_id           (16)
+    //   linkage_type         (8)
+    // then a type-specific body + private_data_byte run, surfaced raw.
+    if data.len() < 7 {
+        return None;
+    }
+    Some(DescriptorBody::Linkage(LinkageDescriptor {
+        transport_stream_id: u16::from_be_bytes([data[0], data[1]]),
+        original_network_id: u16::from_be_bytes([data[2], data[3]]),
+        service_id: u16::from_be_bytes([data[4], data[5]]),
+        linkage_type: data[6],
+        link_data: &data[7..],
+    }))
+}
+
+fn decode_component(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.8 Table 25 — fixed 6-byte header:
+    //   stream_content_ext (4) | stream_content (4)
+    //   component_type     (8)
+    //   component_tag      (8)
+    //   ISO_639_language_code (24)
+    // then a free-text run.
+    if data.len() < 6 {
+        return None;
+    }
+    Some(DescriptorBody::Component(ComponentDescriptor {
+        stream_content_ext: data[0] >> 4,
+        stream_content: data[0] & 0x0F,
+        component_type: data[1],
+        component_tag: data[2],
+        language_code: [data[3], data[4], data[5]],
+        text: &data[6..],
+    }))
+}
+
+fn decode_ca_identifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.5 Table 22 — N × CA_system_id (16).
+    if data.len() % 2 != 0 {
+        return None;
+    }
+    let mut ca_system_ids = Vec::with_capacity(data.len() / 2);
+    for chunk in data.chunks_exact(2) {
+        ca_system_ids.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    Some(DescriptorBody::CaIdentifier(CaIdentifierDescriptor {
+        ca_system_ids,
+    }))
+}
+
+fn decode_parental_rating(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.28 Table 82 — a flat array of 4-byte records:
+    //   country_code (24)
+    //   rating       (8)
+    const ENTRY_LEN: usize = 4;
+    if data.len() % ENTRY_LEN != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
+    for chunk in data.chunks_exact(ENTRY_LEN) {
+        entries.push(ParentalRatingEntry {
+            country_code: [chunk[0], chunk[1], chunk[2]],
+            rating: chunk[3],
+        });
+    }
+    Some(DescriptorBody::ParentalRating(ParentalRatingDescriptor {
+        entries,
+    }))
+}
+
+fn decode_private_data_specifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.31 Table 85 — fixed 4-byte body.
+    if data.len() < 4 {
+        return None;
+    }
+    Some(DescriptorBody::PrivateDataSpecifier(
+        PrivateDataSpecifierDescriptor {
+            private_data_specifier: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
         },
     ))
 }
@@ -4047,5 +4393,141 @@ mod tests {
         let d = iter_descriptors(&block).next().unwrap().unwrap();
         assert!(matches!(d.body, DescriptorBody::Raw));
         assert_eq!(d.data.len(), 7);
+    }
+
+    #[test]
+    fn service_list_descriptor_decodes_entries() {
+        // Two (service_id, service_type) pairs.
+        let block = tlv(0x41, &[0x10, 0x01, 0x01, 0x10, 0x02, 0x02]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ServiceList(s) => {
+                assert_eq!(s.entries.len(), 2);
+                assert_eq!(s.entries[0].service_id, 0x1001);
+                assert_eq!(s.entries[0].service_type, 0x01);
+                assert_eq!(s.entries[1].service_id, 0x1002);
+                assert_eq!(s.entries[1].service_type, 0x02);
+            }
+            other => panic!("expected ServiceList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_list_descriptor_misaligned_falls_back_to_raw() {
+        // 4 bytes is not a multiple of the 3-byte entry size.
+        let block = tlv(0x41, &[0x10, 0x01, 0x01, 0x99]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn country_availability_descriptor_intended_flag_and_codes() {
+        // flag byte 0x80 → available == true, then "GBR".
+        let block = tlv(0x49, &[0x80, b'G', b'B', b'R']);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::CountryAvailability(c) => {
+                assert!(c.country_availability);
+                assert_eq!(c.country_codes, vec![[b'G', b'B', b'R']]);
+            }
+            other => panic!("expected CountryAvailability, got {other:?}"),
+        }
+        // flag byte 0x00 → available == false.
+        let block = tlv(0x49, &[0x00, b'F', b'R', b'A']);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::CountryAvailability(c) => {
+                assert!(!c.country_availability);
+                assert_eq!(c.country_codes, vec![[b'F', b'R', b'A']]);
+            }
+            other => panic!("expected CountryAvailability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linkage_descriptor_decodes_header_and_link_data() {
+        // tsid=0x0001, onid=0x0002, sid=0x0003, type=0x05, then 2 bytes.
+        let block = tlv(
+            0x4A,
+            &[0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x05, 0xAA, 0xBB],
+        );
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Linkage(l) => {
+                assert_eq!(l.transport_stream_id, 0x0001);
+                assert_eq!(l.original_network_id, 0x0002);
+                assert_eq!(l.service_id, 0x0003);
+                assert_eq!(l.linkage_type, 0x05);
+                assert_eq!(l.link_data, &[0xAA, 0xBB]);
+            }
+            other => panic!("expected Linkage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linkage_descriptor_short_header_falls_back_to_raw() {
+        let block = tlv(0x4A, &[0x00, 0x01, 0x00, 0x02, 0x00, 0x03]); // 6 < 7
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn component_descriptor_decodes_classification_and_text() {
+        // stream_content_ext=0xF, stream_content=0x9 (HEVC), type=0x80,
+        // tag=0x05, lang="eng", text="HD".
+        let block = tlv(0x50, &[0xF9, 0x80, 0x05, b'e', b'n', b'g', b'H', b'D']);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Component(c) => {
+                assert_eq!(c.stream_content_ext, 0xF);
+                assert_eq!(c.stream_content, 0x9);
+                assert_eq!(c.component_type, 0x80);
+                assert_eq!(c.component_tag, 0x05);
+                assert_eq!(&c.language_code, b"eng");
+                assert_eq!(c.text, b"HD");
+            }
+            other => panic!("expected Component, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ca_identifier_descriptor_decodes_system_ids() {
+        let block = tlv(0x53, &[0x09, 0x00, 0x18, 0x34]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::CaIdentifier(c) => {
+                assert_eq!(c.ca_system_ids, vec![0x0900, 0x1834]);
+            }
+            other => panic!("expected CaIdentifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parental_rating_descriptor_decodes_and_maps_age() {
+        // "GBR" rating 0x04 → min age 7; "FRA" rating 0x00 → undefined.
+        let block = tlv(0x55, &[b'G', b'B', b'R', 0x04, b'F', b'R', b'A', 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ParentalRating(p) => {
+                assert_eq!(p.entries.len(), 2);
+                assert_eq!(&p.entries[0].country_code, b"GBR");
+                assert_eq!(p.entries[0].rating, 0x04);
+                assert_eq!(p.entries[0].minimum_age_years(), Some(7));
+                assert_eq!(p.entries[1].minimum_age_years(), None);
+            }
+            other => panic!("expected ParentalRating, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn private_data_specifier_descriptor_decodes_32bit() {
+        let block = tlv(0x5F, &[0x00, 0x00, 0x23, 0x3A]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::PrivateDataSpecifier(p) => {
+                assert_eq!(p.private_data_specifier, 0x0000_233A);
+            }
+            other => panic!("expected PrivateDataSpecifier, got {other:?}"),
+        }
     }
 }
