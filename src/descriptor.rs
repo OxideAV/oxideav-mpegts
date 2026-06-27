@@ -64,6 +64,12 @@
 //! | `0x44` | cable_delivery_system_descriptor (EN 300 468 §6.2.13.1) | [`DescriptorBody::CableDeliverySystem`] |
 //! | `0x5A` | terrestrial_delivery_system_descriptor (EN 300 468 §6.2.13.4) | [`DescriptorBody::TerrestrialDeliverySystem`] |
 //! | `0x62` | frequency_list_descriptor (EN 300 468 §6.2.17) | [`DescriptorBody::FrequencyList`] |
+//! | `0x60` | service_move_descriptor (EN 300 468 §6.2.36) | [`DescriptorBody::ServiceMove`] |
+//! | `0x61` | short_smoothing_buffer_descriptor (EN 300 468 §6.2.38) | [`DescriptorBody::ShortSmoothingBuffer`] |
+//! | `0x65` | scrambling_descriptor (EN 300 468 §6.2.32) | [`DescriptorBody::Scrambling`] |
+//! | `0x66` | data_broadcast_id_descriptor (EN 300 468 §6.2.12) | [`DescriptorBody::DataBroadcastId`] |
+//! | `0x6B` | ancillary_data_descriptor (EN 300 468 §6.2.2) | [`DescriptorBody::AncillaryData`] |
+//! | `0x7C` | AAC_descriptor (EN 300 468 annex H) | [`DescriptorBody::Aac`] |
 //! | `0x6A` | AC-3_descriptor (EN 300 468 annex D)  | [`DescriptorBody::Ac3`]                      |
 //! | `0x7A` | enhanced_AC-3_descriptor (EN 300 468 annex D) | [`DescriptorBody::EnhancedAc3`]      |
 //! | `0x7B` | DTS_descriptor (EN 300 468 annex G)   | [`DescriptorBody::Dts`]                      |
@@ -254,6 +260,35 @@ pub enum DescriptorBody<'a> {
     /// additional frequencies of a multiplex transmitted on several
     /// frequencies.
     FrequencyList(FrequencyListDescriptor),
+    /// `0x60` service_move_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.36 Table 92). Carried in a PMT `ES_info` loop while a service
+    /// migrates between transport streams; carries the new
+    /// `(original_network_id, transport_stream_id, service_id)` triple.
+    ServiceMove(ServiceMoveDescriptor),
+    /// `0x61` short_smoothing_buffer_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.38 Table 94). Carried in EIT present/following /
+    /// schedule loops; signals an event's bit-rate as a smoothing-buffer
+    /// size + leak-rate code.
+    ShortSmoothingBuffer(ShortSmoothingBufferDescriptor<'a>),
+    /// `0x65` scrambling_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.32 Table 86). Carried in a PMT program-info loop; selects the
+    /// scrambling mode (annex E).
+    Scrambling(ScramblingDescriptor),
+    /// `0x66` data_broadcast_id_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.12 Table 32). Carried in a PMT `ES_info` loop; the
+    /// short form of the data_broadcast_descriptor identifying the data
+    /// broadcast specification by `data_broadcast_id` plus selector bytes.
+    DataBroadcastId(DataBroadcastIdDescriptor<'a>),
+    /// `0x6B` ancillary_data_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.2 Table 15). Carried in a PMT `ES_info` loop;
+    /// indicates the presence + type of ancillary data in an audio
+    /// elementary stream as a bit-flag identifier.
+    AncillaryData(AncillaryDataDescriptor),
+    /// `0x7C` AAC_descriptor — DVB SI extension (ETSI EN 300 468 annex H
+    /// Table H.1). Carried in a PMT `ES_info` loop; identifies an MPEG-4
+    /// AAC / HE-AAC / HE-AAC v2 audio stream with its profile-and-level
+    /// and optional `AAC_type`.
+    Aac(AacDescriptor<'a>),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -1408,6 +1443,121 @@ pub struct FrequencyListDescriptor {
     pub centre_frequencies: Vec<u32>,
 }
 
+/// service_move_descriptor body (ETSI EN 300 468 §6.2.36 Table 92) —
+/// a fixed 6-byte body carrying the post-move addressing triple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceMoveDescriptor {
+    /// 16-bit `new_original_network_id`.
+    pub new_original_network_id: u16,
+    /// 16-bit `new_transport_stream_id`.
+    pub new_transport_stream_id: u16,
+    /// 16-bit `new_service_id`.
+    pub new_service_id: u16,
+}
+
+/// short_smoothing_buffer_descriptor body (ETSI EN 300 468 §6.2.38
+/// Table 94).
+///
+/// Signals an EIT event's bit-rate compactly: `sb_size` (Table 95)
+/// codes the smoothing-buffer size (`1` ⇒ 1 536 bytes) and `sb_leak_rate`
+/// (Table 96) codes the leak rate in Mbit/s. Any trailing
+/// `reserved_future_use` bytes are preserved in `reserved`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortSmoothingBufferDescriptor<'a> {
+    /// 2-bit `sb_size` (Table 95).
+    pub sb_size: u8,
+    /// 6-bit `sb_leak_rate` (Table 96).
+    pub sb_leak_rate: u8,
+    /// Trailing `reserved_future_use` bytes, preserved verbatim.
+    pub reserved: &'a [u8],
+}
+
+/// scrambling_descriptor body (ETSI EN 300 468 §6.2.32 Table 86) — a
+/// fixed 1-byte body carrying the `scrambling_mode` (annex E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScramblingDescriptor {
+    /// 8-bit `scrambling_mode` (annex E).
+    pub scrambling_mode: u8,
+}
+
+/// data_broadcast_id_descriptor body (ETSI EN 300 468 §6.2.12
+/// Table 32).
+///
+/// The short form of the data_broadcast_descriptor: a 16-bit
+/// `data_broadcast_id` (coded per ETSI TS 101 162) plus a run of
+/// `selector_byte`s whose interpretation depends on the id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataBroadcastIdDescriptor<'a> {
+    /// 16-bit `data_broadcast_id`.
+    pub data_broadcast_id: u16,
+    /// Raw `selector_byte` run.
+    pub selector_bytes: &'a [u8],
+}
+
+/// ancillary_data_descriptor body (ETSI EN 300 468 §6.2.2 Table 15) —
+/// a fixed 1-byte body whose bits flag the ancillary data present in an
+/// audio elementary stream (Table 16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AncillaryDataDescriptor {
+    /// 8-bit `ancillary_data_identifier` bit-flags (Table 16).
+    pub ancillary_data_identifier: u8,
+}
+
+impl AncillaryDataDescriptor {
+    /// `b0` — DVD-Video ancillary data present.
+    pub fn dvd_video(self) -> bool {
+        self.ancillary_data_identifier & 0b0000_0001 != 0
+    }
+    /// `b1` — Extended ancillary data present.
+    pub fn extended(self) -> bool {
+        self.ancillary_data_identifier & 0b0000_0010 != 0
+    }
+    /// `b2` — Announcement-switching data present.
+    pub fn announcement_switching(self) -> bool {
+        self.ancillary_data_identifier & 0b0000_0100 != 0
+    }
+    /// `b3` — DAB ancillary data present.
+    pub fn dab(self) -> bool {
+        self.ancillary_data_identifier & 0b0000_1000 != 0
+    }
+    /// `b4` — Scale-factor error-check (ScF-CRC) present.
+    pub fn scale_factor_error_check(self) -> bool {
+        self.ancillary_data_identifier & 0b0001_0000 != 0
+    }
+    /// `b5` — MPEG-4 ancillary data present.
+    pub fn mpeg4(self) -> bool {
+        self.ancillary_data_identifier & 0b0010_0000 != 0
+    }
+    /// `b6` — RDS-via-UECP ancillary data present.
+    pub fn rds_via_uecp(self) -> bool {
+        self.ancillary_data_identifier & 0b0100_0000 != 0
+    }
+}
+
+/// AAC_descriptor body (ETSI EN 300 468 annex H Table H.1).
+///
+/// Identifies an MPEG-4 AAC / HE-AAC / HE-AAC v2 audio stream in a PMT
+/// `ES_info` loop. The `profile_and_level` byte mirrors the
+/// MPEG-4_audio_descriptor's `MPEG-4_audio_profile_and_level`; when the
+/// descriptor body is longer than one byte the flag byte's
+/// `AAC_type_flag` gates an optional `AAC_type`, and any further bytes
+/// are `additional_info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AacDescriptor<'a> {
+    /// 8-bit `profile_and_level`.
+    pub profile_and_level: u8,
+    /// `AAC_type_flag` — `true` when [`Self::aac_type`] is present.
+    pub aac_type_flag: bool,
+    /// `SAOC_DE_flag` — `true` when SAOC-DE parametric data is embedded
+    /// (Table H.2).
+    pub saoc_de_flag: bool,
+    /// Optional `AAC_type` (set per Table 26 `component_type` for
+    /// `stream_content == 0x06`), present only when `aac_type_flag`.
+    pub aac_type: Option<u8>,
+    /// Raw `additional_info` bytes.
+    pub additional_info: &'a [u8],
+}
+
 /// STD_descriptor body (§2.6.32 Table 2-60).
 ///
 /// When `leak_valid_flag == true`, the transfer of data from buffer
@@ -1657,6 +1807,12 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x44 => decode_cable_delivery(data).unwrap_or(DescriptorBody::Raw),
         0x5A => decode_terrestrial_delivery(data).unwrap_or(DescriptorBody::Raw),
         0x62 => decode_frequency_list(data).unwrap_or(DescriptorBody::Raw),
+        0x60 => decode_service_move(data).unwrap_or(DescriptorBody::Raw),
+        0x61 => decode_short_smoothing_buffer(data).unwrap_or(DescriptorBody::Raw),
+        0x65 => decode_scrambling(data).unwrap_or(DescriptorBody::Raw),
+        0x66 => decode_data_broadcast_id(data).unwrap_or(DescriptorBody::Raw),
+        0x6B => decode_ancillary_data(data).unwrap_or(DescriptorBody::Raw),
+        0x7C => decode_aac(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
 }
@@ -1815,6 +1971,106 @@ fn decode_private_data_specifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
             private_data_specifier: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
         },
     ))
+}
+
+fn decode_service_move(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.36 Table 92 — fixed 6-byte body.
+    if data.len() < 6 {
+        return None;
+    }
+    Some(DescriptorBody::ServiceMove(ServiceMoveDescriptor {
+        new_original_network_id: u16::from_be_bytes([data[0], data[1]]),
+        new_transport_stream_id: u16::from_be_bytes([data[2], data[3]]),
+        new_service_id: u16::from_be_bytes([data[4], data[5]]),
+    }))
+}
+
+fn decode_short_smoothing_buffer(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.38 Table 94:
+    //   sb_size (2) | sb_leak_rate (6), then reserved_future_use bytes.
+    if data.is_empty() {
+        return None;
+    }
+    Some(DescriptorBody::ShortSmoothingBuffer(
+        ShortSmoothingBufferDescriptor {
+            sb_size: data[0] >> 6,
+            sb_leak_rate: data[0] & 0b0011_1111,
+            reserved: &data[1..],
+        },
+    ))
+}
+
+fn decode_scrambling(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.32 Table 86 — fixed 1-byte body.
+    if data.is_empty() {
+        return None;
+    }
+    Some(DescriptorBody::Scrambling(ScramblingDescriptor {
+        scrambling_mode: data[0],
+    }))
+}
+
+fn decode_data_broadcast_id(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.12 Table 32:
+    //   data_broadcast_id (16), then selector_byte run.
+    if data.len() < 2 {
+        return None;
+    }
+    Some(DescriptorBody::DataBroadcastId(DataBroadcastIdDescriptor {
+        data_broadcast_id: u16::from_be_bytes([data[0], data[1]]),
+        selector_bytes: &data[2..],
+    }))
+}
+
+fn decode_ancillary_data(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.2 Table 15 — fixed 1-byte body.
+    if data.is_empty() {
+        return None;
+    }
+    Some(DescriptorBody::AncillaryData(AncillaryDataDescriptor {
+        ancillary_data_identifier: data[0],
+    }))
+}
+
+fn decode_aac(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 annex H Table H.1:
+    //   profile_and_level (8)
+    //   if (descriptor_length > 1) {
+    //     AAC_type_flag (1) | SAOC_DE_flag (1) | reserved (6)
+    //     if (AAC_type_flag) { AAC_type (8) }
+    //     additional_info_byte run
+    //   }
+    if data.is_empty() {
+        return None;
+    }
+    let profile_and_level = data[0];
+    if data.len() == 1 {
+        return Some(DescriptorBody::Aac(AacDescriptor {
+            profile_and_level,
+            aac_type_flag: false,
+            saoc_de_flag: false,
+            aac_type: None,
+            additional_info: &[],
+        }));
+    }
+    let flags = data[1];
+    let aac_type_flag = (flags & 0b1000_0000) != 0;
+    let saoc_de_flag = (flags & 0b0100_0000) != 0;
+    let mut rest = &data[2..];
+    let aac_type = if aac_type_flag {
+        let b = *rest.first()?;
+        rest = &rest[1..];
+        Some(b)
+    } else {
+        None
+    };
+    Some(DescriptorBody::Aac(AacDescriptor {
+        profile_and_level,
+        aac_type_flag,
+        saoc_de_flag,
+        aac_type,
+        additional_info: rest,
+    }))
 }
 
 fn decode_satellite_delivery(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -4927,6 +5183,106 @@ mod tests {
             let block = tlv(tag, &[0u8; 10]); // one short of 11
             let d = iter_descriptors(&block).next().unwrap().unwrap();
             assert!(matches!(d.body, DescriptorBody::Raw), "tag {tag:#x}");
+        }
+    }
+
+    #[test]
+    fn service_move_descriptor_decodes_triple() {
+        let block = tlv(0x60, &[0x00, 0x02, 0x00, 0x01, 0x00, 0x03]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ServiceMove(s) => {
+                assert_eq!(s.new_original_network_id, 0x0002);
+                assert_eq!(s.new_transport_stream_id, 0x0001);
+                assert_eq!(s.new_service_id, 0x0003);
+            }
+            other => panic!("expected ServiceMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_smoothing_buffer_descriptor_decodes_size_and_rate() {
+        // sb_size=1 (0b01), sb_leak_rate=8 (0b001000) → byte 0b01_001000.
+        let block = tlv(0x61, &[0b0100_1000, 0xFF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ShortSmoothingBuffer(s) => {
+                assert_eq!(s.sb_size, 1);
+                assert_eq!(s.sb_leak_rate, 8);
+                assert_eq!(s.reserved, &[0xFF]);
+            }
+            other => panic!("expected ShortSmoothingBuffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scrambling_descriptor_decodes_mode() {
+        let block = tlv(0x65, &[0x01]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Scrambling(s) => assert_eq!(s.scrambling_mode, 0x01),
+            other => panic!("expected Scrambling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_broadcast_id_descriptor_decodes_id_and_selector() {
+        let block = tlv(0x66, &[0x00, 0x0A, 0xDE, 0xAD]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::DataBroadcastId(b) => {
+                assert_eq!(b.data_broadcast_id, 0x000A);
+                assert_eq!(b.selector_bytes, &[0xDE, 0xAD]);
+            }
+            other => panic!("expected DataBroadcastId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ancillary_data_descriptor_decodes_flag_bits() {
+        // b0 (DVD-Video) and b5 (MPEG-4) set → 0b0010_0001 = 0x21.
+        let block = tlv(0x6B, &[0x21]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::AncillaryData(a) => {
+                assert_eq!(a.ancillary_data_identifier, 0x21);
+                assert!(a.dvd_video());
+                assert!(a.mpeg4());
+                assert!(!a.extended());
+                assert!(!a.dab());
+                assert!(!a.rds_via_uecp());
+            }
+            other => panic!("expected AncillaryData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aac_descriptor_decodes_minimal_and_full() {
+        // Minimal: just profile_and_level.
+        let block = tlv(0x7C, &[0x50]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Aac(a) => {
+                assert_eq!(a.profile_and_level, 0x50);
+                assert!(!a.aac_type_flag);
+                assert_eq!(a.aac_type, None);
+                assert!(a.additional_info.is_empty());
+            }
+            other => panic!("expected Aac, got {other:?}"),
+        }
+        // Full: profile, flags (AAC_type_flag=1, SAOC_DE_flag=1 → 0xC0),
+        // AAC_type, one additional_info byte.
+        let block = tlv(0x7C, &[0x50, 0xC0, 0x05, 0x99]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Aac(a) => {
+                assert_eq!(a.profile_and_level, 0x50);
+                assert!(a.aac_type_flag);
+                assert!(a.saoc_de_flag);
+                assert_eq!(a.aac_type, Some(0x05));
+                assert_eq!(a.additional_info, &[0x99]);
+            }
+            other => panic!("expected Aac, got {other:?}"),
         }
     }
 }

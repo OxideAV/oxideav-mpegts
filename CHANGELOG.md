@@ -11,6 +11,18 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- Six more PMT / EIT DVB descriptors now decode to typed bodies (ETSI
+  EN 300 468): `service_move_descriptor` (tag `0x60`, §6.2.36 — the
+  post-move `(original_network_id, transport_stream_id, service_id)`
+  triple), `short_smoothing_buffer_descriptor` (tag `0x61`, §6.2.38 —
+  `sb_size` / `sb_leak_rate` event bit-rate signalling),
+  `scrambling_descriptor` (tag `0x65`, §6.2.32 — the `scrambling_mode`),
+  `data_broadcast_id_descriptor` (tag `0x66`, §6.2.12 —
+  `data_broadcast_id` + selector bytes), `ancillary_data_descriptor`
+  (tag `0x6B`, §6.2.2 — the Table-16 ancillary-data bit-flags with
+  per-field accessors), and `AAC_descriptor` (tag `0x7C`, annex H —
+  `profile_and_level` plus the optional flag byte / `AAC_type` /
+  `additional_info`). Malformed bodies still fall back to `Raw`.
 - The four DVB NIT delivery-system descriptors now decode to typed
   bodies (ETSI EN 300 468 §6.2.13 / §6.2.17):
   `satellite_delivery_system_descriptor` (tag `0x43`, §6.2.13.2 — the
