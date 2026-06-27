@@ -11,6 +11,17 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- The DVB `extension_descriptor` (tag `0x7F`, ETSI EN 300 468 §6.2.16
+  Table 54) now decodes its `descriptor_tag_extension` envelope (clause
+  6.3 Table 109) into a typed `DescriptorBody::Extension`. The selector
+  field is exposed both raw and, for `descriptor_tag_extension == 0x06`,
+  decoded into a typed `supplementary_audio_descriptor` (§6.4.11
+  Table 153 — `mix_type`, `editorial_classification`, and the optional
+  overriding `ISO_639_language_code`). Unknown extension sub-tags keep
+  their selector bytes verbatim.
+- Every public descriptor body type is now re-exported from the crate
+  root (previously a subset was reachable only via the `descriptor::`
+  module path).
 - Six more PMT / EIT DVB descriptors now decode to typed bodies (ETSI
   EN 300 468): `service_move_descriptor` (tag `0x60`, §6.2.36 — the
   post-move `(original_network_id, transport_stream_id, service_id)`

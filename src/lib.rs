@@ -80,9 +80,11 @@
 //!   `short_event_descriptor` (tag `0x4D`) names the event and the
 //!   `extended_event_descriptor` (tag `0x4E`) carries its detailed
 //!   two-column item list plus non-itemized synopsis text.
-//! - Conditional Access (CA) descriptors / scrambling.
-//! - Re-multiplexing — this is a demux-only crate. The MKV writer
-//!   in `oxideav-mkv` owns the output side.
+//! - Descrambling of scrambled payloads. The `CA_descriptor` (tag
+//!   `0x09`), `CA_identifier_descriptor` (tag `0x53`), and
+//!   `scrambling_descriptor` (tag `0x65`) are *parsed* so a caller can
+//!   see the CA system / PID / scrambling mode, but the crate performs
+//!   no CA / CSA decryption.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -112,17 +114,19 @@ pub use descriptor::{
     CaIdentifierDescriptor, CableDeliverySystemDescriptor, ComponentDescriptor, ContentDescriptor,
     ContentNibble, CopyrightDescriptor, CountryAvailabilityDescriptor, DataBroadcastIdDescriptor,
     DataStreamAlignmentDescriptor, Descriptor, DescriptorBody, DescriptorIter, DtsDescriptor,
-    EnhancedAc3Descriptor, ExtendedEventDescriptor, ExtendedEventItem, FrequencyListDescriptor,
-    HevcVideoDescriptor, HierarchyDescriptor, HierarchyType, IbpDescriptor, Iso639Language,
-    LinkageDescriptor, LocalTimeOffsetDescriptor, LocalTimeOffsetEntry, MaximumBitrateDescriptor,
-    MultiplexBufferUtilizationDescriptor, NetworkNameDescriptor, ParentalRatingDescriptor,
-    ParentalRatingEntry, PartialTransportStreamDescriptor, PrivateDataSpecifierDescriptor,
+    EnhancedAc3Descriptor, ExtendedEventDescriptor, ExtendedEventItem, ExtensionBody,
+    ExtensionDescriptor, FrequencyListDescriptor, HevcVideoDescriptor, HierarchyDescriptor,
+    HierarchyType, IbpDescriptor, Iso639Language, LinkageDescriptor, LocalTimeOffsetDescriptor,
+    LocalTimeOffsetEntry, MaximumBitrateDescriptor, MultiplexBufferUtilizationDescriptor,
+    NetworkNameDescriptor, ParentalRatingDescriptor, ParentalRatingEntry,
+    PartialTransportStreamDescriptor, PrivateDataSpecifierDescriptor,
     SatelliteDeliverySystemDescriptor, ScramblingDescriptor, ServiceDescriptor,
     ServiceListDescriptor, ServiceListEntry, ServiceMoveDescriptor, ShortEventDescriptor,
     ShortSmoothingBufferDescriptor, SmoothingBufferDescriptor, StdDescriptor,
     StreamIdentifierDescriptor, StuffingDescriptor, SubtitlingDescriptor, SubtitlingEntry,
-    SystemClockDescriptor, TargetBackgroundGridDescriptor, TeletextDescriptor, TeletextEntry,
-    TerrestrialDeliverySystemDescriptor, VideoStreamDescriptor, VideoWindowDescriptor,
+    SupplementaryAudioDescriptor, SystemClockDescriptor, TargetBackgroundGridDescriptor,
+    TeletextDescriptor, TeletextEntry, TerrestrialDeliverySystemDescriptor, VideoStreamDescriptor,
+    VideoWindowDescriptor,
 };
 pub use error::TsError;
 pub use packet::{

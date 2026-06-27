@@ -70,6 +70,7 @@
 //! | `0x66` | data_broadcast_id_descriptor (EN 300 468 §6.2.12) | [`DescriptorBody::DataBroadcastId`] |
 //! | `0x6B` | ancillary_data_descriptor (EN 300 468 §6.2.2) | [`DescriptorBody::AncillaryData`] |
 //! | `0x7C` | AAC_descriptor (EN 300 468 annex H) | [`DescriptorBody::Aac`] |
+//! | `0x7F` | extension_descriptor (EN 300 468 §6.2.16 / clause 6.4) | [`DescriptorBody::Extension`] |
 //! | `0x6A` | AC-3_descriptor (EN 300 468 annex D)  | [`DescriptorBody::Ac3`]                      |
 //! | `0x7A` | enhanced_AC-3_descriptor (EN 300 468 annex D) | [`DescriptorBody::EnhancedAc3`]      |
 //! | `0x7B` | DTS_descriptor (EN 300 468 annex G)   | [`DescriptorBody::Dts`]                      |
@@ -289,6 +290,13 @@ pub enum DescriptorBody<'a> {
     /// AAC / HE-AAC / HE-AAC v2 audio stream with its profile-and-level
     /// and optional `AAC_type`.
     Aac(AacDescriptor<'a>),
+    /// `0x7F` extension_descriptor — DVB SI extension (ETSI EN 300 468
+    /// §6.2.16 Table 54). Extends the 8-bit `descriptor_tag` namespace
+    /// with a `descriptor_tag_extension` byte (clause 6.3 Table 109)
+    /// followed by a selector field. The envelope is always decoded; a
+    /// small set of extension sub-tags decode their selector into a typed
+    /// [`ExtensionBody`], the rest surface their selector bytes raw.
+    Extension(ExtensionDescriptor<'a>),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -1558,6 +1566,61 @@ pub struct AacDescriptor<'a> {
     pub additional_info: &'a [u8],
 }
 
+/// extension_descriptor body (ETSI EN 300 468 §6.2.16 Table 54).
+///
+/// The `descriptor_tag_extension` (clause 6.3 Table 109) selects a
+/// second-level descriptor inside the `0x7F` namespace. The selector
+/// field is exposed both raw ([`Self::selector`]) and, for the
+/// extension tags this module decodes, as a typed [`ExtensionBody`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionDescriptor<'a> {
+    /// 8-bit `descriptor_tag_extension` (Table 109). Notable values:
+    /// `0x04` T2 delivery system, `0x06` supplementary audio, `0x0D` C2
+    /// delivery system, `0x15` AC-4, `0x19` audio preselection.
+    pub tag_extension: u8,
+    /// Raw `selector_byte` run (everything after `tag_extension`).
+    pub selector: &'a [u8],
+    /// Typed decode of the selector for the extension tags this module
+    /// understands; otherwise [`ExtensionBody::Raw`].
+    pub body: ExtensionBody<'a>,
+}
+
+/// Typed body for the extension_descriptor sub-tags this module decodes
+/// (ETSI EN 300 468 clause 6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionBody<'a> {
+    /// `0x06` supplementary_audio_descriptor (§6.4.11 Table 153).
+    SupplementaryAudio(SupplementaryAudioDescriptor<'a>),
+    /// Selector bytes for an extension tag this module does not decode.
+    Raw,
+}
+
+/// supplementary_audio_descriptor selector (ETSI EN 300 468 §6.4.11
+/// Table 153) — the body of an `extension_descriptor` with
+/// `descriptor_tag_extension == 0x06`.
+///
+/// Carried in a PMT `ES_info` audio loop; describes how the audio
+/// component is meant to be presented / mixed and optionally overrides
+/// the ES loop's language code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupplementaryAudioDescriptor<'a> {
+    /// `mix_type` (Table 154): `false` a dependent stream meant to be
+    /// mixed, `true` a complete and independent stream.
+    pub mix_type_independent: bool,
+    /// 5-bit `editorial_classification` (Table 155): `0x00` main audio,
+    /// `0x01` audio description, `0x02` clean audio, `0x03` spoken
+    /// subtitles, `0x04` dependent parametric data, `0x17` unspecific
+    /// supplementary audio.
+    pub editorial_classification: u8,
+    /// `language_code_present` — whether [`Self::language_code`] is set.
+    pub language_code_present: bool,
+    /// Overriding `ISO_639_language_code`, present only when
+    /// `language_code_present`.
+    pub language_code: Option<[u8; 3]>,
+    /// Raw `private_data_byte` run.
+    pub private_data: &'a [u8],
+}
+
 /// STD_descriptor body (§2.6.32 Table 2-60).
 ///
 /// When `leak_valid_flag == true`, the transfer of data from buffer
@@ -1813,6 +1876,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x66 => decode_data_broadcast_id(data).unwrap_or(DescriptorBody::Raw),
         0x6B => decode_ancillary_data(data).unwrap_or(DescriptorBody::Raw),
         0x7C => decode_aac(data).unwrap_or(DescriptorBody::Raw),
+        0x7F => decode_extension(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
 }
@@ -1969,6 +2033,59 @@ fn decode_private_data_specifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
     Some(DescriptorBody::PrivateDataSpecifier(
         PrivateDataSpecifierDescriptor {
             private_data_specifier: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
+        },
+    ))
+}
+
+fn decode_extension(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.16 Table 54:
+    //   descriptor_tag_extension (8), then selector_byte run.
+    if data.is_empty() {
+        return None;
+    }
+    let tag_extension = data[0];
+    let selector = &data[1..];
+    let body = match tag_extension {
+        0x06 => decode_supplementary_audio(selector).unwrap_or(ExtensionBody::Raw),
+        _ => ExtensionBody::Raw,
+    };
+    Some(DescriptorBody::Extension(ExtensionDescriptor {
+        tag_extension,
+        selector,
+        body,
+    }))
+}
+
+fn decode_supplementary_audio(selector: &[u8]) -> Option<ExtensionBody<'_>> {
+    // ETSI EN 300 468 §6.4.11 Table 153 (selector, i.e. after tag_extension):
+    //   mix_type (1) | editorial_classification (5) | reserved (1) | language_code_present (1)
+    //   if (language_code_present) { ISO_639_language_code (24) }
+    //   private_data_byte run
+    if selector.is_empty() {
+        return None;
+    }
+    let b0 = selector[0];
+    let mix_type_independent = (b0 & 0b1000_0000) != 0;
+    let editorial_classification = (b0 >> 2) & 0b0001_1111;
+    let language_code_present = (b0 & 0b0000_0001) != 0;
+    let mut rest = &selector[1..];
+    let language_code = if language_code_present {
+        if rest.len() < 3 {
+            return None;
+        }
+        let lc = [rest[0], rest[1], rest[2]];
+        rest = &rest[3..];
+        Some(lc)
+    } else {
+        None
+    };
+    Some(ExtensionBody::SupplementaryAudio(
+        SupplementaryAudioDescriptor {
+            mix_type_independent,
+            editorial_classification,
+            language_code_present,
+            language_code,
+            private_data: rest,
         },
     ))
 }
@@ -5253,6 +5370,67 @@ mod tests {
                 assert!(!a.rds_via_uecp());
             }
             other => panic!("expected AncillaryData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extension_descriptor_supplementary_audio_with_language() {
+        // ext tag 0x06; selector: mix_type=1, editorial=0x01 (audio
+        // description), lang present → byte 1_00001_0_1 = 0b1000_0101 =
+        // 0x85, then "ger", then 1 private byte.
+        let block = tlv(0x7F, &[0x06, 0x85, b'g', b'e', b'r', 0x77]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Extension(e) => {
+                assert_eq!(e.tag_extension, 0x06);
+                match e.body {
+                    ExtensionBody::SupplementaryAudio(s) => {
+                        assert!(s.mix_type_independent);
+                        assert_eq!(s.editorial_classification, 0x01);
+                        assert!(s.language_code_present);
+                        assert_eq!(s.language_code, Some(*b"ger"));
+                        assert_eq!(s.private_data, &[0x77]);
+                    }
+                    other => panic!("expected SupplementaryAudio, got {other:?}"),
+                }
+            }
+            other => panic!("expected Extension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extension_descriptor_supplementary_audio_no_language() {
+        // mix_type=0, editorial=0x00, lang absent → byte 0_00000_0_0 = 0.
+        let block = tlv(0x7F, &[0x06, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Extension(e) => match e.body {
+                ExtensionBody::SupplementaryAudio(s) => {
+                    assert!(!s.mix_type_independent);
+                    assert_eq!(s.editorial_classification, 0x00);
+                    assert!(!s.language_code_present);
+                    assert_eq!(s.language_code, None);
+                    assert!(s.private_data.is_empty());
+                }
+                other => panic!("expected SupplementaryAudio, got {other:?}"),
+            },
+            other => panic!("expected Extension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extension_descriptor_unknown_tag_surfaces_raw_selector() {
+        // ext tag 0x04 (T2 delivery system) is not decoded here; the
+        // envelope still decodes and the selector is preserved.
+        let block = tlv(0x7F, &[0x04, 0xDE, 0xAD, 0xBE, 0xEF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Extension(e) => {
+                assert_eq!(e.tag_extension, 0x04);
+                assert_eq!(e.selector, &[0xDE, 0xAD, 0xBE, 0xEF]);
+                assert!(matches!(e.body, ExtensionBody::Raw));
+            }
+            other => panic!("expected Extension, got {other:?}"),
         }
     }
 
