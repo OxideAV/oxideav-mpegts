@@ -71,6 +71,7 @@
 //! | `0x6B` | ancillary_data_descriptor (EN 300 468 §6.2.2) | [`DescriptorBody::AncillaryData`] |
 //! | `0x7C` | AAC_descriptor (EN 300 468 annex H) | [`DescriptorBody::Aac`] |
 //! | `0x7F` | extension_descriptor (EN 300 468 §6.2.16 / clause 6.4) | [`DescriptorBody::Extension`] |
+//! | `0x64` | data_broadcast_descriptor (EN 300 468 §6.2.11) | [`DescriptorBody::DataBroadcast`] |
 //! | `0x6A` | AC-3_descriptor (EN 300 468 annex D)  | [`DescriptorBody::Ac3`]                      |
 //! | `0x7A` | enhanced_AC-3_descriptor (EN 300 468 annex D) | [`DescriptorBody::EnhancedAc3`]      |
 //! | `0x7B` | DTS_descriptor (EN 300 468 annex G)   | [`DescriptorBody::Dts`]                      |
@@ -297,6 +298,12 @@ pub enum DescriptorBody<'a> {
     /// small set of extension sub-tags decode their selector into a typed
     /// [`ExtensionBody`], the rest surface their selector bytes raw.
     Extension(ExtensionDescriptor<'a>),
+    /// `0x64` data_broadcast_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.11 Table 31). Carried in the SDT / EIT loops; the
+    /// long form of the data_broadcast_id_descriptor pairing a
+    /// `data_broadcast_id` + `component_tag` with a length-prefixed
+    /// selector field and a language-tagged free-text description.
+    DataBroadcast(DataBroadcastDescriptor<'a>),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -1621,6 +1628,28 @@ pub struct SupplementaryAudioDescriptor<'a> {
     pub private_data: &'a [u8],
 }
 
+/// data_broadcast_descriptor body (ETSI EN 300 468 §6.2.11 Table 31).
+///
+/// The long form of the data_broadcast_id_descriptor: it adds a
+/// `component_tag` (matching the `stream_identifier_descriptor`), a
+/// length-prefixed selector field, and a language-tagged free-text
+/// description of the data component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataBroadcastDescriptor<'a> {
+    /// 16-bit `data_broadcast_id` (coded per ETSI TS 101 162).
+    pub data_broadcast_id: u16,
+    /// 8-bit `component_tag` — matches the component's
+    /// `stream_identifier_descriptor`, or `0x00` when unused.
+    pub component_tag: u8,
+    /// `selector_byte` run (its `selector_length` is consumed on parse).
+    pub selector_bytes: &'a [u8],
+    /// 24-bit `ISO_639_language_code` of the text field.
+    pub language_code: [u8; 3],
+    /// Raw `text` bytes — the data-component description (DVB text
+    /// string, annex A); its `text_length` is consumed on parse.
+    pub text: &'a [u8],
+}
+
 /// STD_descriptor body (§2.6.32 Table 2-60).
 ///
 /// When `leak_valid_flag == true`, the transfer of data from buffer
@@ -1877,6 +1906,7 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x6B => decode_ancillary_data(data).unwrap_or(DescriptorBody::Raw),
         0x7C => decode_aac(data).unwrap_or(DescriptorBody::Raw),
         0x7F => decode_extension(data).unwrap_or(DescriptorBody::Raw),
+        0x64 => decode_data_broadcast(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
 }
@@ -2035,6 +2065,42 @@ fn decode_private_data_specifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
             private_data_specifier: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
         },
     ))
+}
+
+fn decode_data_broadcast(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.11 Table 31:
+    //   data_broadcast_id (16)
+    //   component_tag     (8)
+    //   selector_length   (8) + selector_byte[selector_length]
+    //   ISO_639_language_code (24)
+    //   text_length       (8) + char[text_length]
+    if data.len() < 4 {
+        return None;
+    }
+    let data_broadcast_id = u16::from_be_bytes([data[0], data[1]]);
+    let component_tag = data[2];
+    let selector_length = data[3] as usize;
+    let sel_start = 4usize;
+    let sel_end = sel_start.checked_add(selector_length)?;
+    if data.len() < sel_end + 4 {
+        return None;
+    }
+    let selector_bytes = &data[sel_start..sel_end];
+    let language_code = [data[sel_end], data[sel_end + 1], data[sel_end + 2]];
+    let text_length = data[sel_end + 3] as usize;
+    let text_start = sel_end + 4;
+    let text_end = text_start.checked_add(text_length)?;
+    if data.len() < text_end {
+        return None;
+    }
+    let text = &data[text_start..text_end];
+    Some(DescriptorBody::DataBroadcast(DataBroadcastDescriptor {
+        data_broadcast_id,
+        component_tag,
+        selector_bytes,
+        language_code,
+        text,
+    }))
 }
 
 fn decode_extension(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -5371,6 +5437,65 @@ mod tests {
             }
             other => panic!("expected AncillaryData, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn data_broadcast_descriptor_decodes_all_fields() {
+        // id=0x00AB, component_tag=0x05, selector "XY" (len 2), lang
+        // "eng", text "DAT" (len 3).
+        let body = [
+            0x00, 0xAB, // data_broadcast_id
+            0x05, // component_tag
+            0x02, b'X', b'Y', // selector_length + selector
+            b'e', b'n', b'g', // language
+            0x03, b'D', b'A', b'T', // text_length + text
+        ];
+        let block = tlv(0x64, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::DataBroadcast(b) => {
+                assert_eq!(b.data_broadcast_id, 0x00AB);
+                assert_eq!(b.component_tag, 0x05);
+                assert_eq!(b.selector_bytes, b"XY");
+                assert_eq!(&b.language_code, b"eng");
+                assert_eq!(b.text, b"DAT");
+            }
+            other => panic!("expected DataBroadcast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_broadcast_descriptor_truncated_text_falls_back_to_raw() {
+        // text_length claims 5 but only 1 byte follows.
+        let body = [
+            0x00, 0xAB, 0x05, 0x00, // id, tag, selector_length 0
+            b'e', b'n', b'g', 0x05, b'X',
+        ];
+        let block = tlv(0x64, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn mixed_descriptor_loop_through_parse_descriptors() {
+        // A realistic PMT-ish ES_info loop: an ISO-639 language
+        // descriptor, a component descriptor, a CA_identifier, and an
+        // unknown tag, parsed as one block via parse_descriptors.
+        let mut block = Vec::new();
+        block.extend_from_slice(&tlv(0x0A, &[b'e', b'n', b'g', 0x00]));
+        block.extend_from_slice(&tlv(0x50, &[0xF9, 0x80, 0x05, b'e', b'n', b'g']));
+        block.extend_from_slice(&tlv(0x53, &[0x09, 0x00]));
+        block.extend_from_slice(&tlv(0xC1, &[0xDE, 0xAD]));
+        let ds = parse_descriptors(&block).unwrap();
+        assert_eq!(ds.len(), 4);
+        assert!(matches!(ds[0].body, DescriptorBody::Iso639Language(_)));
+        assert!(matches!(ds[1].body, DescriptorBody::Component(_)));
+        match &ds[2].body {
+            DescriptorBody::CaIdentifier(c) => assert_eq!(c.ca_system_ids, vec![0x0900]),
+            other => panic!("expected CaIdentifier, got {other:?}"),
+        }
+        assert_eq!(ds[3].tag, 0xC1);
+        assert!(matches!(ds[3].body, DescriptorBody::Raw));
     }
 
     #[test]

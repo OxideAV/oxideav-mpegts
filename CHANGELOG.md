@@ -11,6 +11,12 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- The DVB `data_broadcast_descriptor` (tag `0x64`, ETSI EN 300 468
+  §6.2.11 Table 31) — the long form of the data_broadcast_id_descriptor
+  — now decodes to a typed `DescriptorBody::DataBroadcast` carrying the
+  `data_broadcast_id`, `component_tag`, the length-prefixed selector
+  field, and the language-tagged free-text description. Truncated
+  length prefixes fall back to `Raw`.
 - The DVB `extension_descriptor` (tag `0x7F`, ETSI EN 300 468 §6.2.16
   Table 54) now decodes its `descriptor_tag_extension` envelope (clause
   6.3 Table 109) into a typed `DescriptorBody::Extension`. The selector
