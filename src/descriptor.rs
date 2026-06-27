@@ -60,6 +60,10 @@
 //! | `0x53` | CA_identifier_descriptor (EN 300 468 §6.2.5) | [`DescriptorBody::CaIdentifier`] |
 //! | `0x55` | parental_rating_descriptor (EN 300 468 §6.2.28) | [`DescriptorBody::ParentalRating`] |
 //! | `0x5F` | private_data_specifier_descriptor (EN 300 468 §6.2.31) | [`DescriptorBody::PrivateDataSpecifier`] |
+//! | `0x43` | satellite_delivery_system_descriptor (EN 300 468 §6.2.13.2) | [`DescriptorBody::SatelliteDeliverySystem`] |
+//! | `0x44` | cable_delivery_system_descriptor (EN 300 468 §6.2.13.1) | [`DescriptorBody::CableDeliverySystem`] |
+//! | `0x5A` | terrestrial_delivery_system_descriptor (EN 300 468 §6.2.13.4) | [`DescriptorBody::TerrestrialDeliverySystem`] |
+//! | `0x62` | frequency_list_descriptor (EN 300 468 §6.2.17) | [`DescriptorBody::FrequencyList`] |
 //! | `0x6A` | AC-3_descriptor (EN 300 468 annex D)  | [`DescriptorBody::Ac3`]                      |
 //! | `0x7A` | enhanced_AC-3_descriptor (EN 300 468 annex D) | [`DescriptorBody::EnhancedAc3`]      |
 //! | `0x7B` | DTS_descriptor (EN 300 468 annex G)   | [`DescriptorBody::Dts`]                      |
@@ -233,6 +237,23 @@ pub enum DescriptorBody<'a> {
     /// SDT / EIT / PMT / SIT descriptor loops; scopes the interpretation
     /// of any private descriptors / fields that follow it.
     PrivateDataSpecifier(PrivateDataSpecifierDescriptor),
+    /// `0x43` satellite_delivery_system_descriptor — DVB SI extension
+    /// (ETSI EN 300 468 §6.2.13.2 Table 37). Carried in the NIT
+    /// transport-stream descriptor loop; tunes a DVB-S / DVB-S2 carrier.
+    SatelliteDeliverySystem(SatelliteDeliverySystemDescriptor),
+    /// `0x44` cable_delivery_system_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.13.1 Table 33). Carried in the NIT transport-stream
+    /// descriptor loop; tunes a DVB-C carrier.
+    CableDeliverySystem(CableDeliverySystemDescriptor),
+    /// `0x5A` terrestrial_delivery_system_descriptor — DVB SI extension
+    /// (ETSI EN 300 468 §6.2.13.4 Table 44). Carried in the NIT
+    /// transport-stream descriptor loop; tunes a DVB-T carrier.
+    TerrestrialDeliverySystem(TerrestrialDeliverySystemDescriptor),
+    /// `0x62` frequency_list_descriptor — DVB SI extension (ETSI
+    /// EN 300 468 §6.2.17 Table 55). Carried in the NIT; gives the
+    /// additional frequencies of a multiplex transmitted on several
+    /// frequencies.
+    FrequencyList(FrequencyListDescriptor),
     /// Unrecognised tag — payload bytes preserved verbatim.
     Raw,
 }
@@ -1276,6 +1297,117 @@ pub struct PrivateDataSpecifierDescriptor {
     pub private_data_specifier: u32,
 }
 
+/// satellite_delivery_system_descriptor body (ETSI EN 300 468
+/// §6.2.13.2 Table 37) — an 11-byte fixed body tuning a DVB-S / DVB-S2
+/// carrier.
+///
+/// The `frequency` (8-digit BCD, GHz, decimal after the 3rd character)
+/// and `symbol_rate` (7-digit BCD, Msymbol/s, decimal after the 3rd
+/// character) and `orbital_position` (4-digit BCD, degrees, decimal
+/// after the 3rd character) are surfaced as their raw packed BCD
+/// integers — the caller scales them per the table's worked examples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SatelliteDeliverySystemDescriptor {
+    /// 32-bit packed-BCD `frequency` (GHz, decimal after digit 3).
+    pub frequency_bcd: u32,
+    /// 16-bit packed-BCD `orbital_position` (degrees, decimal after
+    /// digit 3).
+    pub orbital_position_bcd: u16,
+    /// `west_east_flag` — `false` west, `true` east.
+    pub east: bool,
+    /// 2-bit `polarization` (Table 38): `0` linear-H, `1` linear-V,
+    /// `2` circular-left, `3` circular-right.
+    pub polarization: u8,
+    /// 2-bit `roll_off` (Table 39) — only meaningful when
+    /// [`Self::dvb_s2`] is true (DVB-S2): `0` α=0.35, `1` α=0.25,
+    /// `2` α=0.20.
+    pub roll_off: u8,
+    /// `modulation_system` (Table 40) — `false` DVB-S, `true` DVB-S2.
+    pub dvb_s2: bool,
+    /// 2-bit `modulation_type` (Table 41): `0` auto, `1` QPSK, `2` 8PSK,
+    /// `3` 16QAM.
+    pub modulation_type: u8,
+    /// 28-bit packed-BCD `symbol_rate` (Msymbol/s, decimal after
+    /// digit 3).
+    pub symbol_rate_bcd: u32,
+    /// 4-bit `FEC_inner` (Table 36).
+    pub fec_inner: u8,
+}
+
+/// cable_delivery_system_descriptor body (ETSI EN 300 468 §6.2.13.1
+/// Table 33) — an 11-byte fixed body tuning a DVB-C carrier.
+///
+/// `frequency` (8-digit BCD, MHz, decimal after the 4th character) and
+/// `symbol_rate` (7-digit BCD, Msymbol/s, decimal after the 3rd
+/// character) are surfaced as raw packed BCD integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CableDeliverySystemDescriptor {
+    /// 32-bit packed-BCD `frequency` (MHz, decimal after digit 4).
+    pub frequency_bcd: u32,
+    /// 4-bit `FEC_outer` (Table 34): `1` no outer FEC, `2` RS(204,188).
+    pub fec_outer: u8,
+    /// 8-bit `modulation` (Table 35): `1` 16QAM … `5` 256QAM.
+    pub modulation: u8,
+    /// 28-bit packed-BCD `symbol_rate` (Msymbol/s, decimal after
+    /// digit 3).
+    pub symbol_rate_bcd: u32,
+    /// 4-bit `FEC_inner` (Table 36).
+    pub fec_inner: u8,
+}
+
+/// terrestrial_delivery_system_descriptor body (ETSI EN 300 468
+/// §6.2.13.4 Table 44) — an 11-byte fixed body tuning a DVB-T carrier.
+///
+/// Unlike the cable / satellite descriptors, `centre_frequency` here is
+/// a plain unsigned integer in multiples of 10 Hz (not BCD).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrestrialDeliverySystemDescriptor {
+    /// 32-bit `centre_frequency` in multiples of 10 Hz.
+    pub centre_frequency_10hz: u32,
+    /// 3-bit `bandwidth` (Table 45): `0` 8 MHz, `1` 7 MHz, `2` 6 MHz,
+    /// `3` 5 MHz.
+    pub bandwidth: u8,
+    /// `priority` (Table 46) — `true` HP stream, `false` LP stream.
+    pub priority_hp: bool,
+    /// `time_slicing_indicator` — `false` (cleared) means at least one
+    /// ES uses time slicing.
+    pub time_slicing_indicator: bool,
+    /// `MPE-FEC_indicator` — `false` (cleared) means at least one ES
+    /// uses MPE-FEC.
+    pub mpe_fec_indicator: bool,
+    /// 2-bit `constellation` (Table 47): `0` QPSK, `1` 16QAM, `2` 64QAM.
+    pub constellation: u8,
+    /// 3-bit `hierarchy_information` (Table 48).
+    pub hierarchy_information: u8,
+    /// 3-bit `code_rate_HP_stream` (Table 49).
+    pub code_rate_hp: u8,
+    /// 3-bit `code_rate_LP_stream` (Table 49).
+    pub code_rate_lp: u8,
+    /// 2-bit `guard_interval`.
+    pub guard_interval: u8,
+    /// 2-bit `transmission_mode`.
+    pub transmission_mode: u8,
+    /// `other_frequency_flag` — `true` when additional frequencies are
+    /// signalled (via a `frequency_list_descriptor`).
+    pub other_frequency_flag: bool,
+}
+
+/// frequency_list_descriptor body (ETSI EN 300 468 §6.2.17 Table 55).
+///
+/// Lists the additional centre frequencies of a multiplex transmitted
+/// on several frequencies. The interpretation of each 32-bit
+/// `centre_frequency` depends on [`Self::coding_type`] (the same coding
+/// as the matching delivery-system descriptor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrequencyListDescriptor {
+    /// 2-bit `coding_type` (Table 56): `0` undefined, `1` satellite,
+    /// `2` cable, `3` terrestrial. Decides how each `centre_frequency`
+    /// is coded.
+    pub coding_type: u8,
+    /// The raw 32-bit `centre_frequency` values, in wire order.
+    pub centre_frequencies: Vec<u32>,
+}
+
 /// STD_descriptor body (§2.6.32 Table 2-60).
 ///
 /// When `leak_valid_flag == true`, the transfer of data from buffer
@@ -1521,6 +1653,10 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x53 => decode_ca_identifier(data).unwrap_or(DescriptorBody::Raw),
         0x55 => decode_parental_rating(data).unwrap_or(DescriptorBody::Raw),
         0x5F => decode_private_data_specifier(data).unwrap_or(DescriptorBody::Raw),
+        0x43 => decode_satellite_delivery(data).unwrap_or(DescriptorBody::Raw),
+        0x44 => decode_cable_delivery(data).unwrap_or(DescriptorBody::Raw),
+        0x5A => decode_terrestrial_delivery(data).unwrap_or(DescriptorBody::Raw),
+        0x62 => decode_frequency_list(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
 }
@@ -1679,6 +1815,145 @@ fn decode_private_data_specifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
             private_data_specifier: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
         },
     ))
+}
+
+fn decode_satellite_delivery(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.13.2 Table 37 — fixed 11-byte body:
+    //   frequency        (32)  BCD
+    //   orbital_position (16)  BCD
+    //   west_east_flag   (1)
+    //   polarization     (2)
+    //   roll_off (2) | modulation_system (1)   (the latter selects roll_off vs reserved)
+    //   modulation_type  (2)
+    //   symbol_rate      (28)  BCD
+    //   FEC_inner        (4)
+    if data.len() < 11 {
+        return None;
+    }
+    let frequency_bcd = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    let orbital_position_bcd = u16::from_be_bytes([data[4], data[5]]);
+    let b6 = data[6];
+    let east = (b6 & 0b1000_0000) != 0;
+    let polarization = (b6 >> 5) & 0b11;
+    let roll_off = (b6 >> 3) & 0b11;
+    let dvb_s2 = (b6 & 0b0000_0100) != 0;
+    let modulation_type = b6 & 0b11;
+    // symbol_rate is 28 bits: 24 bits in data[7..10] plus the high nibble
+    // of data[10]; the low nibble of data[10] is FEC_inner.
+    let symbol_rate_bcd = ((data[7] as u32) << 20)
+        | ((data[8] as u32) << 12)
+        | ((data[9] as u32) << 4)
+        | ((data[10] as u32) >> 4);
+    let fec_inner = data[10] & 0x0F;
+    Some(DescriptorBody::SatelliteDeliverySystem(
+        SatelliteDeliverySystemDescriptor {
+            frequency_bcd,
+            orbital_position_bcd,
+            east,
+            polarization,
+            roll_off,
+            dvb_s2,
+            modulation_type,
+            symbol_rate_bcd,
+            fec_inner,
+        },
+    ))
+}
+
+fn decode_cable_delivery(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.13.1 Table 33 — fixed 11-byte body:
+    //   frequency           (32)  BCD
+    //   reserved_future_use (12) | FEC_outer (4)
+    //   modulation          (8)
+    //   symbol_rate         (28)  BCD | FEC_inner (4)
+    if data.len() < 11 {
+        return None;
+    }
+    let frequency_bcd = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    // 12 reserved bits span data[4] and the high nibble of data[5];
+    // FEC_outer is the low nibble of data[5].
+    let fec_outer = data[5] & 0x0F;
+    let modulation = data[6];
+    let symbol_rate_bcd = ((data[7] as u32) << 20)
+        | ((data[8] as u32) << 12)
+        | ((data[9] as u32) << 4)
+        | ((data[10] as u32) >> 4);
+    let fec_inner = data[10] & 0x0F;
+    Some(DescriptorBody::CableDeliverySystem(
+        CableDeliverySystemDescriptor {
+            frequency_bcd,
+            fec_outer,
+            modulation,
+            symbol_rate_bcd,
+            fec_inner,
+        },
+    ))
+}
+
+fn decode_terrestrial_delivery(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.13.4 Table 44 — fixed 11-byte body:
+    //   centre_frequency       (32)
+    //   bandwidth (3) | priority (1) | time_slicing (1) | MPE-FEC (1) | reserved (2)
+    //   constellation (2) | hierarchy_information (3) | code_rate_HP (3)
+    //   code_rate_LP (3) | guard_interval (2) | transmission_mode (2) | other_frequency_flag (1)
+    //   reserved_future_use    (32)
+    if data.len() < 11 {
+        return None;
+    }
+    let centre_frequency_10hz = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    let b4 = data[4];
+    let bandwidth = b4 >> 5;
+    // priority per Table 46: 0b1 == LP, 0b0 == HP. Expose priority_hp.
+    let priority_hp = (b4 & 0b0001_0000) == 0;
+    let time_slicing_indicator = (b4 & 0b0000_1000) != 0;
+    let mpe_fec_indicator = (b4 & 0b0000_0100) != 0;
+    let b5 = data[5];
+    let constellation = b5 >> 6;
+    let hierarchy_information = (b5 >> 3) & 0b111;
+    let code_rate_hp = b5 & 0b111;
+    let b6 = data[6];
+    let code_rate_lp = b6 >> 5;
+    let guard_interval = (b6 >> 3) & 0b11;
+    let transmission_mode = (b6 >> 1) & 0b11;
+    let other_frequency_flag = (b6 & 0b0000_0001) != 0;
+    Some(DescriptorBody::TerrestrialDeliverySystem(
+        TerrestrialDeliverySystemDescriptor {
+            centre_frequency_10hz,
+            bandwidth,
+            priority_hp,
+            time_slicing_indicator,
+            mpe_fec_indicator,
+            constellation,
+            hierarchy_information,
+            code_rate_hp,
+            code_rate_lp,
+            guard_interval,
+            transmission_mode,
+            other_frequency_flag,
+        },
+    ))
+}
+
+fn decode_frequency_list(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // ETSI EN 300 468 §6.2.17 Table 55:
+    //   reserved_future_use (6) | coding_type (2)
+    //   then N × centre_frequency (32)
+    if data.is_empty() {
+        return None;
+    }
+    let coding_type = data[0] & 0b11;
+    let rest = &data[1..];
+    if rest.len() % 4 != 0 {
+        return None;
+    }
+    let mut centre_frequencies = Vec::with_capacity(rest.len() / 4);
+    for chunk in rest.chunks_exact(4) {
+        centre_frequencies.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Some(DescriptorBody::FrequencyList(FrequencyListDescriptor {
+        coding_type,
+        centre_frequencies,
+    }))
 }
 
 fn decode_local_time_offset(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -4528,6 +4803,130 @@ mod tests {
                 assert_eq!(p.private_data_specifier, 0x0000_233A);
             }
             other => panic!("expected PrivateDataSpecifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn satellite_delivery_descriptor_decodes_worked_example() {
+        // §6.2.13.2 example: frequency 0x01175725 (11,75725 GHz).
+        // orbital 0x0192 (019,2°), east, linear-V polarization, DVB-S2,
+        // roll-off α=0.25, QPSK, symbol_rate 0x0274500, FEC 1/2.
+        // byte 6: east(1)=1 | pol(2)=01 | roll_off(2)=01 | s2(1)=1 | mod(2)=01
+        //         = 1 01 01 1 01 = 0b1010_1101 = 0xAD
+        // symbol_rate 0x0274500 across bytes 7..10 high nibble; FEC=0x1.
+        let body = [
+            0x01, 0x17, 0x57, 0x25, // frequency
+            0x01, 0x92, // orbital_position
+            0xAD, // flags
+            0x02, 0x74, 0x50, 0x01, // symbol_rate (0x0274500) << 4 | FEC 0x1
+        ];
+        let block = tlv(0x43, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::SatelliteDeliverySystem(s) => {
+                assert_eq!(s.frequency_bcd, 0x0117_5725);
+                assert_eq!(s.orbital_position_bcd, 0x0192);
+                assert!(s.east);
+                assert_eq!(s.polarization, 0b01);
+                assert_eq!(s.roll_off, 0b01);
+                assert!(s.dvb_s2);
+                assert_eq!(s.modulation_type, 0b01);
+                assert_eq!(s.symbol_rate_bcd, 0x027_4500);
+                assert_eq!(s.fec_inner, 0x1);
+            }
+            other => panic!("expected SatelliteDeliverySystem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cable_delivery_descriptor_decodes_worked_example() {
+        // §6.2.13.1 examples: frequency 0x03120000 (312,0000 MHz),
+        // symbol_rate 0x0274500 (27,4500 Msymbol/s). FEC_outer RS=0x2,
+        // modulation 64QAM=0x03, FEC_inner 3/4=0x3.
+        let body = [
+            0x03, 0x12, 0x00, 0x00, // frequency
+            0x00, 0x02, // 12 reserved | FEC_outer 0x2
+            0x03, // modulation 64QAM
+            0x02, 0x74, 0x50, 0x03, // symbol_rate << 4 | FEC_inner 0x3
+        ];
+        let block = tlv(0x44, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::CableDeliverySystem(c) => {
+                assert_eq!(c.frequency_bcd, 0x0312_0000);
+                assert_eq!(c.fec_outer, 0x2);
+                assert_eq!(c.modulation, 0x03);
+                assert_eq!(c.symbol_rate_bcd, 0x027_4500);
+                assert_eq!(c.fec_inner, 0x3);
+            }
+            other => panic!("expected CableDeliverySystem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terrestrial_delivery_descriptor_decodes_fields() {
+        // centre_frequency 0x00000001 (10 Hz), bandwidth 8MHz=0b000,
+        // priority bit=1 (Table 46: LP), time_slicing not used (1),
+        // MPE-FEC not used (1), constellation 64QAM=0b10, hierarchy 0b000,
+        // code_rate_HP 0b001, code_rate_LP 0b010, guard 0b01, mode 0b10,
+        // other_freq 1.
+        // byte4: bw(3)=000 | prio(1)=1 | ts(1)=1 | mpe(1)=1 | rsv(2)=00
+        //        = 0 001 11 00 -> 0b0001_1100 = 0x1C
+        // byte5: const(2)=10 | hier(3)=000 | crHP(3)=001
+        //        = 10 000 001 = 0b1000_0001 = 0x81
+        // byte6: crLP(3)=010 | guard(2)=01 | mode(2)=10 | other(1)=1
+        //        = 010 01 10 1 = 0b0100_1101 = 0x4D
+        let body = [
+            0x00, 0x00, 0x00, 0x01, // centre_frequency
+            0x1C, 0x81, 0x4D, // tuning fields
+            0xFF, 0xFF, 0xFF, 0xFF, // reserved_future_use
+        ];
+        let block = tlv(0x5A, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::TerrestrialDeliverySystem(t) => {
+                assert_eq!(t.centre_frequency_10hz, 1);
+                assert_eq!(t.bandwidth, 0b000);
+                assert!(!t.priority_hp); // priority bit set → LP
+                assert!(t.time_slicing_indicator);
+                assert!(t.mpe_fec_indicator);
+                assert_eq!(t.constellation, 0b10);
+                assert_eq!(t.hierarchy_information, 0b000);
+                assert_eq!(t.code_rate_hp, 0b001);
+                assert_eq!(t.code_rate_lp, 0b010);
+                assert_eq!(t.guard_interval, 0b01);
+                assert_eq!(t.transmission_mode, 0b10);
+                assert!(t.other_frequency_flag);
+            }
+            other => panic!("expected TerrestrialDeliverySystem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frequency_list_descriptor_decodes_terrestrial_coding() {
+        // coding_type terrestrial (0b11) + two 32-bit frequencies.
+        let body = [
+            0x03, // reserved(6)=000000 | coding_type=11
+            0x00, 0x00, 0x00, 0x0A, // freq 10
+            0x00, 0x00, 0x00, 0x14, // freq 20
+        ];
+        let block = tlv(0x62, &body);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::FrequencyList(f) => {
+                assert_eq!(f.coding_type, 0b11);
+                assert_eq!(f.centre_frequencies, vec![10, 20]);
+            }
+            other => panic!("expected FrequencyList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delivery_descriptors_short_body_fall_back_to_raw() {
+        for tag in [0x43u8, 0x44, 0x5A] {
+            let block = tlv(tag, &[0u8; 10]); // one short of 11
+            let d = iter_descriptors(&block).next().unwrap().unwrap();
+            assert!(matches!(d.body, DescriptorBody::Raw), "tag {tag:#x}");
         }
     }
 }

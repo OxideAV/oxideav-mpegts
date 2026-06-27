@@ -11,6 +11,23 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- The four DVB NIT delivery-system descriptors now decode to typed
+  bodies (ETSI EN 300 468 §6.2.13 / §6.2.17):
+  `satellite_delivery_system_descriptor` (tag `0x43`, §6.2.13.2 — the
+  DVB-S/S2 carrier: packed-BCD frequency / orbital position / symbol
+  rate, polarization, roll-off, modulation system + type, inner FEC),
+  `cable_delivery_system_descriptor` (tag `0x44`, §6.2.13.1 — the DVB-C
+  carrier: packed-BCD frequency / symbol rate, outer + inner FEC,
+  modulation), `terrestrial_delivery_system_descriptor` (tag `0x5A`,
+  §6.2.13.4 — the DVB-T carrier: 10-Hz-unit centre frequency, bandwidth,
+  priority, time-slicing / MPE-FEC indicators, constellation, hierarchy,
+  HP/LP code rates, guard interval, transmission mode, other-frequency
+  flag), and `frequency_list_descriptor` (tag `0x62`, §6.2.17 — the
+  multiplex's additional centre frequencies with their `coding_type`).
+  Frequency / symbol-rate fields are surfaced as their raw packed-BCD
+  integers; the spec's §6.2.13 worked examples (cable `0x03120000` →
+  312 MHz, satellite `0x01175725` → 11.75725 GHz, symbol rate
+  `0x0274500` → 27.4500 Msymbol/s) are pinned as tests.
 - Seven more DVB SI descriptors now decode to typed bodies (ETSI
   EN 300 468): `service_list_descriptor` (tag `0x41`, §6.2.35 — the
   NIT/BAT `(service_id, service_type)` channel list),
