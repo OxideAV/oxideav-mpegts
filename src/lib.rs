@@ -89,6 +89,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod build;
 pub mod clock;
 pub mod descriptor;
 pub mod error;
@@ -104,6 +105,13 @@ pub mod muxer;
 #[cfg(feature = "registry")]
 pub mod registry;
 
+pub use build::{
+    aac_descriptor, ac3_descriptor, bouquet_name_descriptor, build_eit_pf, build_nit, build_pat,
+    build_pmt, build_sdt, dts_descriptor, enhanced_ac3_descriptor, iso639_language_descriptor,
+    network_name_descriptor, registration_descriptor, service_descriptor,
+    stream_identifier_descriptor, subtitling_descriptor, teletext_descriptor, EitEventEntry,
+    NitTsEntry, PmtStreamEntry, SdtServiceEntry,
+};
 pub use clock::{
     ContinuityEvent, ContinuityTracker, DiscontinuityReason, Pcr, PcrEvent, PcrTracker, PtsTracker,
     TimestampEvent, PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ, TIMESTAMP_MODULUS_90KHZ,

@@ -801,6 +801,22 @@ impl RunningStatus {
             other => RunningStatus::Reserved(other),
         }
     }
+
+    /// Encode a typed status back to its 3-bit wire value — the inverse
+    /// of [`RunningStatus::from_bits`]. Used by the write side (SDT / EIT
+    /// / RST section builders) so a parse → build round-trip is
+    /// bit-exact.
+    pub fn to_bits(self) -> u8 {
+        match self {
+            RunningStatus::Undefined => 0,
+            RunningStatus::NotRunning => 1,
+            RunningStatus::StartsSoon => 2,
+            RunningStatus::Pausing => 3,
+            RunningStatus::Running => 4,
+            RunningStatus::OffAir => 5,
+            RunningStatus::Reserved(v) => v & 0b0000_0111,
+        }
+    }
 }
 
 /// One entry from the Running Status Table loop (ETSI EN 300 468 §5.2.7

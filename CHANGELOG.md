@@ -11,6 +11,25 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- New `build` module — the write-side mirror of the `psi` / `descriptor`
+  parse surface. Pure `&[…] -> Vec<u8>` builders emit spec-conformant
+  bytes that read back identically through the matching parser:
+  - **Descriptor TLV builders**: `registration_descriptor` (§2.6.8),
+    `iso639_language_descriptor` (§2.6.18),
+    `stream_identifier_descriptor` (0x52), `service_descriptor` (0x48),
+    `network_name_descriptor` (0x40), `bouquet_name_descriptor` (0x47),
+    `teletext_descriptor` (0x56), `subtitling_descriptor` (0x59),
+    `ac3_descriptor` (0x6A), `enhanced_ac3_descriptor` (0x7A),
+    `dts_descriptor` (0x7B), `aac_descriptor` (0x7C).
+  - **Long-form PSI section builders**: `build_pat` (multi-program),
+    `build_pmt` (per-stream `ES_info` loops), `build_sdt`, `build_nit`,
+    and `build_eit_pf` (present/following), each emitting `table_id`
+    through the MPEG-2 CRC-32 trailer.
+  - DVB 40-bit MJD + BCD `UTC_time` encoding (the inverse of
+    `decode_utc_time`, ETSI EN 300 468 annex-C integer formula) drives
+    the EIT `start_time` field.
+  - `RunningStatus::to_bits` — the inverse of `from_bits` — so an SDT /
+    EIT parse → build round-trip is bit-exact.
 - The DVB `data_broadcast_descriptor` (tag `0x64`, ETSI EN 300 468
   §6.2.11 Table 31) — the long form of the data_broadcast_id_descriptor
   — now decodes to a typed `DescriptorBody::DataBroadcast` carrying the
