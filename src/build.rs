@@ -113,6 +113,33 @@ pub fn bouquet_name_descriptor(name: &[u8]) -> Vec<u8> {
     tlv(0x47, name)
 }
 
+/// `short_event_descriptor` (tag `0x4D`, EN 300 468 §6.2.37) — the EIT
+/// event-loop descriptor naming an event plus a short free-text
+/// description, both under one language code.
+pub fn short_event_descriptor(language_code: [u8; 3], event_name: &[u8], text: &[u8]) -> Vec<u8> {
+    let nlen = event_name.len().min(0xFF);
+    let tlen = text.len().min(0xFF);
+    let mut body = Vec::with_capacity(3 + 2 + nlen + tlen);
+    body.extend_from_slice(&language_code);
+    body.push(nlen as u8);
+    body.extend_from_slice(&event_name[..nlen]);
+    body.push(tlen as u8);
+    body.extend_from_slice(&text[..tlen]);
+    tlv(0x4D, &body)
+}
+
+/// `service_list_descriptor` (tag `0x41`, EN 300 468 §6.2.35) — the
+/// NIT / BAT transport-stream-loop descriptor listing a TS's services by
+/// `(service_id, service_type)`.
+pub fn service_list_descriptor(entries: &[(u16, u8)]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(entries.len() * 3);
+    for (service_id, service_type) in entries {
+        body.extend_from_slice(&service_id.to_be_bytes());
+        body.push(*service_type);
+    }
+    tlv(0x41, &body)
+}
+
 /// `teletext_descriptor` (tag `0x56`, EN 300 468 §6.2.43) — a flat run of
 /// 5-byte EBU teletext page records.
 pub fn teletext_descriptor(entries: &[TeletextEntry]) -> Vec<u8> {
@@ -593,6 +620,32 @@ mod tests {
         let d = stream_identifier_descriptor(0x42);
         match one_descriptor(&d) {
             DescriptorBody::StreamIdentifier(s) => assert_eq!(s.component_tag, 0x42),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_event_descriptor_round_trips() {
+        let d = short_event_descriptor(*b"eng", b"News", b"Evening bulletin");
+        match one_descriptor(&d) {
+            DescriptorBody::ShortEvent(s) => {
+                assert_eq!(s.language_code, *b"eng");
+                assert_eq!(s.event_name, b"News");
+                assert_eq!(s.text, b"Evening bulletin");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_list_descriptor_round_trips() {
+        let d = service_list_descriptor(&[(0x0064, 0x01), (0x0065, 0x02)]);
+        match one_descriptor(&d) {
+            DescriptorBody::ServiceList(s) => {
+                assert_eq!(s.entries.len(), 2);
+                assert_eq!(s.entries[0].service_id, 0x0064);
+                assert_eq!(s.entries[1].service_type, 0x02);
+            }
             other => panic!("{other:?}"),
         }
     }

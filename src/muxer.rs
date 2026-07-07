@@ -96,6 +96,29 @@ pub struct ServiceSpec {
     pub service_name: Vec<u8>,
 }
 
+/// A present/following event described for one program in the DVB EIT
+/// (ETSI EN 300 468 §5.2.4). The muxer emits a `short_event_descriptor`
+/// for the event when `event_name` / `text` are non-empty.
+#[derive(Debug, Clone)]
+pub struct EventSpec {
+    /// 16-bit `event_id`, unique within the service.
+    pub event_id: u16,
+    /// Event start time (DVB 40-bit MJD + BCD `UTC_time`), or `None` for
+    /// the undefined sentinel.
+    pub start_time: Option<crate::psi::EitDateTime>,
+    /// Event duration (BCD hours/minutes/seconds).
+    pub duration: crate::psi::EitDuration,
+    /// `running_status` of the event.
+    pub running_status: crate::psi::RunningStatus,
+    /// 3-byte ISO 639-2 language of the `short_event_descriptor`.
+    pub language: [u8; 3],
+    /// Raw `event_name` bytes (DVB text string). Empty → no
+    /// `short_event_descriptor`.
+    pub event_name: Vec<u8>,
+    /// Raw short-text description bytes (DVB text string).
+    pub text: Vec<u8>,
+}
+
 /// One program of a multi-program transport stream.
 ///
 /// A program groups a set of the muxer's input streams (by their
@@ -118,6 +141,29 @@ pub struct ProgramSpec {
     pub stream_indices: Vec<u32>,
     /// Optional DVB service metadata → an SDT entry for this program.
     pub service: Option<ServiceSpec>,
+    /// Present/following events for this program → an EIT p/f section
+    /// (PID 0x0012) keyed on the program's `program_number` as
+    /// `service_id`. Empty → no EIT for this program.
+    pub events: Vec<EventSpec>,
+}
+
+/// Network metadata carried in the DVB NIT (ETSI EN 300 468 §5.2.1). When
+/// a [`MpegTsMuxConfig`] carries one, the muxer emits a NIT on PID 0x0010
+/// naming the network and listing this transport stream (optionally with
+/// delivery-system / service-list descriptors supplied verbatim).
+#[derive(Debug, Clone)]
+pub struct NetworkSpec {
+    /// 16-bit `network_id` (rides the NIT `table_id_extension`).
+    pub network_id: u16,
+    /// Raw `network_name` bytes (DVB text string) → a
+    /// `network_name_descriptor` in the network-level loop.
+    pub network_name: Vec<u8>,
+    /// Extra network-level descriptor bytes appended after the
+    /// `network_name_descriptor` (may be empty).
+    pub network_descriptors: Vec<u8>,
+    /// Per-TS descriptor loop for this transport stream's entry in the
+    /// `transport_stream_loop` (delivery-system / service_list, etc.).
+    pub transport_descriptors: Vec<u8>,
 }
 
 /// Multi-program muxer configuration passed to
@@ -126,10 +172,12 @@ pub struct ProgramSpec {
 pub struct MpegTsMuxConfig {
     /// `transport_stream_id` carried in the PAT (and SDT, when emitted).
     pub transport_stream_id: u16,
-    /// `original_network_id` carried in the SDT (when emitted).
+    /// `original_network_id` carried in the SDT / NIT (when emitted).
     pub original_network_id: u16,
     /// The programs multiplexed into this transport stream.
     pub programs: Vec<ProgramSpec>,
+    /// Optional network metadata → a NIT on PID 0x0010.
+    pub network: Option<NetworkSpec>,
 }
 
 impl Default for MpegTsMuxConfig {
@@ -138,6 +186,7 @@ impl Default for MpegTsMuxConfig {
             transport_stream_id: 1,
             original_network_id: 1,
             programs: Vec::new(),
+            network: None,
         }
     }
 }
@@ -160,6 +209,12 @@ pub struct MpegTsMuxer {
     pat_cc: u8,
     /// Continuity counter for SDT TS packets (PID 0x0011).
     sdt_cc: u8,
+    /// Continuity counter for NIT TS packets (PID 0x0010).
+    nit_cc: u8,
+    /// Continuity counter for EIT TS packets (PID 0x0012).
+    eit_cc: u8,
+    /// Optional network metadata for the NIT.
+    network: Option<NetworkSpec>,
     /// PSI re-emission interval in 90 kHz ticks, or `None` to emit the
     /// program tables only at header + trailer. When set, the PAT / PMTs
     /// / SDT are re-emitted mid-stream whenever the running PTS advances
@@ -200,6 +255,8 @@ struct ProgramState {
     last_pcr_pts: Option<i64>,
     /// Optional DVB service metadata for the SDT.
     service: Option<ServiceSpec>,
+    /// Present/following events for this program's EIT.
+    events: Vec<EventSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,7 +293,9 @@ impl MpegTsMuxer {
                 pcr_pid: None,
                 stream_indices: streams.iter().map(|s| s.index).collect(),
                 service: None,
+                events: Vec::new(),
             }],
+            network: None,
         };
         Self::with_config(output, streams, config)
     }
@@ -335,6 +394,7 @@ impl MpegTsMuxer {
                 track_indices,
                 last_pcr_pts: None,
                 service: spec.service.clone(),
+                events: spec.events.clone(),
             });
         }
 
@@ -345,8 +405,11 @@ impl MpegTsMuxer {
             idx_to_track,
             transport_stream_id: config.transport_stream_id,
             original_network_id: config.original_network_id,
+            network: config.network.clone(),
             pat_cc: 0,
             sdt_cc: 0,
+            nit_cc: 0,
+            eit_cc: 0,
             // ~200 ms (18000 ticks of the 90 kHz clock) — a conformant
             // default that keeps the tables fresh without flooding the
             // multiplex. Callers can widen / disable it.
@@ -387,6 +450,8 @@ impl MpegTsMuxer {
             self.write_pat()?;
             self.write_pmt()?;
             self.write_sdt()?;
+            self.write_nit()?;
+            self.write_eit()?;
             self.last_psi_pts = Some(pts);
         }
         Ok(())
@@ -521,6 +586,78 @@ impl MpegTsMuxer {
         let mut cc = self.sdt_cc;
         self.write_psi_packet(crate::psi::SDT_PID, &mut cc, &section)?;
         self.sdt_cc = cc;
+        Ok(())
+    }
+
+    /// Emit a DVB Network Information Table (PID 0x0010) naming the
+    /// network and listing this transport stream. Skipped when the config
+    /// carried no [`NetworkSpec`].
+    fn write_nit(&mut self) -> CoreResult<()> {
+        let net = match &self.network {
+            Some(n) => n.clone(),
+            None => return Ok(()),
+        };
+        let mut network_descriptors = crate::build::network_name_descriptor(&net.network_name);
+        network_descriptors.extend_from_slice(&net.network_descriptors);
+        let ts_entry = crate::build::NitTsEntry {
+            transport_stream_id: self.transport_stream_id,
+            original_network_id: self.original_network_id,
+            descriptors: net.transport_descriptors.clone(),
+        };
+        let section = crate::build::build_nit(
+            true,
+            net.network_id,
+            0,
+            &network_descriptors,
+            std::slice::from_ref(&ts_entry),
+        );
+        let mut cc = self.nit_cc;
+        self.write_psi_packet(crate::psi::NIT_PID, &mut cc, &section)?;
+        self.nit_cc = cc;
+        Ok(())
+    }
+
+    /// Emit one DVB present/following Event Information Table section
+    /// (PID 0x0012, `table_id` 0x4E) per program that carries events,
+    /// keyed on the program's `program_number` as `service_id`. Skipped
+    /// when no program declares events.
+    fn write_eit(&mut self) -> CoreResult<()> {
+        for pi in 0..self.programs.len() {
+            if self.programs[pi].events.is_empty() {
+                continue;
+            }
+            let service_id = self.programs[pi].program_number;
+            let events: Vec<crate::build::EitEventEntry> = self.programs[pi]
+                .events
+                .iter()
+                .map(|ev| {
+                    let descriptors = if ev.event_name.is_empty() && ev.text.is_empty() {
+                        Vec::new()
+                    } else {
+                        crate::build::short_event_descriptor(ev.language, &ev.event_name, &ev.text)
+                    };
+                    crate::build::EitEventEntry {
+                        event_id: ev.event_id,
+                        start_time: ev.start_time,
+                        duration: ev.duration,
+                        running_status: ev.running_status,
+                        free_ca_mode: false,
+                        descriptors,
+                    }
+                })
+                .collect();
+            let section = crate::build::build_eit_pf(
+                true,
+                service_id,
+                self.transport_stream_id,
+                self.original_network_id,
+                0,
+                &events,
+            );
+            let mut cc = self.eit_cc;
+            self.write_psi_packet(crate::psi::EIT_PID, &mut cc, &section)?;
+            self.eit_cc = cc;
+        }
         Ok(())
     }
 
@@ -701,6 +838,8 @@ impl Muxer for MpegTsMuxer {
         self.write_pat()?;
         self.write_pmt()?;
         self.write_sdt()?;
+        self.write_nit()?;
+        self.write_eit()?;
         self.header_written = true;
         Ok(())
     }
@@ -724,11 +863,13 @@ impl Muxer for MpegTsMuxer {
     }
 
     fn write_trailer(&mut self) -> CoreResult<()> {
-        // Re-emit PAT/PMT/SDT once so a late-joining player still finds
-        // the program tables after seeking near the end.
+        // Re-emit the program / SI tables once so a late-joining player
+        // still finds them after seeking near the end.
         self.write_pat()?;
         self.write_pmt()?;
         self.write_sdt()?;
+        self.write_nit()?;
+        self.write_eit()?;
         self.output.flush().map_err(CoreError::Io)?;
         Ok(())
     }
@@ -979,6 +1120,7 @@ mod tests {
                     pcr_pid: None,
                     stream_indices: vec![0, 1],
                     service: None,
+                    events: Vec::new(),
                 },
                 ProgramSpec {
                     program_number: 2,
@@ -986,8 +1128,10 @@ mod tests {
                     pcr_pid: None,
                     stream_indices: vec![2, 3],
                     service: None,
+                    events: Vec::new(),
                 },
             ],
+            network: None,
         };
         let sink = SharedSink::new();
         {
@@ -1049,7 +1193,9 @@ mod tests {
                     provider_name: b"OxideAV".to_vec(),
                     service_name: b"Channel One".to_vec(),
                 }),
+                events: Vec::new(),
             }],
+            network: None,
         };
         let sink = SharedSink::new();
         {
@@ -1092,6 +1238,146 @@ mod tests {
                 assert_eq!(s.service_name, b"Channel One");
             }
             other => panic!("expected Service descriptor, got {other:?}"),
+        }
+    }
+
+    /// Helper: find + parse the first section on `pid` with a matching
+    /// table_id via `parse`.
+    fn first_section_on<T>(
+        bytes: &[u8],
+        pid: u16,
+        parse: impl Fn(&[u8]) -> Result<T, crate::TsError>,
+    ) -> Option<T> {
+        use crate::psi::iter_sections;
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let p = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
+            let pusi = chunk[1] & 0x40 != 0;
+            if p == pid && pusi {
+                for sec in iter_sections(&chunk[4..]) {
+                    if let Ok(parsed) = parse(sec) {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A NetworkSpec makes the muxer emit a NIT on PID 0x0010 that
+    /// reassembles + parses back to the same network + TS entry.
+    #[test]
+    fn nit_round_trips_through_mux() {
+        use crate::psi::{NetworkInformationTable, NIT_PID};
+        let streams = vec![stream_info(0, "h264", true)];
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 0x0007,
+            original_network_id: 0x2024,
+            programs: vec![ProgramSpec {
+                program_number: 1,
+                pmt_pid: 0x0100,
+                pcr_pid: None,
+                stream_indices: vec![0],
+                service: None,
+                events: Vec::new(),
+            }],
+            network: Some(NetworkSpec {
+                network_id: 0x1000,
+                network_name: b"OxideNet".to_vec(),
+                network_descriptors: Vec::new(),
+                transport_descriptors: crate::build::service_list_descriptor(&[(1, 0x01)]),
+            }),
+        };
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.write_header().unwrap();
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![1; 4]).with_pts(10))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let nit = first_section_on(&bytes, NIT_PID, NetworkInformationTable::parse)
+            .expect("NIT on PID 0x0010");
+        assert_eq!(nit.network_id, 0x1000);
+        assert_eq!(nit.transport_streams.len(), 1);
+        assert_eq!(nit.transport_streams[0].transport_stream_id, 0x0007);
+        assert_eq!(nit.transport_streams[0].original_network_id, 0x2024);
+        match nit.iter_descriptors().next().unwrap().unwrap().body {
+            crate::descriptor::DescriptorBody::NetworkName(n) => {
+                assert_eq!(n.network_name, b"OxideNet")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An EventSpec makes the muxer emit an EIT present/following section
+    /// on PID 0x0012 that reassembles + parses back to the same event,
+    /// including its short_event_descriptor.
+    #[test]
+    fn eit_pf_round_trips_through_mux() {
+        use crate::psi::{EitDateTime, EitDuration, EventInformationTable, RunningStatus, EIT_PID};
+        let streams = vec![stream_info(0, "h264", true)];
+        let ev = EventSpec {
+            event_id: 0x0001,
+            start_time: Some(EitDateTime {
+                year: 2024,
+                month: 6,
+                day: 15,
+                hour: 20,
+                minute: 0,
+                second: 0,
+                mjd: 0,
+            }),
+            duration: EitDuration {
+                hours: 0,
+                minutes: 30,
+                seconds: 0,
+            },
+            running_status: RunningStatus::Running,
+            language: *b"eng",
+            event_name: b"News".to_vec(),
+            text: b"Evening bulletin".to_vec(),
+        };
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 0x0007,
+            original_network_id: 0x2024,
+            programs: vec![ProgramSpec {
+                program_number: 0x0064,
+                pmt_pid: 0x0100,
+                pcr_pid: None,
+                stream_indices: vec![0],
+                service: None,
+                events: vec![ev],
+            }],
+            network: None,
+        };
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.write_header().unwrap();
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![1; 4]).with_pts(10))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let eit = first_section_on(&bytes, EIT_PID, EventInformationTable::parse)
+            .expect("EIT on PID 0x0012");
+        assert_eq!(eit.service_id, 0x0064);
+        assert!(!eit.schedule);
+        assert_eq!(eit.events.len(), 1);
+        let e = &eit.events[0];
+        assert_eq!(e.event_id, 0x0001);
+        let st = e.start_time.unwrap();
+        assert_eq!((st.year, st.month, st.day), (2024, 6, 15));
+        assert_eq!(e.duration.as_seconds(), 1800);
+        match e.iter_descriptors().next().unwrap().unwrap().body {
+            crate::descriptor::DescriptorBody::ShortEvent(s) => {
+                assert_eq!(s.event_name, b"News");
+                assert_eq!(s.text, b"Evening bulletin");
+            }
+            other => panic!("{other:?}"),
         }
     }
 
@@ -1163,7 +1449,9 @@ mod tests {
                 pcr_pid: None,
                 stream_indices: vec![9],
                 service: None,
+                events: Vec::new(),
             }],
+            network: None,
         };
         let out: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
         assert!(MpegTsMuxer::with_config(out, &streams, bad).is_err());

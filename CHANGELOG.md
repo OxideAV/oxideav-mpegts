@@ -11,6 +11,17 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **DVB NIT + EIT emission on the mux side.** `MpegTsMuxConfig.network`
+  (a `NetworkSpec`) makes the muxer emit a Network Information Table on
+  PID 0x0010 naming the network and listing this transport stream (with
+  a `network_name_descriptor` plus caller-supplied delivery-system /
+  service_list descriptors). Each `ProgramSpec.events` (a `Vec<EventSpec>`)
+  makes the muxer emit a present/following Event Information Table on PID
+  0x0012 keyed on the program's `program_number`, each event carrying a
+  `short_event_descriptor`. Both round-trip through the demuxer's
+  `NetworkInformationTable::parse` / `EventInformationTable::parse`.
+- `build::short_event_descriptor` (tag `0x4D`) and
+  `build::service_list_descriptor` (tag `0x41`) round-trip builders.
 - **PSI repetition intervals.** The muxer now re-emits the PAT, every
   PMT, and the SDT mid-stream whenever the running PTS advances past a
   configurable interval (default ~200 ms / 18000 ticks of the 90 kHz
