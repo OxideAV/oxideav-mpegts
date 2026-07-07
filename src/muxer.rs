@@ -1410,6 +1410,185 @@ mod tests {
         }
     }
 
+    /// End-to-end harness: a two-program TS carrying SDT + NIT + EIT +
+    /// per-stream descriptors and PES with distinct PTS/DTS must demux
+    /// back with every table, descriptor, and timestamp intact.
+    #[test]
+    fn full_multiprogram_si_round_trip_harness() {
+        use crate::descriptor::DescriptorBody;
+        use crate::psi::{
+            EitDateTime, EitDuration, EventInformationTable, NetworkInformationTable,
+            RunningStatus, ServiceDescriptionTable, EIT_PID, NIT_PID, SDT_PID,
+        };
+        use oxideav_core::Demuxer as _;
+
+        let streams = vec![
+            stream_info(0, "h264", true),
+            stream_info(1, "ac3", false),
+            stream_info(2, "hevc", true),
+        ];
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 0x0100,
+            original_network_id: 0x2024,
+            programs: vec![
+                ProgramSpec {
+                    program_number: 1,
+                    pmt_pid: 0x1000,
+                    pcr_pid: None,
+                    stream_indices: vec![0, 1],
+                    service: Some(ServiceSpec {
+                        service_type: 0x19,
+                        provider_name: b"OxideAV".to_vec(),
+                        service_name: b"Prog One".to_vec(),
+                    }),
+                    events: vec![EventSpec {
+                        event_id: 0x0011,
+                        start_time: Some(EitDateTime {
+                            year: 2024,
+                            month: 6,
+                            day: 15,
+                            hour: 20,
+                            minute: 0,
+                            second: 0,
+                            mjd: 0,
+                        }),
+                        duration: EitDuration {
+                            hours: 1,
+                            minutes: 0,
+                            seconds: 0,
+                        },
+                        running_status: RunningStatus::Running,
+                        language: *b"eng",
+                        event_name: b"Movie".to_vec(),
+                        text: b"Feature film".to_vec(),
+                    }],
+                    es_descriptors: Vec::new(),
+                },
+                ProgramSpec {
+                    program_number: 2,
+                    pmt_pid: 0x1001,
+                    pcr_pid: None,
+                    stream_indices: vec![2],
+                    service: Some(ServiceSpec {
+                        service_type: 0x1F,
+                        provider_name: b"OxideAV".to_vec(),
+                        service_name: b"Prog Two".to_vec(),
+                    }),
+                    events: Vec::new(),
+                    es_descriptors: Vec::new(),
+                },
+            ],
+            network: Some(NetworkSpec {
+                network_id: 0x3000,
+                network_name: b"OxideNet".to_vec(),
+                network_descriptors: Vec::new(),
+                transport_descriptors: crate::build::service_list_descriptor(&[
+                    (1, 0x19),
+                    (2, 0x1F),
+                ]),
+            }),
+        };
+
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.set_psi_repetition_interval(None);
+            mx.write_header().unwrap();
+            // Video packet on program 1 with distinct PTS/DTS.
+            mx.write_packet(
+                &Packet::new(0, TimeBase::new(1, 90_000), vec![0xAA; 8])
+                    .with_pts(12_000)
+                    .with_dts(9_000),
+            )
+            .unwrap();
+            mx.write_packet(
+                &Packet::new(1, TimeBase::new(1, 90_000), vec![0xBB; 6]).with_pts(12_500),
+            )
+            .unwrap();
+            // Video on program 2.
+            mx.write_packet(
+                &Packet::new(2, TimeBase::new(1, 90_000), vec![0xCC; 8]).with_pts(13_000),
+            )
+            .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        assert_eq!(bytes.len() % TS_PACKET_LEN, 0);
+
+        // --- PAT enumerates both programs. ---
+        let dmx = crate::demuxer::MpegTsDemuxer::open_program(
+            Box::new(Cursor::new(bytes.clone())) as Box<dyn ReadSeek>,
+            1,
+        )
+        .expect("open prog 1");
+        let mut progs: Vec<(u16, u16)> = dmx
+            .programs()
+            .iter()
+            .map(|p| (p.program_number, p.pmt_pid))
+            .collect();
+        progs.sort();
+        assert_eq!(progs, vec![(1, 0x1000), (2, 0x1001)]);
+
+        // --- Program 1 PES timing: video PTS/DTS + audio PTS. ---
+        let mut dmx1 = crate::demuxer::MpegTsDemuxer::open_program(
+            Box::new(Cursor::new(bytes.clone())) as Box<dyn ReadSeek>,
+            1,
+        )
+        .expect("open prog 1");
+        let mut video_seen = false;
+        let mut audio_seen = false;
+        while let Ok(p) = dmx1.next_packet() {
+            match p.pts {
+                Some(12_000) => {
+                    assert_eq!(p.dts, Some(9_000), "video DTS must round-trip");
+                    video_seen = true;
+                }
+                Some(12_500) => audio_seen = true,
+                _ => {}
+            }
+        }
+        assert!(video_seen && audio_seen, "prog-1 PES timing lost");
+
+        // --- SDT names both services. ---
+        let sdt =
+            first_section_on(&bytes, SDT_PID, ServiceDescriptionTable::parse).expect("SDT present");
+        let mut names: Vec<Vec<u8>> = sdt
+            .services
+            .iter()
+            .filter_map(|s| {
+                s.iter_descriptors().find_map(|d| match d.unwrap().body {
+                    DescriptorBody::Service(sv) => Some(sv.service_name.to_vec()),
+                    _ => None,
+                })
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![b"Prog One".to_vec(), b"Prog Two".to_vec()]);
+
+        // --- NIT names the network + lists the TS. ---
+        let nit =
+            first_section_on(&bytes, NIT_PID, NetworkInformationTable::parse).expect("NIT present");
+        assert_eq!(nit.network_id, 0x3000);
+        assert_eq!(nit.transport_streams.len(), 1);
+        assert_eq!(nit.transport_streams[0].transport_stream_id, 0x0100);
+
+        // --- EIT carries program 1's event. ---
+        let eit =
+            first_section_on(&bytes, EIT_PID, EventInformationTable::parse).expect("EIT present");
+        assert_eq!(eit.service_id, 1);
+        assert_eq!(eit.events.len(), 1);
+        assert_eq!(eit.events[0].duration.as_seconds(), 3600);
+        let ev_name = eit.events[0]
+            .iter_descriptors()
+            .find_map(|d| match d.unwrap().body {
+                DescriptorBody::ShortEvent(s) => Some(s.event_name.to_vec()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(ev_name, b"Movie");
+    }
+
     /// With PSI repetition enabled, a long PTS run re-emits the PAT
     /// mid-stream (more than the two header/trailer copies). With it
     /// disabled, exactly two PAT sections appear.

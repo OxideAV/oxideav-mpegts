@@ -11,6 +11,12 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **End-to-end mux → demux round-trip harness.** A single test builds a
+  two-program transport stream carrying SDT + NIT + present/following EIT
+  + per-stream `stream_identifier` descriptors and PES with distinct
+  PTS/DTS, then demuxes it and asserts every program, service name,
+  network name, event, component tag, and timestamp reads back
+  identically.
 - **Richer PMT ES_info descriptor emission.** Every muxed elementary
   stream now carries an auto `stream_identifier_descriptor` (tag 0x52)
   with a per-program 1-based `component_tag`, alongside the existing
