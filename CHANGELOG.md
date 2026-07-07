@@ -11,6 +11,14 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Richer PMT ES_info descriptor emission.** Every muxed elementary
+  stream now carries an auto `stream_identifier_descriptor` (tag 0x52)
+  with a per-program 1-based `component_tag`, alongside the existing
+  ISO-639 language descriptor. `ProgramSpec.es_descriptors` lets a caller
+  attach arbitrary extra ES_info descriptor bytes per stream (built with
+  the `build` module — teletext / subtitling / AC-3 / …), appended after
+  the auto ones. Round-trips through the demuxer's
+  `PmtStream::iter_descriptors`.
 - **DVB NIT + EIT emission on the mux side.** `MpegTsMuxConfig.network`
   (a `NetworkSpec`) makes the muxer emit a Network Information Table on
   PID 0x0010 naming the network and listing this transport stream (with

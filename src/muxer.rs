@@ -145,6 +145,13 @@ pub struct ProgramSpec {
     /// (PID 0x0012) keyed on the program's `program_number` as
     /// `service_id`. Empty → no EIT for this program.
     pub events: Vec<EventSpec>,
+    /// Extra PMT `ES_info` descriptor bytes to append for a stream, keyed
+    /// by its `StreamInfo.index`. Lets a caller attach the DVB
+    /// component descriptors the muxer can't infer — teletext (0x56),
+    /// subtitling (0x59), AC-3 (0x6A), etc. — built with the `build`
+    /// module. Appended after the auto-emitted stream_identifier +
+    /// language descriptors.
+    pub es_descriptors: Vec<(u32, Vec<u8>)>,
 }
 
 /// Network metadata carried in the DVB NIT (ETSI EN 300 468 §5.2.1). When
@@ -268,10 +275,18 @@ struct TrackState {
     is_video: bool,
     /// Index into `MpegTsMuxer::programs` of this track's owning program.
     program: usize,
+    /// DVB `component_tag` (EN 300 468 §6.2.39) — a per-program ordinal
+    /// (1-based) emitted as a `stream_identifier_descriptor` in this
+    /// track's PMT ES_info loop so an EIT `component_descriptor` can
+    /// cross-reference the stream.
+    component_tag: u8,
     /// 3-byte ISO 639-2 language code, when the `StreamInfo` carried a
     /// language tag. Drives an `ISO_639_language_descriptor` (tag 0x0A)
     /// in this track's PMT ES_info loop. `None` → no language loop.
     language: Option<[u8; 3]>,
+    /// Caller-supplied extra ES_info descriptor bytes (teletext /
+    /// subtitling / AC-3 / …) appended verbatim after the auto ones.
+    extra_es_descriptors: Vec<u8>,
 }
 
 impl MpegTsMuxer {
@@ -294,6 +309,7 @@ impl MpegTsMuxer {
                 stream_indices: streams.iter().map(|s| s.index).collect(),
                 service: None,
                 events: Vec::new(),
+                es_descriptors: Vec::new(),
             }],
             network: None,
         };
@@ -357,6 +373,14 @@ impl MpegTsMuxer {
                 } else {
                     s.params.language.as_deref().map(iso639_code)
                 };
+                // component_tag = 1-based ordinal within the program.
+                let component_tag = (track_indices.len() as u8).wrapping_add(1);
+                let extra_es_descriptors = spec
+                    .es_descriptors
+                    .iter()
+                    .find(|(idx, _)| *idx == sidx)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_default();
                 let track_idx = tracks.len();
                 tracks.push(TrackState {
                     pid: next_pid,
@@ -365,7 +389,9 @@ impl MpegTsMuxer {
                     cc: 0,
                     is_video,
                     program: programs.len(),
+                    component_tag,
                     language,
+                    extra_es_descriptors,
                 });
                 idx_to_track.insert(sidx, track_idx);
                 track_indices.push(track_idx);
@@ -952,13 +978,11 @@ fn iso639_code(tag: &str) -> [u8; 3] {
 /// (undefined) since the core `StreamInfo` does not distinguish the
 /// clean-effects / hearing-impaired / visual-impaired sub-types.
 fn build_es_descriptors(track: &TrackState) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = crate::build::stream_identifier_descriptor(track.component_tag);
     if let Some(lang) = track.language {
-        out.push(0x0A); // descriptor_tag
-        out.push(0x04); // descriptor_length = 3 (code) + 1 (audio_type)
-        out.extend_from_slice(&lang);
-        out.push(0x00); // audio_type = undefined
+        out.extend_from_slice(&crate::build::iso639_language_descriptor(&[(lang, 0x00)]));
     }
+    out.extend_from_slice(&track.extra_es_descriptors);
     out
 }
 
@@ -1121,6 +1145,7 @@ mod tests {
                     stream_indices: vec![0, 1],
                     service: None,
                     events: Vec::new(),
+                    es_descriptors: Vec::new(),
                 },
                 ProgramSpec {
                     program_number: 2,
@@ -1129,6 +1154,7 @@ mod tests {
                     stream_indices: vec![2, 3],
                     service: None,
                     events: Vec::new(),
+                    es_descriptors: Vec::new(),
                 },
             ],
             network: None,
@@ -1194,6 +1220,7 @@ mod tests {
                     service_name: b"Channel One".to_vec(),
                 }),
                 events: Vec::new(),
+                es_descriptors: Vec::new(),
             }],
             network: None,
         };
@@ -1279,6 +1306,7 @@ mod tests {
                 stream_indices: vec![0],
                 service: None,
                 events: Vec::new(),
+                es_descriptors: Vec::new(),
             }],
             network: Some(NetworkSpec {
                 network_id: 0x1000,
@@ -1349,6 +1377,7 @@ mod tests {
                 stream_indices: vec![0],
                 service: None,
                 events: vec![ev],
+                es_descriptors: Vec::new(),
             }],
             network: None,
         };
@@ -1450,6 +1479,7 @@ mod tests {
                 stream_indices: vec![9],
                 service: None,
                 events: Vec::new(),
+                es_descriptors: Vec::new(),
             }],
             network: None,
         };
@@ -1544,8 +1574,9 @@ mod tests {
         assert!(langs.contains(&Some("jpn".to_string())), "langs={langs:?}");
     }
 
-    /// A video track's language tag is dropped — video streams don't
-    /// carry an ISO_639_language_descriptor in the PMT.
+    /// A video track's language tag is dropped — video streams carry a
+    /// stream_identifier_descriptor but no ISO_639_language_descriptor in
+    /// the PMT.
     #[test]
     fn video_track_emits_no_language_descriptor() {
         let mut video = stream_info(0, "h264", true);
@@ -1553,7 +1584,92 @@ mod tests {
         let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
         let mx = MpegTsMuxer::new(output, std::slice::from_ref(&video)).expect("open");
         assert!(mx.tracks[0].language.is_none());
-        assert!(build_es_descriptors(&mx.tracks[0]).is_empty());
+        let es = build_es_descriptors(&mx.tracks[0]);
+        let tags: Vec<u8> = crate::descriptor::iter_descriptors(&es)
+            .map(|d| d.unwrap().tag)
+            .collect();
+        assert!(
+            tags.contains(&0x52),
+            "expected stream_identifier, tags={tags:?}"
+        );
+        assert!(
+            !tags.contains(&0x0A),
+            "video must not carry ISO-639, tags={tags:?}"
+        );
+    }
+
+    /// The auto stream_identifier_descriptor and a caller-injected DVB
+    /// component descriptor (teletext) both surface in the demuxed PMT.
+    #[test]
+    fn es_descriptors_component_tag_and_injected_round_trip() {
+        use crate::descriptor::DescriptorBody;
+        use crate::psi::{iter_sections, ProgramMapTable};
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let teletext = crate::build::teletext_descriptor(&[crate::descriptor::TeletextEntry {
+            language_code: *b"eng",
+            teletext_type: 0x02,
+            teletext_magazine_number: 0x01,
+            teletext_page_number: 0x88,
+        }]);
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 1,
+            original_network_id: 1,
+            programs: vec![ProgramSpec {
+                program_number: 1,
+                pmt_pid: 0x0100,
+                pcr_pid: None,
+                stream_indices: vec![0, 1],
+                service: None,
+                events: Vec::new(),
+                es_descriptors: vec![(1, teletext)],
+            }],
+            network: None,
+        };
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.write_header().unwrap();
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![1; 4]).with_pts(10))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        // Reassemble the PMT from PID 0x0100.
+        let mut pmt = None;
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
+            let pusi = chunk[1] & 0x40 != 0;
+            if pid == 0x0100 && pusi {
+                for sec in iter_sections(&chunk[4..]) {
+                    if let Ok(p) = ProgramMapTable::parse(sec) {
+                        pmt = Some(p);
+                        break;
+                    }
+                }
+            }
+            if pmt.is_some() {
+                break;
+            }
+        }
+        let pmt = pmt.expect("PMT on 0x0100");
+        // Every stream carries a distinct stream_identifier component_tag.
+        let mut tags = Vec::new();
+        for st in &pmt.streams {
+            for d in st.iter_descriptors() {
+                if let DescriptorBody::StreamIdentifier(s) = d.unwrap().body {
+                    tags.push(s.component_tag);
+                }
+            }
+        }
+        tags.sort();
+        assert_eq!(tags, vec![1, 2]);
+        // The AC-3 stream (index 1) carries the injected teletext descriptor.
+        let ac3 = pmt.streams.iter().find(|s| s.stream_type == 0x81).unwrap();
+        let has_teletext = ac3
+            .iter_descriptors()
+            .any(|d| matches!(d.unwrap().body, DescriptorBody::Teletext(_)));
+        assert!(has_teletext, "expected injected teletext descriptor");
     }
 
     /// `encode_pcr` must round-trip through the demuxer-side adaptation
