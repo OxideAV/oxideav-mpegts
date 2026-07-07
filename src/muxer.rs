@@ -51,12 +51,14 @@ use crate::{TS_PACKET_LEN, TS_SYNC_BYTE};
 
 /// PAT lives on PID 0x0000 by spec.
 const PAT_PID: u16 = 0x0000;
-/// PMT PID is implementation-defined; we use the conventional 0x0100.
-const PMT_PID: u16 = 0x0100;
+/// PMT PID handed to the single (or first) program by default; the
+/// conventional value. Multi-program configs assign subsequent PMT PIDs
+/// upward from here (or the caller pins them explicitly).
+const DEFAULT_PMT_PID: u16 = 0x0100;
 /// First PID we hand out for an elementary stream.
 const FIRST_ES_PID: u16 = 0x1011;
-/// Single-program stream — `program_number` = 1 in PAT and PMT.
-const PROGRAM_NUMBER: u16 = 1;
+/// Default `program_number` for the single-program factory.
+const DEFAULT_PROGRAM_NUMBER: u16 = 1;
 /// ISO/IEC 13818-1 §2.7.2 bounds the interval between consecutive PCRs
 /// on the PCR_PID at 0,1 s. We aim well inside it — a PCR at least
 /// every ~40 ms (3600 ticks of the 90 kHz PCR base) — so even a player
@@ -67,42 +69,121 @@ const PROGRAM_NUMBER: u16 = 1;
 const PCR_MAX_INTERVAL_90K: i64 = 3600;
 
 /// `Open` factory matching `oxideav_core::OpenMuxerFn`. Registered
-/// under the `"mpegts"` container name.
+/// under the `"mpegts"` container name. Produces a single-program
+/// muxer; use [`MpegTsMuxer::with_config`] for multi-program output.
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> CoreResult<Box<dyn Muxer>> {
     MpegTsMuxer::new(output, streams).map(|m| Box::new(m) as Box<dyn Muxer>)
+}
+
+/// Human-readable service metadata carried in the DVB SDT for one
+/// program (ETSI EN 300 468 §5.2.3 / §6.2.33). When a [`ProgramSpec`]
+/// carries one, the muxer emits an SDT `service_descriptor` for the
+/// program so a receiver can label the channel.
+#[derive(Debug, Clone)]
+pub struct ServiceSpec {
+    /// `service_type` (Table 89) — e.g. `0x01` digital TV, `0x02` radio,
+    /// `0x19` H.264 HD, `0x1F` HEVC.
+    pub service_type: u8,
+    /// Raw `service_provider_name` bytes (DVB text string).
+    pub provider_name: Vec<u8>,
+    /// Raw `service_name` bytes (DVB text string).
+    pub service_name: Vec<u8>,
+}
+
+/// One program of a multi-program transport stream.
+///
+/// A program groups a set of the muxer's input streams (by their
+/// `StreamInfo.index`) under one `program_number`, its own PMT PID, and
+/// its own PCR PID. The PAT gains one `(program_number, pmt_pid)` entry
+/// per spec, and each program's PMT is emitted on its own PID.
+#[derive(Debug, Clone)]
+pub struct ProgramSpec {
+    /// `program_number` advertised in the PAT + carried in the PMT's
+    /// `table_id_extension`. Must be non-zero (0 is the network PID).
+    pub program_number: u16,
+    /// PID this program's PMT section is carried on. Must be unique
+    /// across programs.
+    pub pmt_pid: u16,
+    /// PCR PID for this program. `None` → the first video stream in the
+    /// program (or its first stream when there is no video).
+    pub pcr_pid: Option<u16>,
+    /// `StreamInfo.index` values of the input streams that belong to
+    /// this program, in PMT order.
+    pub stream_indices: Vec<u32>,
+    /// Optional DVB service metadata → an SDT entry for this program.
+    pub service: Option<ServiceSpec>,
+}
+
+/// Multi-program muxer configuration passed to
+/// [`MpegTsMuxer::with_config`].
+#[derive(Debug, Clone)]
+pub struct MpegTsMuxConfig {
+    /// `transport_stream_id` carried in the PAT (and SDT, when emitted).
+    pub transport_stream_id: u16,
+    /// `original_network_id` carried in the SDT (when emitted).
+    pub original_network_id: u16,
+    /// The programs multiplexed into this transport stream.
+    pub programs: Vec<ProgramSpec>,
+}
+
+impl Default for MpegTsMuxConfig {
+    fn default() -> Self {
+        Self {
+            transport_stream_id: 1,
+            original_network_id: 1,
+            programs: Vec::new(),
+        }
+    }
 }
 
 /// MPEG-TS muxer state.
 pub struct MpegTsMuxer {
     output: Box<dyn WriteSeek>,
-    /// Per-stream PID + stream_type + stream_id + CC. Order matches
-    /// the `streams` slice passed to [`MpegTsMuxer::new`].
+    /// Per-stream PID + stream_type + stream_id + CC + owning program.
     tracks: Vec<TrackState>,
+    /// One entry per multiplexed program — its PMT PID, PCR PID, and the
+    /// tracks it carries.
+    programs: Vec<ProgramState>,
     /// `stream_index` → `tracks[index]` for `write_packet` dispatch.
     idx_to_track: HashMap<u32, usize>,
-    /// PCR PID — the first track classified as video, or the first
-    /// track when no video is present.
-    pcr_pid: u16,
+    /// `transport_stream_id` for the PAT / SDT.
+    transport_stream_id: u16,
+    /// `original_network_id` for the SDT.
+    original_network_id: u16,
     /// Continuity counter for PAT TS packets.
     pat_cc: u8,
-    /// Continuity counter for PMT TS packets.
-    pmt_cc: u8,
+    /// Continuity counter for SDT TS packets (PID 0x0011).
+    sdt_cc: u8,
     /// `true` once `write_header` has run.
     header_written: bool,
-    /// 90 kHz PCR-base value of the last PCR emitted on the PCR_PID, or
-    /// `None` before the first PCR. Used to bound the inter-PCR interval
-    /// per §2.7.2.
-    last_pcr_pts: Option<i64>,
 }
 
 impl std::fmt::Debug for MpegTsMuxer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MpegTsMuxer")
             .field("tracks", &self.tracks.len())
-            .field("pcr_pid", &self.pcr_pid)
+            .field("programs", &self.programs.len())
             .field("header_written", &self.header_written)
             .finish()
     }
+}
+
+/// Per-program mux state.
+#[derive(Debug, Clone)]
+struct ProgramState {
+    program_number: u16,
+    pmt_pid: u16,
+    pcr_pid: u16,
+    /// Continuity counter for this program's PMT TS packets.
+    pmt_cc: u8,
+    /// Indices into `MpegTsMuxer::tracks` of the streams in this program,
+    /// in PMT order.
+    track_indices: Vec<usize>,
+    /// 90 kHz PCR-base value of the last PCR emitted on this program's
+    /// PCR_PID, or `None` before the first PCR (§2.7.2 interval bound).
+    last_pcr_pts: Option<i64>,
+    /// Optional DVB service metadata for the SDT.
+    service: Option<ServiceSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +193,8 @@ struct TrackState {
     stream_id: u8,
     cc: u8,
     is_video: bool,
+    /// Index into `MpegTsMuxer::programs` of this track's owning program.
+    program: usize,
     /// 3-byte ISO 639-2 language code, when the `StreamInfo` carried a
     /// language tag. Drives an `ISO_639_language_descriptor` (tag 0x0A)
     /// in this track's PMT ES_info loop. `None` → no language loop.
@@ -119,64 +202,136 @@ struct TrackState {
 }
 
 impl MpegTsMuxer {
+    /// Single-program factory: every stream is placed in one program
+    /// (`program_number` 1, PMT PID 0x0100). Backwards-compatible with
+    /// the original muxer surface.
     fn new(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> CoreResult<Self> {
         if streams.is_empty() {
             return Err(CoreError::invalid(
                 "mpegts muxer: at least one stream required",
             ));
         }
-        let mut tracks = Vec::with_capacity(streams.len());
-        let mut idx_to_track = HashMap::with_capacity(streams.len());
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 1,
+            original_network_id: 1,
+            programs: vec![ProgramSpec {
+                program_number: DEFAULT_PROGRAM_NUMBER,
+                pmt_pid: DEFAULT_PMT_PID,
+                pcr_pid: None,
+                stream_indices: streams.iter().map(|s| s.index).collect(),
+                service: None,
+            }],
+        };
+        Self::with_config(output, streams, config)
+    }
+
+    /// Multi-program factory. Each [`ProgramSpec`] in `config.programs`
+    /// becomes a PAT entry + its own PMT on `pmt_pid`, grouping the
+    /// input streams named by its `stream_indices`. Elementary-stream
+    /// PIDs are assigned sequentially from 0x1011 in program order.
+    pub fn with_config(
+        output: Box<dyn WriteSeek>,
+        streams: &[StreamInfo],
+        config: MpegTsMuxConfig,
+    ) -> CoreResult<Self> {
+        if streams.is_empty() {
+            return Err(CoreError::invalid(
+                "mpegts muxer: at least one stream required",
+            ));
+        }
+        if config.programs.is_empty() {
+            return Err(CoreError::invalid(
+                "mpegts muxer: at least one program required",
+            ));
+        }
+        let by_index: HashMap<u32, &StreamInfo> = streams.iter().map(|s| (s.index, s)).collect();
+
+        let mut tracks: Vec<TrackState> = Vec::with_capacity(streams.len());
+        let mut idx_to_track: HashMap<u32, usize> = HashMap::with_capacity(streams.len());
+        let mut programs: Vec<ProgramState> = Vec::with_capacity(config.programs.len());
         let mut next_pid = FIRST_ES_PID;
-        for (i, s) in streams.iter().enumerate() {
-            let (stream_type, stream_id, is_video) =
-                stream_type_for_codec(s.params.codec_id.as_str()).ok_or_else(|| {
-                    CoreError::unsupported(format!(
-                        "mpegts muxer: no MPEG-TS stream_type for codec_id '{}'",
-                        s.params.codec_id.as_str()
+
+        for spec in &config.programs {
+            if spec.program_number == 0 {
+                return Err(CoreError::invalid(
+                    "mpegts muxer: program_number 0 is reserved for the network PID",
+                ));
+            }
+            let mut track_indices = Vec::with_capacity(spec.stream_indices.len());
+            for &sidx in &spec.stream_indices {
+                let s = by_index.get(&sidx).ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "mpegts muxer: program {} references unknown stream_index {sidx}",
+                        spec.program_number
                     ))
                 })?;
-            // Carry the per-track language tag into the PMT as an
-            // ISO_639_language_descriptor. Only audio and subtitle
-            // streams carry language semantically; a 3-character ISO
-            // 639-2 code is the spec's exact field width — anything
-            // shorter is left-justified and space-padded, anything
-            // longer is truncated to 3.
-            let language = if is_video {
-                None
-            } else {
-                s.params.language.as_deref().map(iso639_code)
-            };
-            tracks.push(TrackState {
-                pid: next_pid,
-                stream_type,
-                stream_id,
-                cc: 0,
-                is_video,
-                language,
+                if idx_to_track.contains_key(&sidx) {
+                    return Err(CoreError::invalid(format!(
+                        "mpegts muxer: stream_index {sidx} assigned to more than one program"
+                    )));
+                }
+                let (stream_type, stream_id, is_video) =
+                    stream_type_for_codec(s.params.codec_id.as_str()).ok_or_else(|| {
+                        CoreError::unsupported(format!(
+                            "mpegts muxer: no MPEG-TS stream_type for codec_id '{}'",
+                            s.params.codec_id.as_str()
+                        ))
+                    })?;
+                let language = if is_video {
+                    None
+                } else {
+                    s.params.language.as_deref().map(iso639_code)
+                };
+                let track_idx = tracks.len();
+                tracks.push(TrackState {
+                    pid: next_pid,
+                    stream_type,
+                    stream_id,
+                    cc: 0,
+                    is_video,
+                    program: programs.len(),
+                    language,
+                });
+                idx_to_track.insert(sidx, track_idx);
+                track_indices.push(track_idx);
+                next_pid = next_pid.wrapping_add(1);
+            }
+            if track_indices.is_empty() {
+                return Err(CoreError::invalid(format!(
+                    "mpegts muxer: program {} has no streams",
+                    spec.program_number
+                )));
+            }
+            // PCR PID: explicit, else first video track, else first track.
+            let pcr_pid = spec.pcr_pid.unwrap_or_else(|| {
+                track_indices
+                    .iter()
+                    .map(|&i| &tracks[i])
+                    .find(|t| t.is_video)
+                    .map(|t| t.pid)
+                    .unwrap_or(tracks[track_indices[0]].pid)
             });
-            idx_to_track.insert(s.index, i);
-            // Increment PID with a bit of separation between codec
-            // classes so the muxed file roughly matches the BD-style
-            // 0x1011 (video) / 0x1100+ (audio) / 0x1200+ (subs)
-            // convention. Strictly cosmetic — any 13-bit PID works.
-            next_pid = next_pid.wrapping_add(1);
-            let _ = i;
+            programs.push(ProgramState {
+                program_number: spec.program_number,
+                pmt_pid: spec.pmt_pid,
+                pcr_pid,
+                pmt_cc: 0,
+                track_indices,
+                last_pcr_pts: None,
+                service: spec.service.clone(),
+            });
         }
-        let pcr_pid = tracks
-            .iter()
-            .find(|t| t.is_video)
-            .map(|t| t.pid)
-            .unwrap_or(tracks[0].pid);
+
         Ok(Self {
             output,
             tracks,
+            programs,
             idx_to_track,
-            pcr_pid,
+            transport_stream_id: config.transport_stream_id,
+            original_network_id: config.original_network_id,
             pat_cc: 0,
-            pmt_cc: 0,
+            sdt_cc: 0,
             header_written: false,
-            last_pcr_pts: None,
         })
     }
 
@@ -227,81 +382,88 @@ impl MpegTsMuxer {
         Ok(())
     }
 
+    /// Emit the Program Association Table listing every program's
+    /// `(program_number, pmt_pid)` pair (§2.4.4.3).
     fn write_pat(&mut self) -> CoreResult<()> {
-        // PAT body: table_id=0x00, ssi=1, '0', reserved, section_length(12),
-        //           table_id_extension (tsid)(16), reserved + version + cni,
-        //           section_number, last_section_number,
-        //           one program entry: program_number(16), reserved + pmt_pid(13).
-        let mut body = vec![
-            0x00, // table_id
-            0xB0,
-            0x0D, // ssi=1, '0', reserved, section_length=13
-            0x00,
-            0x01, // tsid = 1
-            0xC1, // reserved + version=0 + current_next=1
-            0x00,
-            0x00, // section_number + last_section_number
-            (PROGRAM_NUMBER >> 8) as u8,
-            PROGRAM_NUMBER as u8,
-            (0xE0 | ((PMT_PID >> 8) as u8 & 0x1F)),
-            PMT_PID as u8,
-        ];
-        let crc = mpeg2_crc32(&body);
-        body.extend_from_slice(&crc.to_be_bytes());
+        let entries: Vec<(u16, u16)> = self
+            .programs
+            .iter()
+            .map(|p| (p.program_number, p.pmt_pid))
+            .collect();
+        let section = crate::build::build_pat(self.transport_stream_id, 0, &entries);
         let mut cc = self.pat_cc;
-        self.write_psi_packet(PAT_PID, &mut cc, &body)?;
+        self.write_psi_packet(PAT_PID, &mut cc, &section)?;
         self.pat_cc = cc;
         Ok(())
     }
 
+    /// Emit one Program Map Table per program on its own PMT PID
+    /// (§2.4.4.8), each carrying its streams' `stream_type` + PID +
+    /// ES-info descriptor loop.
     fn write_pmt(&mut self) -> CoreResult<()> {
-        // PMT body:
-        //   table_id=0x02, ssi=1, '0', reserved, section_length(12),
-        //   program_number(16), reserved + version + cni,
-        //   section_number, last_section_number,
-        //   reserved + PCR_PID(13), reserved + program_info_length(12)=0,
-        //   per-stream: stream_type(8), reserved + ES_PID(13),
-        //               reserved + ES_info_length(12)=0.
-        //   CRC_32.
-        let mut body: Vec<u8> = Vec::new();
-        body.push(0x02); // table_id
-                         // section_length placeholder — fill after constructing the body.
-        body.push(0xB0);
-        body.push(0x00);
-        body.extend_from_slice(&[
-            (PROGRAM_NUMBER >> 8) as u8,
-            PROGRAM_NUMBER as u8,
-            0xC1, // reserved + version=0 + current_next=1
-            0x00, // section_number
-            0x00, // last_section_number
-            0xE0 | ((self.pcr_pid >> 8) as u8 & 0x1F),
-            self.pcr_pid as u8,
-            0xF0, // reserved + program_info_length high
-            0x00, // program_info_length low
-        ]);
-        for t in &self.tracks {
-            // Build this stream's ES descriptor loop first so we can
-            // fill ES_info_length.
-            let es_info = build_es_descriptors(t);
-            let es_info_length = es_info.len() as u16;
-            body.push(t.stream_type);
-            body.push(0xE0 | ((t.pid >> 8) as u8 & 0x1F));
-            body.push(t.pid as u8);
-            body.push(0xF0 | ((es_info_length >> 8) as u8 & 0x0F));
-            body.push(es_info_length as u8);
-            body.extend_from_slice(&es_info);
+        for pi in 0..self.programs.len() {
+            let streams: Vec<crate::build::PmtStreamEntry> = self.programs[pi]
+                .track_indices
+                .iter()
+                .map(|&ti| {
+                    let t = &self.tracks[ti];
+                    crate::build::PmtStreamEntry {
+                        stream_type: t.stream_type,
+                        elementary_pid: t.pid,
+                        es_info: build_es_descriptors(t),
+                    }
+                })
+                .collect();
+            let section = crate::build::build_pmt(
+                self.programs[pi].program_number,
+                0,
+                self.programs[pi].pcr_pid,
+                &[],
+                &streams,
+            );
+            let pmt_pid = self.programs[pi].pmt_pid;
+            let mut cc = self.programs[pi].pmt_cc;
+            self.write_psi_packet(pmt_pid, &mut cc, &section)?;
+            self.programs[pi].pmt_cc = cc;
         }
-        // section_length = body bytes following section_length field
-        // (i.e. body.len() - 3 (table_id + 2-byte length field)) + 4 (CRC).
-        let section_length = (body.len() - 3 + 4) as u16;
-        body[1] = 0xB0 | ((section_length >> 8) as u8 & 0x0F);
-        body[2] = section_length as u8;
-        let crc = mpeg2_crc32(&body);
-        body.extend_from_slice(&crc.to_be_bytes());
+        Ok(())
+    }
 
-        let mut cc = self.pmt_cc;
-        self.write_psi_packet(PMT_PID, &mut cc, &body)?;
-        self.pmt_cc = cc;
+    /// Emit a DVB Service Description Table (PID 0x0011) describing every
+    /// program that carries a [`ServiceSpec`]. Skipped entirely when no
+    /// program has service metadata.
+    fn write_sdt(&mut self) -> CoreResult<()> {
+        let services: Vec<crate::build::SdtServiceEntry> = self
+            .programs
+            .iter()
+            .filter_map(|p| {
+                p.service.as_ref().map(|svc| crate::build::SdtServiceEntry {
+                    service_id: p.program_number,
+                    eit_schedule: false,
+                    eit_present_following: false,
+                    running_status: crate::psi::RunningStatus::Running,
+                    free_ca_mode: false,
+                    descriptors: crate::build::service_descriptor(
+                        svc.service_type,
+                        &svc.provider_name,
+                        &svc.service_name,
+                    ),
+                })
+            })
+            .collect();
+        if services.is_empty() {
+            return Ok(());
+        }
+        let section = crate::build::build_sdt(
+            true,
+            self.transport_stream_id,
+            self.original_network_id,
+            0,
+            &services,
+        );
+        let mut cc = self.sdt_cc;
+        self.write_psi_packet(crate::psi::SDT_PID, &mut cc, &section)?;
+        self.sdt_cc = cc;
         Ok(())
     }
 
@@ -310,8 +472,9 @@ impl MpegTsMuxer {
     /// with the AF spanning the whole 184-byte body: a flags byte with
     /// `PCR_flag` set, the 6-byte PCR, then 0xFF stuffing. Per §2.4.3.4
     /// a packet may legally carry an adaptation field and no payload.
-    fn write_pcr_only_packet(&mut self, pts: i64) -> CoreResult<()> {
-        let pcr_track = match self.tracks.iter().position(|t| t.pid == self.pcr_pid) {
+    fn write_pcr_only_packet(&mut self, prog_idx: usize, pts: i64) -> CoreResult<()> {
+        let pcr_pid = self.programs[prog_idx].pcr_pid;
+        let pcr_track = match self.tracks.iter().position(|t| t.pid == pcr_pid) {
             Some(i) => i,
             None => return Ok(()),
         };
@@ -321,8 +484,8 @@ impl MpegTsMuxer {
         let mut pkt = [0xFFu8; TS_PACKET_LEN];
         pkt[0] = TS_SYNC_BYTE;
         // PUSI = 0 (no payload start), PID high.
-        pkt[1] = (self.pcr_pid >> 8) as u8 & 0b0001_1111;
-        pkt[2] = self.pcr_pid as u8;
+        pkt[1] = (pcr_pid >> 8) as u8 & 0b0001_1111;
+        pkt[2] = pcr_pid as u8;
         // adaptation_field_control = 0b10 (AF only, no payload).
         pkt[3] = 0b0010_0000 | (cc & 0x0F);
         // adaptation_field_length = 183 (rest of the packet).
@@ -333,20 +496,20 @@ impl MpegTsMuxer {
         pkt[6..12].copy_from_slice(&pcr_bytes);
         // pkt[12..] stays 0xFF stuffing (already pre-filled).
         self.output.write_all(&pkt).map_err(CoreError::Io)?;
-        self.last_pcr_pts = Some(pts);
+        self.programs[prog_idx].last_pcr_pts = Some(pts);
         Ok(())
     }
 
     /// Inject PCR-only packets ahead of a PES so the gap between
-    /// consecutive PCRs on the PCR_PID stays under
+    /// consecutive PCRs on the program's PCR_PID stays under
     /// [`PCR_MAX_INTERVAL_90K`] (§2.7.2's 0,1 s bound, with margin).
     /// Driven by the PES PTS rather than wall time — the muxer has no
     /// real-time clock.
-    fn maybe_emit_periodic_pcr(&mut self, pts: i64) -> CoreResult<()> {
-        match self.last_pcr_pts {
-            None => self.write_pcr_only_packet(pts),
+    fn maybe_emit_periodic_pcr(&mut self, prog_idx: usize, pts: i64) -> CoreResult<()> {
+        match self.programs[prog_idx].last_pcr_pts {
+            None => self.write_pcr_only_packet(prog_idx, pts),
             Some(last) if pts.saturating_sub(last) >= PCR_MAX_INTERVAL_90K => {
-                self.write_pcr_only_packet(pts)
+                self.write_pcr_only_packet(prog_idx, pts)
             }
             _ => Ok(()),
         }
@@ -358,17 +521,19 @@ impl MpegTsMuxer {
     /// PCR-only packets when the inter-PCR interval would be exceeded.
     fn write_pes_packet(&mut self, track_idx: usize, packet: &Packet) -> CoreResult<()> {
         let track = self.tracks[track_idx].clone();
+        let prog_idx = track.program;
+        let pcr_pid = self.programs[prog_idx].pcr_pid;
         // Bound the inter-PCR interval (§2.7.2). Any track's PTS can
-        // advance the muxer's notion of time; the PCR is emitted on the
-        // PCR_PID regardless of which track triggered it.
-        let pcr_on_this_pes = if track.pid == self.pcr_pid {
+        // advance the program's notion of time; the PCR is emitted on the
+        // program's PCR_PID regardless of which track triggered it.
+        let pcr_on_this_pes = if track.pid == pcr_pid {
             // The PCR PID's own PES carries an inline PCR on its first
             // TS packet — record it so the periodic logic doesn't
             // double-emit.
             packet.pts
         } else {
             if let Some(p) = packet.pts {
-                self.maybe_emit_periodic_pcr(p)?;
+                self.maybe_emit_periodic_pcr(prog_idx, p)?;
             }
             None
         };
@@ -381,7 +546,7 @@ impl MpegTsMuxer {
             (pcr_base, 0u16)
         });
         if let Some((base, _)) = pcr {
-            self.last_pcr_pts = Some(base as i64);
+            self.programs[prog_idx].last_pcr_pts = Some(base as i64);
         }
         self.write_pes_bytes_as_ts(track.pid, track_idx, &pes, pcr)
     }
@@ -478,6 +643,7 @@ impl Muxer for MpegTsMuxer {
     fn write_header(&mut self) -> CoreResult<()> {
         self.write_pat()?;
         self.write_pmt()?;
+        self.write_sdt()?;
         self.header_written = true;
         Ok(())
     }
@@ -498,10 +664,11 @@ impl Muxer for MpegTsMuxer {
     }
 
     fn write_trailer(&mut self) -> CoreResult<()> {
-        // Re-emit PAT/PMT once so a late-joining player still finds
-        // them after seeking near the end.
+        // Re-emit PAT/PMT/SDT once so a late-joining player still finds
+        // the program tables after seeking near the end.
         self.write_pat()?;
         self.write_pmt()?;
+        self.write_sdt()?;
         self.output.flush().map_err(CoreError::Io)?;
         Ok(())
     }
@@ -634,24 +801,6 @@ fn stream_type_for_codec(codec_id: &str) -> Option<(u8, u8, bool)> {
     })
 }
 
-/// MPEG-2 CRC-32 — `oxideav-mpegts::psi::mpeg2_crc32` would be the
-/// natural choice, but it's currently `pub(crate)`. Inlined here so
-/// the muxer module stays decoupled from the section-parser surface.
-fn mpeg2_crc32(data: &[u8]) -> u32 {
-    let mut c: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        c ^= (b as u32) << 24;
-        for _ in 0..8 {
-            c = if c & 0x8000_0000 != 0 {
-                (c << 1) ^ 0x04C1_1DB7
-            } else {
-                c << 1
-            };
-        }
-    }
-    c
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +896,163 @@ mod tests {
         let mut pts_set = vec![p1.pts.unwrap(), p2.pts.unwrap()];
         pts_set.sort();
         assert_eq!(pts_set, vec![12345, 22222]);
+    }
+
+    /// Two independent programs, each with its own PMT PID + PCR PID,
+    /// must round-trip through the demuxer's `programs()` enumeration and
+    /// be individually selectable with `open_program`.
+    #[test]
+    fn multi_program_round_trips_through_pat() {
+        let streams = vec![
+            stream_info(0, "h264", true),
+            stream_info(1, "ac3", false),
+            stream_info(2, "hevc", true),
+            stream_info(3, "eac3", false),
+        ];
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 0x0042,
+            original_network_id: 0x2024,
+            programs: vec![
+                ProgramSpec {
+                    program_number: 1,
+                    pmt_pid: 0x0100,
+                    pcr_pid: None,
+                    stream_indices: vec![0, 1],
+                    service: None,
+                },
+                ProgramSpec {
+                    program_number: 2,
+                    pmt_pid: 0x0101,
+                    pcr_pid: None,
+                    stream_indices: vec![2, 3],
+                    service: None,
+                },
+            ],
+        };
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.write_header().expect("hdr");
+            for k in 0..4i64 {
+                mx.write_packet(
+                    &Packet::new(k as u32, TimeBase::new(1, 90_000), vec![k as u8; 6])
+                        .with_pts(1000 + k * 10),
+                )
+                .unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+
+        // Enumerate the programs via the concrete demuxer.
+        use oxideav_core::Demuxer as _;
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
+        let dmx = crate::demuxer::MpegTsDemuxer::open_program(input, 1).expect("open prog 1");
+        let mut progs: Vec<(u16, u16)> = dmx
+            .programs()
+            .iter()
+            .map(|p| (p.program_number, p.pmt_pid))
+            .collect();
+        progs.sort();
+        assert_eq!(progs, vec![(1, 0x0100), (2, 0x0101)]);
+
+        // Program 2 selected explicitly must expose its hevc+eac3 streams.
+        let input2: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let dmx2 = crate::demuxer::MpegTsDemuxer::open_program(input2, 2).expect("open prog 2");
+        assert_eq!(dmx2.selected_program(), 2);
+        let codecs: Vec<&str> = dmx2
+            .streams()
+            .iter()
+            .map(|s| s.params.codec_id.as_str())
+            .collect();
+        assert!(codecs.contains(&"hevc"), "codecs={codecs:?}");
+        assert!(codecs.contains(&"eac3"), "codecs={codecs:?}");
+    }
+
+    /// A program carrying `ServiceSpec` metadata must emit an SDT on
+    /// PID 0x0011 that reassembles + parses back to the same service.
+    #[test]
+    fn sdt_service_round_trips_through_mux() {
+        use crate::psi::{iter_sections, ServiceDescriptionTable, SDT_PID};
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 0x0007,
+            original_network_id: 0x1000,
+            programs: vec![ProgramSpec {
+                program_number: 0x0064,
+                pmt_pid: 0x0100,
+                pcr_pid: None,
+                stream_indices: vec![0, 1],
+                service: Some(ServiceSpec {
+                    service_type: 0x19,
+                    provider_name: b"OxideAV".to_vec(),
+                    service_name: b"Channel One".to_vec(),
+                }),
+            }],
+        };
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.write_header().expect("hdr");
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![1; 4]).with_pts(90))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        // Find the first SDT_PID packet with PUSI and parse its section.
+        let mut found = None;
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
+            let pusi = chunk[1] & 0x40 != 0;
+            if pid == SDT_PID && pusi {
+                // afc = payload only (0b01) → payload from byte 4.
+                for sec in iter_sections(&chunk[4..]) {
+                    if let Ok(sdt) = ServiceDescriptionTable::parse(sec) {
+                        found = Some(sdt);
+                        break;
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let sdt = found.expect("SDT section on PID 0x0011");
+        assert_eq!(sdt.transport_stream_id, 0x0007);
+        assert_eq!(sdt.original_network_id, 0x1000);
+        assert_eq!(sdt.services.len(), 1);
+        let svc = &sdt.services[0];
+        assert_eq!(svc.service_id, 0x0064);
+        match svc.iter_descriptors().next().unwrap().unwrap().body {
+            crate::descriptor::DescriptorBody::Service(s) => {
+                assert_eq!(s.service_type, 0x19);
+                assert_eq!(s.service_provider_name, b"OxideAV");
+                assert_eq!(s.service_name, b"Channel One");
+            }
+            other => panic!("expected Service descriptor, got {other:?}"),
+        }
+    }
+
+    /// A stream_index referenced by no program (or by two) is rejected.
+    #[test]
+    fn with_config_rejects_bad_stream_mapping() {
+        let streams = vec![stream_info(0, "h264", true)];
+        // Unknown stream_index 9.
+        let bad = MpegTsMuxConfig {
+            transport_stream_id: 1,
+            original_network_id: 1,
+            programs: vec![ProgramSpec {
+                program_number: 1,
+                pmt_pid: 0x0100,
+                pcr_pid: None,
+                stream_indices: vec![9],
+                service: None,
+            }],
+        };
+        let out: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        assert!(MpegTsMuxer::with_config(out, &streams, bad).is_err());
     }
 
     /// A PSI section longer than one packet's 183-byte first-packet
@@ -887,7 +1193,7 @@ mod tests {
         {
             let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
             let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
-            pcr_pid = mx.pcr_pid;
+            pcr_pid = mx.programs[0].pcr_pid;
             mx.write_header().expect("hdr");
             // Video at PTS 0, then a run of audio packets advancing PTS
             // well past several PCR intervals, then video again.

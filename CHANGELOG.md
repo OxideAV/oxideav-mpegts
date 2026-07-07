@@ -11,6 +11,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Multi-program muxing.** `MpegTsMuxer::with_config` takes a
+  `MpegTsMuxConfig` describing several `ProgramSpec`s — each with its own
+  `program_number`, PMT PID, PCR PID, and set of input streams. The PAT
+  now lists every program's `(program_number, pmt_pid)` pair, one PMT is
+  emitted per program on its own PID, and PCR insertion / the §2.7.2
+  inter-PCR interval bound is tracked independently per program. The
+  single-program `open` factory is unchanged (one program, PMT PID
+  0x0100). Round-trips through the demuxer's `programs()` enumeration and
+  per-program `open_program` selection.
+- **DVB SDT emission.** A `ProgramSpec` carrying a `ServiceSpec`
+  (`service_type` + provider / service names) makes the muxer emit a
+  Service Description Table on PID 0x0011 with a `service_descriptor`
+  per service, at header and trailer. Reads back through
+  `ServiceDescriptionTable::parse`.
+- The muxer's PAT / PMT construction now goes through the shared `build`
+  module (removing an inlined CRC-32 duplicate).
 - New `build` module — the write-side mirror of the `psi` / `descriptor`
   parse surface. Pure `&[…] -> Vec<u8>` builders emit spec-conformant
   bytes that read back identically through the matching parser:
