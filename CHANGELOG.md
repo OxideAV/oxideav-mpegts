@@ -11,6 +11,13 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **PSI repetition intervals.** The muxer now re-emits the PAT, every
+  PMT, and the SDT mid-stream whenever the running PTS advances past a
+  configurable interval (default ~200 ms / 18000 ticks of the 90 kHz
+  clock), so a receiver tuning in mid-file re-acquires the program tables
+  quickly (cf. DVB TR 101 290 §5). `MpegTsMuxer::set_psi_repetition_interval`
+  widens or disables it; `None` restores the header/trailer-only
+  behaviour.
 - **Multi-program muxing.** `MpegTsMuxer::with_config` takes a
   `MpegTsMuxConfig` describing several `ProgramSpec`s — each with its own
   `program_number`, PMT PID, PCR PID, and set of input streams. The PAT

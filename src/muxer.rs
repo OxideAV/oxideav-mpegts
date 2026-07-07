@@ -3,31 +3,37 @@
 //!
 //! Scope:
 //!
-//! * Synthesises a single-program PAT (`PID 0x0000`) and a matching
-//!   PMT (`PID 0x0100`) on `write_header`. PSI sections too long for
-//!   one packet (a PMT with an ISO-639 / registration descriptor loop
-//!   for many tracks) split across multiple TS packets per §2.4.4 —
-//!   PUSI + `pointer_field` on the first, continuation on the rest.
+//! * Synthesises a PAT (`PID 0x0000`) listing every program's
+//!   `(program_number, pmt_pid)` pair, and one PMT per program on its
+//!   own PID, on `write_header`. The single-program `open` factory
+//!   groups all streams into `program_number` 1 (PMT PID 0x0100);
+//!   [`MpegTsMuxer::with_config`] takes a [`MpegTsMuxConfig`] of several
+//!   [`ProgramSpec`]s for a genuine multi-program transport stream. PSI
+//!   sections too long for one packet split across multiple TS packets
+//!   per §2.4.4 — PUSI + `pointer_field` on the first, continuation on
+//!   the rest.
+//! * When a program carries a [`ServiceSpec`], a DVB Service Description
+//!   Table (`PID 0x0011`) is emitted with a `service_descriptor` per
+//!   service (ETSI EN 300 468 §5.2.3).
 //! * Wraps each [`Packet`] in a PES envelope with PTS (and DTS when
 //!   set), then fragments the PES into 188-byte TS packets — first
 //!   packet has `payload_unit_start_indicator = 1`, continuations
 //!   have it clear. Tail packets get an adaptation-field stuffing
 //!   pass so the byte count lands on the 188-byte boundary.
 //! * Per-PID continuity counters increment 0..0xF and wrap.
-//! * The first track marked as video also serves as the PCR PID —
-//!   every PES start on that PID carries a PCR adaptation field, and
-//!   standalone PCR-only packets are injected on that PID whenever the
-//!   inter-PCR interval would exceed the §2.7.2 bound (0,1 s), driven
-//!   off the stream's PTS progression so a player locks the clock even
-//!   across a long run of audio-only packets.
-//! * `write_trailer` re-emits the PAT/PMT once so a player that
-//!   joins the stream near the end still sees the program tables.
+//! * Each program's PCR PID (its first video track by default) carries a
+//!   PCR adaptation field on every PES start, and standalone PCR-only
+//!   packets are injected on that PID whenever the inter-PCR interval
+//!   would exceed the §2.7.2 bound (0,1 s), tracked independently per
+//!   program and driven off PTS progression.
+//! * The PAT / PMTs / SDT are re-emitted mid-stream at a configurable
+//!   PTS interval (default ~200 ms; see
+//!   [`MpegTsMuxer::set_psi_repetition_interval`]) so a receiver tuning
+//!   in mid-file re-acquires the tables quickly, and once more at
+//!   `write_trailer`.
 //!
-//! Out of scope (Phase 1):
+//! Out of scope:
 //!
-//! * Multi-program streams. There is one program; trying to mux
-//!   streams from two different programs into one PMT is the
-//!   caller's responsibility.
 //! * MPEG-DASH-style time slicing, PES-CRC, or scrambling.
 //! * Adaptation-field random-access / discontinuity / private-data
 //!   flags beyond `PCR_flag`. The PCR PID gets PCR at every PES start
@@ -154,6 +160,16 @@ pub struct MpegTsMuxer {
     pat_cc: u8,
     /// Continuity counter for SDT TS packets (PID 0x0011).
     sdt_cc: u8,
+    /// PSI re-emission interval in 90 kHz ticks, or `None` to emit the
+    /// program tables only at header + trailer. When set, the PAT / PMTs
+    /// / SDT are re-emitted mid-stream whenever the running PTS advances
+    /// past `last_psi_pts + interval`, so a receiver that tunes in
+    /// mid-file re-acquires the tables quickly (DVB TR 101 290 §5 calls
+    /// for a PAT/PMT at least every 0,5 s; the default aims well inside
+    /// that).
+    psi_repetition_90k: Option<i64>,
+    /// PTS at which the PSI tables were last (re-)emitted mid-stream.
+    last_psi_pts: Option<i64>,
     /// `true` once `write_header` has run.
     header_written: bool,
 }
@@ -331,8 +347,49 @@ impl MpegTsMuxer {
             original_network_id: config.original_network_id,
             pat_cc: 0,
             sdt_cc: 0,
+            // ~200 ms (18000 ticks of the 90 kHz clock) — a conformant
+            // default that keeps the tables fresh without flooding the
+            // multiplex. Callers can widen / disable it.
+            psi_repetition_90k: Some(18_000),
+            last_psi_pts: None,
             header_written: false,
         })
+    }
+
+    /// Override the PSI re-emission interval (90 kHz ticks). `None`
+    /// disables mid-stream repetition — the program tables are then only
+    /// written at `write_header` and `write_trailer`. Call before
+    /// `write_header`.
+    pub fn set_psi_repetition_interval(&mut self, ticks: Option<i64>) {
+        self.psi_repetition_90k = ticks;
+    }
+
+    /// Re-emit the full PSI set (PAT + every PMT + SDT) mid-stream when
+    /// the running PTS has advanced past the configured repetition
+    /// interval. Anchored to `write_header`'s emission so the first
+    /// repeat lands one interval into the stream.
+    fn maybe_repeat_psi(&mut self, pts: i64) -> CoreResult<()> {
+        let interval = match self.psi_repetition_90k {
+            Some(i) if i > 0 => i,
+            _ => return Ok(()),
+        };
+        let due = match self.last_psi_pts {
+            None => false,
+            Some(last) => pts.saturating_sub(last) >= interval,
+        };
+        // Seed the anchor on the first packet so repetition is measured
+        // from the stream start, not from t=0.
+        if self.last_psi_pts.is_none() {
+            self.last_psi_pts = Some(pts);
+            return Ok(());
+        }
+        if due {
+            self.write_pat()?;
+            self.write_pmt()?;
+            self.write_sdt()?;
+            self.last_psi_pts = Some(pts);
+        }
+        Ok(())
     }
 
     /// Emit a complete PSI section as one or more 188-byte TS packets
@@ -660,6 +717,9 @@ impl Muxer for MpegTsMuxer {
                 packet.stream_index
             ))
         })?;
+        if let Some(p) = packet.pts {
+            self.maybe_repeat_psi(p)?;
+        }
         self.write_pes_packet(track_idx, packet)
     }
 
@@ -1033,6 +1093,60 @@ mod tests {
             }
             other => panic!("expected Service descriptor, got {other:?}"),
         }
+    }
+
+    /// With PSI repetition enabled, a long PTS run re-emits the PAT
+    /// mid-stream (more than the two header/trailer copies). With it
+    /// disabled, exactly two PAT sections appear.
+    #[test]
+    fn psi_repetition_reemits_pat_mid_stream() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let count_pat = |bytes: &[u8]| -> usize {
+            bytes
+                .chunks_exact(TS_PACKET_LEN)
+                .filter(|c| {
+                    let pid = (((c[1] & 0x1F) as u16) << 8) | c[2] as u16;
+                    let pusi = c[1] & 0x40 != 0;
+                    pid == 0x0000 && pusi
+                })
+                .count()
+        };
+        // Repetition enabled (default 18000): interval crossed each step.
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            for k in 0..8i64 {
+                mx.write_packet(
+                    &Packet::new(0, TimeBase::new(1, 90_000), vec![0; 8]).with_pts(k * 40_000),
+                )
+                .unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let with_rep = count_pat(&sink.into_bytes());
+        assert!(
+            with_rep > 2,
+            "expected mid-stream PAT repeats, got {with_rep}"
+        );
+
+        // Repetition disabled: only header + trailer PAT.
+        let sink2 = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink2.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.set_psi_repetition_interval(None);
+            mx.write_header().unwrap();
+            for k in 0..8i64 {
+                mx.write_packet(
+                    &Packet::new(0, TimeBase::new(1, 90_000), vec![0; 8]).with_pts(k * 40_000),
+                )
+                .unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        assert_eq!(count_pat(&sink2.into_bytes()), 2);
     }
 
     /// A stream_index referenced by no program (or by two) is rejected.
