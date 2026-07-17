@@ -5142,7 +5142,7 @@ mod tests {
         match d.body {
             DescriptorBody::CountryAvailability(c) => {
                 assert!(c.country_availability);
-                assert_eq!(c.country_codes, vec![[b'G', b'B', b'R']]);
+                assert_eq!(c.country_codes, vec![*b"GBR"]);
             }
             other => panic!("expected CountryAvailability, got {other:?}"),
         }
@@ -5152,7 +5152,7 @@ mod tests {
         match d.body {
             DescriptorBody::CountryAvailability(c) => {
                 assert!(!c.country_availability);
-                assert_eq!(c.country_codes, vec![[b'F', b'R', b'A']]);
+                assert_eq!(c.country_codes, vec![*b"FRA"]);
             }
             other => panic!("expected CountryAvailability, got {other:?}"),
         }
