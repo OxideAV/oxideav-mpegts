@@ -56,6 +56,25 @@
 //!   the target PTS between the head/tail PCR anchors and bisects),
 //!   landing on the packet boundary of the last PCR at or before the
 //!   request and resetting the per-PID reassembler + timestamp state.
+//! - Random-access surface (§2.4.3.5): the muxer flags keyframe PES
+//!   starts with the `random_access_indicator`, the reassembler folds
+//!   the indicator into [`pes::PesPacket::random_access`], and the
+//!   demuxer both maps it onto core keyframe flags and offers a
+//!   keyframe-accurate seek (`random_access_points()` index +
+//!   `seek_to_random_access()`).
+//! - Write-side adaptation fields ([`packet::AdaptationFieldSpec`]) —
+//!   the full §2.4.3.4 Table 2-6 optional-field set with §2.4.3.5
+//!   pairing/width validation and `0xFF` stuffing.
+//! - Typed DSM trick-mode decode ([`pes::DsmTrickMode`], §2.4.3.7
+//!   Tables 2-20..2-22) with a wire-exact `to_byte()` inverse.
+//! - Physical packet-framing tolerance ([`packet::TsPacketLayout`]) —
+//!   192-byte (4-byte-prefixed) source packets and 204-byte
+//!   (16-byte-trailer) packets are detected at open and stripped at
+//!   the read layer.
+//! - Conformance validation ([`validate::validate_ts`]) — a bounded
+//!   two-pass report of §2.4.3.3 / §2.4.3.5 / §2.7.2 / §2.4.4
+//!   violations with per-PID and per-PCR-PID statistics and a
+//!   §2.4.2.2 transport-rate estimate.
 //!
 //! The crate ships **no decoders** — every payload byte stays as a
 //! `&[u8]` slice. A downstream pipeline (e.g. `oxideav-cli`'s

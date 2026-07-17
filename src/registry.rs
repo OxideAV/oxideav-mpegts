@@ -9,7 +9,7 @@ use oxideav_core::{ContainerRegistry, RuntimeContext};
 /// a [`ContainerRegistry`].
 ///
 /// Mirrors the shape every sibling container crate exposes
-/// ([`oxideav_mkv::register_containers`], etc.) so the populate
+/// (`register_containers`, etc.) so the populate
 /// helpers in `oxideav-meta` can call it through one uniform entry
 /// point.
 pub fn register_containers(reg: &mut ContainerRegistry) {

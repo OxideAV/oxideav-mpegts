@@ -188,7 +188,7 @@ impl MpegTsDemuxer {
     /// transport stream carries more than one service and the caller
     /// wants a program other than the first the PAT lists. The
     /// available programs can be discovered by opening with [`open`]
-    /// (or [`Self::new`]) and reading [`Self::programs`], then
+    /// and reading [`Self::programs`], then
     /// re-opening a fresh source on the chosen `program_number`.
     ///
     /// Returns an error if the PAT advertises no program with that

@@ -209,7 +209,8 @@ pub enum PcrEvent {
 
 /// Per-PCR-PID PCR recovery + discontinuity detector.
 ///
-/// Construct one per `PCR_PID` and call [`observe`] for every TS
+/// Construct one per `PCR_PID` and call [`PcrTracker::observe`] for
+/// every TS
 /// packet on that PID. Packets without a PCR are silently ignored
 /// (the tracker still reads them for the `discontinuity_indicator`
 /// flag, since §2.4.3.5 allows the indicator to be set in packets
