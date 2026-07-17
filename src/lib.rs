@@ -67,6 +67,9 @@
 //!   pairing/width validation and `0xFF` stuffing.
 //! - Typed DSM trick-mode decode ([`pes::DsmTrickMode`], §2.4.3.7
 //!   Tables 2-20..2-22) with a wire-exact `to_byte()` inverse.
+//! - Write-side PES headers ([`pes::PesHeaderSpec`]) — the full
+//!   Table 2-17 optional-field set with §2.7.5 pairing validation,
+//!   both `PES_packet_length` forms, and the header-less stream_ids.
 //! - Physical packet-framing tolerance ([`packet::TsPacketLayout`]) —
 //!   192-byte (4-byte-prefixed) source packets and 204-byte
 //!   (16-byte-trailer) packets are detected at open and stripped at
