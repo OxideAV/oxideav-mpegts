@@ -1995,6 +1995,103 @@ mod tests {
         assert_eq!(landed, 10_000 + 39 * 3_000 + 500);
     }
 
+    /// Re-frame a plain 188-byte TS byte stream into 192-byte
+    /// (4-byte-prefixed) source packets.
+    fn wrap_192(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() / 188 * 192);
+        for (i, pkt) in bytes.chunks(TS_PACKET_LEN).enumerate() {
+            out.extend_from_slice(&(i as u32).to_be_bytes()); // header word
+            out.extend_from_slice(pkt);
+        }
+        out
+    }
+
+    /// Re-frame a plain 188-byte TS byte stream into 204-byte packets
+    /// (16-byte trailer appended to each packet).
+    fn wrap_204(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() / 188 * 204);
+        for pkt in bytes.chunks(TS_PACKET_LEN) {
+            out.extend_from_slice(pkt);
+            out.extend_from_slice(&[0xEC; 16]);
+        }
+        out
+    }
+
+    /// The demuxer must tolerate the two non-188 physical framings —
+    /// 192-byte prefixed source packets and 204-byte trailer-appended
+    /// packets — transparently: same streams, same timestamps, same
+    /// duration probe, working PCR seek.
+    #[test]
+    fn demux_tolerates_192_and_204_byte_framings() {
+        use oxideav_core::Demuxer as _;
+        // Build a plain 188-byte stream with enough PES + PCR spread
+        // to exercise the duration probe and seek.
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        let tb = TimeBase::new(1, 90_000);
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            for i in 0..30i64 {
+                let v = Packet::new(0, tb, vec![(i & 0xFF) as u8; 200])
+                    .with_pts(9_000 + i * 3_000)
+                    .with_keyframe(i % 5 == 0);
+                mx.write_packet(&v).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let plain = sink.into_bytes();
+
+        for (framed, layout) in [
+            (
+                wrap_192(&plain),
+                crate::packet::TsPacketLayout::PREFIXED_192,
+            ),
+            (wrap_204(&plain), crate::packet::TsPacketLayout::TRAILER_204),
+        ] {
+            // Container probe recognises the framing.
+            let p = oxideav_core::ProbeData {
+                buf: &framed[..framed.len().min(1024)],
+                ext: None,
+            };
+            assert_eq!(
+                crate::demuxer::probe(&p),
+                100,
+                "probe must accept {layout:?}"
+            );
+
+            let input: Box<dyn ReadSeek> = Box::new(Cursor::new(framed));
+            let mut dmx =
+                crate::demuxer::MpegTsDemuxer::open_program(input, 1).expect("open framed");
+            assert_eq!(dmx.packet_layout(), layout);
+            assert_eq!(dmx.streams().len(), 1);
+            assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h264");
+            // Duration probe works on the framed grid.
+            let dur = dmx.duration_micros().expect("duration probed");
+            assert!(dur > 0, "duration = {dur}");
+
+            // Every PES round-trips with its PTS.
+            let mut ptss = Vec::new();
+            while let Ok(p) = dmx.next_packet() {
+                ptss.push(p.pts.unwrap());
+            }
+            assert_eq!(ptss.len(), 30);
+            assert_eq!(ptss[0], 9_000);
+            assert_eq!(*ptss.last().unwrap(), 9_000 + 29 * 3_000);
+
+            // PCR-anchored seek still lands correctly.
+            let landed = dmx.seek_to(0, 9_000 + 15 * 3_000).expect("seek");
+            assert!(landed <= 9_000 + 15 * 3_000);
+            let nxt = dmx.next_packet().expect("packet after seek");
+            assert!(nxt.pts.unwrap() <= 9_000 + 16 * 3_000);
+
+            // Keyframe index sees the RAI grid through the framing.
+            let raps = dmx.random_access_points().expect("index");
+            assert_eq!(raps.len(), 6, "keyframes every 5th of 30 packets");
+        }
+    }
+
     /// A stream that never sets the random_access_indicator yields an
     /// empty index and an `Unsupported` keyframe seek.
     #[test]

@@ -136,6 +136,11 @@ pub struct MpegTsDemuxer {
     /// `random_access_indicator` packets on the tracked PIDs. `None`
     /// until the first index request.
     rap_index: Option<Vec<RandomAccessPoint>>,
+    /// Physical packet framing detected at open — plain 188-byte,
+    /// 4-byte-prefixed 192-byte, or 16-byte-trailer 204-byte packets.
+    /// Every read strips the framing down to the logical 188-byte
+    /// window.
+    layout: crate::packet::TsPacketLayout,
 }
 
 /// One random-access point discovered by scanning the stream for TS
@@ -195,6 +200,33 @@ impl MpegTsDemuxer {
     /// Core constructor. `want` is `None` for "first program wins" or
     /// `Some(n)` to select the program whose `program_number == n`.
     fn with_selector(mut input: Box<dyn ReadSeek>, want: Option<u16>) -> CoreResult<Self> {
+        // Step 0: detect the physical packet layout (188-byte plain,
+        // 192-byte 4-byte-prefixed source packets, or 204-byte
+        // trailer-appended packets) from the head of the stream, then
+        // rewind. Everything downstream works on the logical 188-byte
+        // window; the framing bytes are stripped at the read layer.
+        let layout = {
+            use std::io::Read;
+            let mut head = [0u8; 204 * 8];
+            let mut filled = 0usize;
+            while filled < head.len() {
+                match input.read(&mut head[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(CoreError::Io(e)),
+                }
+            }
+            input
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(CoreError::Io)?;
+            // A head too corrupt (or short) to classify falls back to
+            // the plain layout; the streaming resync path takes over
+            // from there.
+            crate::packet::detect_packet_layout(&head[..filled])
+                .unwrap_or(crate::packet::TsPacketLayout::STANDARD)
+        };
+
         // Step 1: scan for the first PAT, reassembling its section
         // across as many same-PID TS packets as the spec permits per
         // §2.4.4. A PUSI=1 packet starts a fresh section; subsequent
@@ -211,11 +243,12 @@ impl MpegTsDemuxer {
         let mut probe_putback: VecDeque<u8> = VecDeque::new();
         let mut pat_assembler = PsiSectionAssembler::new();
         loop {
-            probe_bytes += TS_PACKET_LEN as u64;
+            probe_bytes += layout.packet_size as u64;
             let buf = match read_one_packet(
                 &mut input,
                 &mut probe_putback,
-                probe_bytes - TS_PACKET_LEN as u64,
+                probe_bytes - layout.packet_size as u64,
+                layout,
             )? {
                 Some(b) => b,
                 None => {
@@ -279,11 +312,12 @@ impl MpegTsDemuxer {
         // audio is the canonical case.
         let mut pmt_assembler = PsiSectionAssembler::new();
         let pmt = loop {
-            probe_bytes += TS_PACKET_LEN as u64;
+            probe_bytes += layout.packet_size as u64;
             let buf = match read_one_packet(
                 &mut input,
                 &mut probe_putback,
-                probe_bytes - TS_PACKET_LEN as u64,
+                probe_bytes - layout.packet_size as u64,
+                layout,
             )? {
                 Some(b) => b,
                 None => {
@@ -375,6 +409,7 @@ impl MpegTsDemuxer {
             first_pcr: None,
             last_pcr: None,
             rap_index: None,
+            layout,
         };
 
         // Probe the container duration from the PCR span (§2.4.2.2).
@@ -429,6 +464,14 @@ impl MpegTsDemuxer {
         self.pcr_tracker.last_pcr()
     }
 
+    /// The physical packet framing detected at open — plain 188-byte
+    /// packets, 192-byte (4-byte-prefixed) source packets, or 204-byte
+    /// (16-byte-trailer) packets. All demux output is already stripped
+    /// to the logical 188-byte units.
+    pub fn packet_layout(&self) -> crate::packet::TsPacketLayout {
+        self.layout
+    }
+
     /// Probe the head and tail PCR anchors on the selected `PCR_PID`,
     /// recording them in `first_pcr` / `last_pcr` for reuse by
     /// [`Self::seek_to`], and return the container duration in
@@ -443,11 +486,12 @@ impl MpegTsDemuxer {
         }
         // Length of the input, for the tail scan. A non-seekable or
         // zero-length source gives up (no end to scan toward).
+        let psize = self.layout.packet_size as u64;
         let len = self.input.seek(std::io::SeekFrom::End(0)).ok()?;
-        if len < (2 * TS_PACKET_LEN) as u64 {
+        if len < 2 * psize {
             return None;
         }
-        let aligned_len = (len / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+        let aligned_len = (len / psize) * psize;
 
         // First PCR from the head: align to a packet boundary and scan
         // forward. Real BD/broadcast streams carry a PCR within the
@@ -466,7 +510,7 @@ impl MpegTsDemuxer {
             let start = aligned_len.saturating_sub(window);
             // Snap the window start to a packet boundary measured from
             // the aligned end so each candidate packet starts on `0x47`.
-            let start = (start / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+            let start = (start / psize) * psize;
             if let Some(found) = self.scan_pcr_backward(start, aligned_len) {
                 break found;
             }
@@ -532,12 +576,13 @@ impl MpegTsDemuxer {
         // Binary search the byte range [lo, hi) (packet-aligned) for the
         // last PCR with base ≤ target. `best` tracks the closest landing
         // found so far that does not overshoot.
+        let psize = self.layout.packet_size as u64;
         let mut lo = first_off;
         let mut hi = last_off;
         let mut best = (first_off, first_base);
-        while hi - lo > TS_PACKET_LEN as u64 {
+        while hi - lo > psize {
             let mid_raw = lo + (hi - lo) / 2;
-            let mid = (mid_raw / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+            let mid = (mid_raw / psize) * psize;
             let mid = mid.max(lo);
             // Find the next PCR at or after `mid`. If none lies before
             // `hi`, the target sits in this packet-sparse tail — shrink
@@ -549,7 +594,7 @@ impl MpegTsDemuxer {
                         best = (off, base);
                         // Advance past this PCR's packet so we don't
                         // re-find the same one and stall.
-                        lo = off + TS_PACKET_LEN as u64;
+                        lo = off + psize;
                     } else {
                         hi = off;
                     }
@@ -596,8 +641,9 @@ impl MpegTsDemuxer {
             use std::io::Seek;
             self.input.stream_position().map_err(CoreError::Io)?
         };
+        let psize = self.layout.packet_size as u64;
         let len = self.input.seek(SeekFrom::End(0)).map_err(CoreError::Io)?;
-        let aligned_len = (len / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+        let aligned_len = (len / psize) * psize;
         self.input.seek(SeekFrom::Start(0)).map_err(CoreError::Io)?;
 
         let mut out: Vec<RandomAccessPoint> = Vec::new();
@@ -605,16 +651,16 @@ impl MpegTsDemuxer {
         // start (the next PUSI=1 packet on that PID) hasn't been seen
         // yet.
         let mut unresolved: HashMap<u16, Vec<usize>> = HashMap::new();
-        let mut buf = [0u8; TS_PACKET_LEN];
+        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
         let mut off = 0u64;
-        while off + TS_PACKET_LEN as u64 <= aligned_len {
-            if read_exact_packet(&mut self.input, &mut buf).is_err() {
+        while off + psize <= aligned_len {
+            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
                 break;
             }
             // A stray mid-stream corruption shouldn't abort the index;
             // skip unparseable packets (the streaming path has its own
             // resync story).
-            if let Ok(pkt) = TsPacket::parse(&buf) {
+            if let Ok(pkt) = TsPacket::parse(self.layout.window(&buf)) {
                 if let Some(&stream_index) = self.pid_to_stream.get(&pkt.pid) {
                     let rai = pkt
                         .adaptation_field
@@ -641,7 +687,7 @@ impl MpegTsDemuxer {
                     }
                 }
             }
-            off += TS_PACKET_LEN as u64;
+            off += psize;
         }
         self.input
             .seek(SeekFrom::Start(resume))
@@ -734,17 +780,18 @@ impl MpegTsDemuxer {
     /// input cursor to where it found the match is *not* required — the
     /// caller treats this as an out-of-band probe.
     fn scan_pcr_forward(&mut self, from: u64, len: u64) -> Option<(Pcr, u64)> {
+        let psize = self.layout.packet_size as u64;
         self.input.seek(std::io::SeekFrom::Start(from)).ok()?;
         let mut off = from;
-        let mut buf = [0u8; TS_PACKET_LEN];
-        while off + TS_PACKET_LEN as u64 <= len {
-            if read_exact_packet(&mut self.input, &mut buf).is_err() {
+        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
+        while off + psize <= len {
+            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
                 return None;
             }
-            if let Some(pcr) = pcr_from_packet(&buf, self.pcr_pid) {
+            if let Some(pcr) = pcr_from_packet(self.layout.window(&buf), self.pcr_pid) {
                 return Some((pcr, off));
             }
-            off += TS_PACKET_LEN as u64;
+            off += psize;
         }
         None
     }
@@ -753,18 +800,19 @@ impl MpegTsDemuxer {
     /// return the **last** PCR on the selected `PCR_PID` together with
     /// its packet offset. `from` and `to` must be packet-aligned.
     fn scan_pcr_backward(&mut self, from: u64, to: u64) -> Option<(Pcr, u64)> {
+        let psize = self.layout.packet_size as u64;
         self.input.seek(std::io::SeekFrom::Start(from)).ok()?;
         let mut off = from;
-        let mut buf = [0u8; TS_PACKET_LEN];
+        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
         let mut found: Option<(Pcr, u64)> = None;
-        while off + TS_PACKET_LEN as u64 <= to {
-            if read_exact_packet(&mut self.input, &mut buf).is_err() {
+        while off + psize <= to {
+            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
                 break;
             }
-            if let Some(pcr) = pcr_from_packet(&buf, self.pcr_pid) {
+            if let Some(pcr) = pcr_from_packet(self.layout.window(&buf), self.pcr_pid) {
                 found = Some((pcr, off));
             }
-            off += TS_PACKET_LEN as u64;
+            off += psize;
         }
         found
     }
@@ -822,12 +870,17 @@ impl MpegTsDemuxer {
     /// track, feed the per-PID reassembler. Returns the number of
     /// `Packet`s pushed into `self.pending` by this call.
     fn read_one_into_pending(&mut self) -> CoreResult<usize> {
-        let buf = match read_one_packet(&mut self.input, &mut self.putback, self.bytes_read)? {
+        let buf = match read_one_packet(
+            &mut self.input,
+            &mut self.putback,
+            self.bytes_read,
+            self.layout,
+        )? {
             Some(b) => b,
             None => return Ok(0),
         };
         let pkt_offset = self.bytes_read;
-        self.bytes_read += TS_PACKET_LEN as u64;
+        self.bytes_read += self.layout.packet_size as u64;
         let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
         // PCR recovery runs on the PCR_PID regardless of whether that
         // PID also carries an elementary stream we track.
@@ -905,14 +958,19 @@ impl Demuxer for MpegTsDemuxer {
                 // when there are no more 188-byte chunks. We need a
                 // signal here without re-reading; do a single
                 // try-read and on `None` set eof + flush.
-                match read_one_packet(&mut self.input, &mut self.putback, self.bytes_read)? {
+                match read_one_packet(
+                    &mut self.input,
+                    &mut self.putback,
+                    self.bytes_read,
+                    self.layout,
+                )? {
                     None => {
                         self.eof_reached = true;
                         self.flush_reassemblers();
                     }
                     Some(buf) => {
                         let pkt_offset = self.bytes_read;
-                        self.bytes_read += TS_PACKET_LEN as u64;
+                        self.bytes_read += self.layout.packet_size as u64;
                         // We've already advanced past an EOF earlier
                         // when this branch was taken with pushed=0 but
                         // there ARE more bytes — that means the prior
@@ -939,41 +997,48 @@ impl Demuxer for MpegTsDemuxer {
     }
 }
 
-/// Maximum 188-byte packets we'll skip while resyncing after a bad
+/// Maximum packet-sized chunks we'll skip while resyncing after a bad
 /// sync byte. We've observed real BD M2TS streams with ~2 AACS units
 /// (~12 KB ≈ 64 TS packets) of undecryptable bytes at chapter
-/// boundaries — `libaacs` reproduces the same garbage bytes there,
-/// so the bytes are part of the protected variant-key area, not a
-/// flaw in our decryption. 256 packets gives a comfortable ceiling
-/// without silently swallowing a longer corruption that the caller
-/// should know about.
+/// boundaries — an independent decryption of the same disc reproduces
+/// the same garbage bytes there, so the bytes are part of the
+/// protected variant-key area, not a flaw in our decryption. 256
+/// packets gives a comfortable ceiling without silently swallowing a
+/// longer corruption that the caller should know about.
 const RESYNC_PACKET_LIMIT: usize = 256;
 
-/// Read exactly one 188-byte TS packet from the input.
+/// Largest physical packet size the demuxer tolerates (the 204-byte
+/// trailer-appended form; see [`crate::packet::TsPacketLayout`]).
+const MAX_PHYSICAL_PACKET: usize = 204;
+
+/// Read exactly one physical packet (per `layout`) from the input and
+/// return its logical 188-byte TS window.
 ///
 /// Drains from `putback` first (used by the resync path to feed peeked
 /// bytes back to the caller) and then from `input`.
 ///
-/// Returns `Ok(None)` cleanly when fewer than 188 bytes remain — the
-/// caller treats that as end-of-stream. A short read mid-packet (e.g.
-/// the stream is truncated) surfaces as `Err`.
+/// Returns `Ok(None)` cleanly when fewer than a packet's bytes remain —
+/// the caller treats that as end-of-stream. A short read mid-packet
+/// (e.g. the stream is truncated) surfaces as `Err`.
 ///
-/// On a sync-byte mismatch we **resync** by discarding 188-byte chunks
-/// until we find one whose first byte is `0x47` AND whose immediately-
-/// following byte is also `0x47` (the next packet's sync). The probe
-/// byte is buffered in `putback` so the next call to `read_one_packet`
-/// sees it as the first byte of a fresh packet — without that, every
-/// subsequent read would land 1 byte off and re-trigger resync.
+/// On a sync-byte mismatch we **resync** by discarding packet-sized
+/// chunks until we find one with `0x47` at the layout's sync offset
+/// AND another `0x47` one packet stride later (the next packet's
+/// sync). The probed bytes are buffered in `putback` so the next call
+/// sees them as the head of a fresh packet — without that, every
+/// subsequent read would land misaligned and re-trigger resync.
 fn read_one_packet(
     input: &mut Box<dyn ReadSeek>,
     putback: &mut VecDeque<u8>,
     bytes_read: u64,
+    layout: crate::packet::TsPacketLayout,
 ) -> CoreResult<Option<[u8; TS_PACKET_LEN]>> {
     use std::io::Read;
-    let mut buf = [0u8; TS_PACKET_LEN];
+    let psize = layout.packet_size;
+    let mut buf = [0u8; MAX_PHYSICAL_PACKET];
     let mut filled = 0;
     // Drain putback first.
-    while filled < TS_PACKET_LEN {
+    while filled < psize {
         match putback.pop_front() {
             Some(b) => {
                 buf[filled] = b;
@@ -982,94 +1047,115 @@ fn read_one_packet(
             None => break,
         }
     }
-    while filled < TS_PACKET_LEN {
-        match input.read(&mut buf[filled..]) {
+    while filled < psize {
+        match input.read(&mut buf[filled..psize]) {
             Ok(0) => {
                 if filled == 0 {
                     return Ok(None);
                 }
                 return Err(CoreError::invalid(format!(
-                    "mpegts: short read at packet boundary ({filled}/{TS_PACKET_LEN} bytes, offset {bytes_read})"
+                    "mpegts: short read at packet boundary ({filled}/{psize} bytes, offset {bytes_read})"
                 )));
             }
             Ok(n) => filled += n,
             Err(e) => return Err(CoreError::Io(e)),
         }
     }
-    if buf[0] != TS_SYNC_BYTE {
-        return resync(input, putback, buf, bytes_read).map(Some);
+    if buf[layout.sync_offset] != TS_SYNC_BYTE {
+        return resync(input, putback, buf[layout.sync_offset], bytes_read, layout).map(Some);
     }
-    Ok(Some(buf))
+    let mut out = [0u8; TS_PACKET_LEN];
+    out.copy_from_slice(layout.window(&buf));
+    Ok(Some(out))
 }
 
-/// Resync after a bad sync byte. Read 188 new bytes; if they start
-/// with `0x47`, accept them as the recovered packet — but **only**
-/// after confirming the byte 188 positions later is also `0x47` (the
-/// next packet's sync). The double-sync check is what rejects random
-/// `0x47` bytes inside garbage data.
+/// Resync after a bad sync byte. Read one fresh packet-sized chunk; if
+/// it carries `0x47` at the layout's sync offset, accept it as the
+/// recovered packet — but **only** after confirming the byte one
+/// packet stride later is also `0x47` (the next packet's sync). The
+/// double-sync check is what rejects random `0x47` bytes inside
+/// garbage data.
 ///
 /// We don't try to recover the failing packet itself; we just skip it
-/// (and any further failing 188-byte chunks) until a clean packet
-/// boundary appears. After at most [`RESYNC_PACKET_LIMIT`] failed
-/// chunks, surface as `Err`.
+/// (and any further failing chunks) until a clean packet boundary
+/// appears. After at most [`RESYNC_PACKET_LIMIT`] failed chunks,
+/// surface as `Err`.
 ///
-/// `initial` is the 188-byte slice that just failed the sync check;
-/// we don't need its contents, just the failing byte for diagnostics.
+/// `bad_byte` is the byte that failed the sync check, kept for
+/// diagnostics.
 fn resync(
     input: &mut Box<dyn ReadSeek>,
     putback: &mut VecDeque<u8>,
-    initial: [u8; TS_PACKET_LEN],
+    bad_byte: u8,
     bytes_read: u64,
+    layout: crate::packet::TsPacketLayout,
 ) -> CoreResult<[u8; TS_PACKET_LEN]> {
     use std::io::Read;
-    let mut buf = [0u8; TS_PACKET_LEN];
-    let mut probe = [0u8; 1];
+    let psize = layout.packet_size;
+    let mut buf = [0u8; MAX_PHYSICAL_PACKET];
+    // To verify the NEXT packet's sync we must read past its framing
+    // prefix: `sync_offset + 1` probe bytes.
+    let probe_len = layout.sync_offset + 1;
+    let mut probe = [0u8; MAX_PHYSICAL_PACKET];
     for _ in 0..RESYNC_PACKET_LIMIT {
-        // Read 188 fresh bytes.
+        // Read one fresh packet-sized chunk.
         let mut filled = 0;
-        while filled < TS_PACKET_LEN {
-            match input.read(&mut buf[filled..]) {
+        while filled < psize {
+            match input.read(&mut buf[filled..psize]) {
                 Ok(0) => {
                     return Err(CoreError::invalid(format!(
-                        "mpegts: bad sync byte 0x{:02X} at offset {bytes_read} \
-                         and EOF reached during resync",
-                        initial[0]
+                        "mpegts: bad sync byte 0x{bad_byte:02X} at offset {bytes_read} \
+                         and EOF reached during resync"
                     )));
                 }
                 Ok(n) => filled += n,
                 Err(e) => return Err(CoreError::Io(e)),
             }
         }
-        if buf[0] != TS_SYNC_BYTE {
+        if buf[layout.sync_offset] != TS_SYNC_BYTE {
             continue;
         }
-        // Candidate passes single-sync; probe the next byte for a
-        // double-sync. If probe is also 0x47, we're aligned.
-        match input.read(&mut probe) {
-            Ok(0) => {
-                // EOF immediately after a clean candidate. Trust the
-                // single sync byte; if we can't probe, we can't
-                // double-check, but the packet itself parsed.
-                return Ok(buf);
+        // Candidate passes single-sync; probe up to the next packet's
+        // sync byte for a double-sync.
+        let mut probed = 0;
+        let mut hit_eof = false;
+        while probed < probe_len {
+            match input.read(&mut probe[probed..probe_len]) {
+                Ok(0) => {
+                    hit_eof = true;
+                    break;
+                }
+                Ok(n) => probed += n,
+                Err(e) => return Err(CoreError::Io(e)),
             }
-            Ok(_) => {}
-            Err(e) => return Err(CoreError::Io(e)),
         }
-        if probe[0] == TS_SYNC_BYTE {
-            // Push the probe byte back so the next call sees it as
-            // the start of a fresh packet.
-            putback.push_back(probe[0]);
-            return Ok(buf);
+        if hit_eof {
+            // EOF while probing after a clean candidate. Trust the
+            // single sync byte; we can't double-check, but the packet
+            // itself parsed (any partially probed bytes are a
+            // truncated tail and are dropped).
+            let mut out = [0u8; TS_PACKET_LEN];
+            out.copy_from_slice(layout.window(&buf));
+            return Ok(out);
         }
-        // Single 0x47 not followed by another at +188; treat as
-        // coincidence inside garbage data and keep scanning.  The
-        // probe byte is also part of the corrupt span — drop it.
+        if probe[probe_len - 1] == TS_SYNC_BYTE {
+            // Push the probed bytes back so the next call sees them as
+            // the head of a fresh packet.
+            for &b in &probe[..probe_len] {
+                putback.push_back(b);
+            }
+            let mut out = [0u8; TS_PACKET_LEN];
+            out.copy_from_slice(layout.window(&buf));
+            return Ok(out);
+        }
+        // Single 0x47 not confirmed by a sync one stride later; treat
+        // as coincidence inside garbage data and keep scanning. The
+        // probed bytes are also part of the corrupt span — drop them.
     }
     Err(CoreError::invalid(format!(
-        "mpegts: bad sync byte 0x{:02X} at offset {bytes_read} (packet {}), \
-         resync failed after {RESYNC_PACKET_LIMIT} 188-byte chunks",
-        initial[0],
-        bytes_read / TS_PACKET_LEN as u64,
+        "mpegts: bad sync byte 0x{bad_byte:02X} at offset {bytes_read} (packet {}), \
+         resync failed after {RESYNC_PACKET_LIMIT} {psize}-byte chunks",
+        bytes_read / psize as u64,
     )))
 }
 
@@ -1077,17 +1163,14 @@ fn map_ts_err(e: crate::TsError) -> CoreError {
     CoreError::invalid(format!("mpegts: {e}"))
 }
 
-/// Read exactly `TS_PACKET_LEN` bytes into `buf` from `input`,
+/// Read exactly `buf.len()` bytes (one physical packet) from `input`,
 /// retrying on short reads. Used by the seek / duration probes, which
 /// always start on a packet boundary and want a hard error rather than
 /// the streaming reader's resync behaviour.
-fn read_exact_packet(
-    input: &mut Box<dyn ReadSeek>,
-    buf: &mut [u8; TS_PACKET_LEN],
-) -> std::io::Result<()> {
+fn read_exact_packet(input: &mut Box<dyn ReadSeek>, buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     let mut filled = 0;
-    while filled < TS_PACKET_LEN {
+    while filled < buf.len() {
         match input.read(&mut buf[filled..]) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -1103,12 +1186,12 @@ fn read_exact_packet(
     Ok(())
 }
 
-/// Extract the [`Pcr`] from a 188-byte TS packet buffer iff the packet
+/// Extract the [`Pcr`] from a 188-byte TS packet window iff the packet
 /// is on `want_pid`, carries an adaptation field, and the field sets
 /// `PCR_flag`. Returns `None` otherwise — including for a non-`0x47`
 /// buffer (an unaligned probe window) or a malformed adaptation field.
-fn pcr_from_packet(buf: &[u8; TS_PACKET_LEN], want_pid: u16) -> Option<Pcr> {
-    if buf[0] != TS_SYNC_BYTE {
+fn pcr_from_packet(buf: &[u8], want_pid: u16) -> Option<Pcr> {
+    if buf.first() != Some(&TS_SYNC_BYTE) {
         return None;
     }
     let pkt = TsPacket::parse(buf).ok()?;
@@ -1213,24 +1296,38 @@ fn codec_params_for_stream_type(st: u8) -> Option<CodecParameters> {
 }
 
 /// Probe an MPEG-TS byte stream — the canonical heuristic checks for
-/// the `0x47` sync byte at offsets `0`, `188`, `376` (and ideally
-/// further). Real-world transport streams are sync-aligned at the
-/// start; a hit at 3+ offsets is unambiguous.
+/// the `0x47` sync byte on a consistent packet grid. All three
+/// physical framings are recognised: plain 188-byte packets, 192-byte
+/// (4-byte-prefixed) source packets, and 204-byte (16-byte-trailer)
+/// packets. Real-world transport streams are sync-aligned at the
+/// start; a hit at 3+ grid positions is unambiguous.
 ///
 /// Scores follow the convention in
 /// [`oxideav_core::ContainerProbeFn`]:
-/// * `100` — sync byte present at offsets 0, 188, 376, 564.
-/// * `80`  — sync byte present at 0, 188, 376.
-/// * `60`  — sync byte present at 0, 188.
+/// * `100` — sync byte present at 4 consecutive grid positions.
+/// * `80`  — sync byte present at 3.
+/// * `60`  — sync byte present at 2.
 /// * `0`   — otherwise.
 pub fn probe(p: &oxideav_core::ProbeData) -> oxideav_core::ProbeScore {
-    let mut hits = 0u8;
-    for off in [0, 188, 376, 564] {
-        if p.buf.get(off).copied() == Some(TS_SYNC_BYTE) {
-            hits += 1;
+    use crate::packet::TsPacketLayout;
+    let mut best = 0u8;
+    for layout in [
+        TsPacketLayout::STANDARD,
+        TsPacketLayout::PREFIXED_192,
+        TsPacketLayout::TRAILER_204,
+    ] {
+        let mut hits = 0u8;
+        for k in 0..4usize {
+            let off = k * layout.packet_size + layout.sync_offset;
+            if p.buf.get(off).copied() == Some(TS_SYNC_BYTE) {
+                hits += 1;
+            } else {
+                break; // grids must be consistent from packet 0
+            }
         }
+        best = best.max(hits);
     }
-    match hits {
+    match best {
         4 => 100,
         3 => 80,
         2 => 60,
@@ -1691,21 +1788,36 @@ mod tests {
         let mut cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
         let mut putback = VecDeque::new();
         // First read: clean.
-        let r0 = read_one_packet(&mut cursor, &mut putback, 0)
-            .expect("first")
-            .expect("Some");
+        let r0 = read_one_packet(
+            &mut cursor,
+            &mut putback,
+            0,
+            crate::packet::TsPacketLayout::STANDARD,
+        )
+        .expect("first")
+        .expect("Some");
         assert_eq!(r0[3] & 0x0F, 0);
         // Second read: bytes start at offset 188 (inside garbage), so
         // resync triggers. It should land on p1.
-        let r1 = read_one_packet(&mut cursor, &mut putback, 188)
-            .expect("resync")
-            .expect("Some");
+        let r1 = read_one_packet(
+            &mut cursor,
+            &mut putback,
+            188,
+            crate::packet::TsPacketLayout::STANDARD,
+        )
+        .expect("resync")
+        .expect("Some");
         assert_eq!(r1[3] & 0x0F, 1, "expected CC=1, got CC={}", r1[3] & 0x0F);
         // Third read: should pick up p2 thanks to the probe-byte
         // putback — no second resync needed.
-        let r2 = read_one_packet(&mut cursor, &mut putback, 376)
-            .expect("p2")
-            .expect("Some");
+        let r2 = read_one_packet(
+            &mut cursor,
+            &mut putback,
+            376,
+            crate::packet::TsPacketLayout::STANDARD,
+        )
+        .expect("p2")
+        .expect("Some");
         assert_eq!(r2[3] & 0x0F, 2, "expected CC=2, got CC={}", r2[3] & 0x0F);
     }
 

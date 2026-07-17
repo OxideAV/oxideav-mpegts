@@ -514,6 +514,88 @@ fn parse_extension(raw: &[u8], cursor: &mut usize) -> Result<AdaptationFieldExte
     })
 }
 
+/// Physical packet layout of a transport-stream byte source. The
+/// logical TS packet is always the 188-byte §2.4.3.2 unit, but two
+/// container-level framings wrap it in the wild:
+///
+/// * a 4-byte per-packet **prefix** (a copy-permission + 27 MHz
+///   arrival-timestamp word) giving 192-byte source packets — the
+///   framing Blu-ray `.m2ts` streams use;
+/// * a 16-byte per-packet error-correction **trailer** appended by
+///   transmission systems, giving 204-byte packets.
+///
+/// [`detect_packet_layout`] recognises all three; the demuxer strips
+/// the framing and hands every consumer the plain 188-byte window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TsPacketLayout {
+    /// Total bytes per physical packet: 188, 192, or 204.
+    pub packet_size: usize,
+    /// Byte offset of the `0x47` sync byte (the start of the logical
+    /// 188-byte packet) inside each physical packet: 4 for the
+    /// prefixed 192-byte form, 0 otherwise.
+    pub sync_offset: usize,
+}
+
+impl TsPacketLayout {
+    /// Plain 188-byte packets (§2.4.3.2).
+    pub const STANDARD: Self = Self {
+        packet_size: TS_PACKET_LEN,
+        sync_offset: 0,
+    };
+    /// 192-byte source packets: 4-byte prefix + 188-byte TS packet.
+    pub const PREFIXED_192: Self = Self {
+        packet_size: 192,
+        sync_offset: 4,
+    };
+    /// 204-byte packets: 188-byte TS packet + 16-byte
+    /// error-correction trailer.
+    pub const TRAILER_204: Self = Self {
+        packet_size: 204,
+        sync_offset: 0,
+    };
+
+    /// Slice the logical 188-byte TS packet out of one physical
+    /// packet-sized chunk.
+    ///
+    /// # Panics
+    /// Panics if `chunk` is shorter than [`Self::packet_size`].
+    pub fn window<'a>(&self, chunk: &'a [u8]) -> &'a [u8] {
+        &chunk[self.sync_offset..self.sync_offset + TS_PACKET_LEN]
+    }
+}
+
+/// Detect the physical packet layout of a TS byte source from its
+/// first bytes (which must start on a packet boundary — the usual
+/// probe contract).
+///
+/// A layout matches when the sync byte `0x47` appears at its expected
+/// position in **every** whole packet the buffer covers (up to 8
+/// packets are checked), with at least two packets available to rule
+/// out coincidence. Candidates are tried in the order 188 / 192 / 204;
+/// the sizes are mutually non-divisible, so a stream of one layout
+/// cannot satisfy another beyond the first packet.
+///
+/// Returns `None` for a buffer with fewer than two packets of any
+/// candidate size or with no consistent sync grid.
+pub fn detect_packet_layout(buf: &[u8]) -> Option<TsPacketLayout> {
+    const MAX_CHECK: usize = 8;
+    for layout in [
+        TsPacketLayout::STANDARD,
+        TsPacketLayout::PREFIXED_192,
+        TsPacketLayout::TRAILER_204,
+    ] {
+        let whole = buf.len() / layout.packet_size;
+        let check = whole.min(MAX_CHECK);
+        if check < 2 {
+            continue;
+        }
+        if (0..check).all(|k| buf[k * layout.packet_size + layout.sync_offset] == TS_SYNC_BYTE) {
+            return Some(layout);
+        }
+    }
+    None
+}
+
 /// Maximum byte size of an adaptation field including its length byte
 /// (§2.4.3.5 — `adaptation_field_length` caps at 183, so the field
 /// occupies at most 184 of the packet's 184 non-header bytes).
@@ -1458,6 +1540,58 @@ mod tests {
                 encode_clock_reference(base, ext)
             );
         }
+    }
+
+    #[test]
+    fn detect_packet_layout_recognises_all_three_framings() {
+        // Plain 188-byte grid.
+        let pkt = make_packet([0x47, 0x00, 0x00, 0x10], &[]);
+        let mut plain = Vec::new();
+        for _ in 0..4 {
+            plain.extend_from_slice(&pkt);
+        }
+        assert_eq!(detect_packet_layout(&plain), Some(TsPacketLayout::STANDARD));
+
+        // 192-byte source packets: 4-byte prefix ahead of each packet.
+        let mut prefixed = Vec::new();
+        for i in 0..4u8 {
+            prefixed.extend_from_slice(&[0x00, 0x00, 0x00, i]); // header word
+            prefixed.extend_from_slice(&pkt);
+        }
+        assert_eq!(
+            detect_packet_layout(&prefixed),
+            Some(TsPacketLayout::PREFIXED_192)
+        );
+
+        // 204-byte packets: 16-byte trailer after each packet.
+        let mut trailed = Vec::new();
+        for _ in 0..4 {
+            trailed.extend_from_slice(&pkt);
+            trailed.extend_from_slice(&[0xEE; 16]);
+        }
+        assert_eq!(
+            detect_packet_layout(&trailed),
+            Some(TsPacketLayout::TRAILER_204)
+        );
+
+        // The layout's window extractor recovers the logical packet.
+        let w = TsPacketLayout::PREFIXED_192.window(&prefixed[..192]);
+        assert_eq!(w, &pkt[..]);
+    }
+
+    #[test]
+    fn detect_packet_layout_rejects_ambiguous_input() {
+        // Garbage.
+        assert_eq!(detect_packet_layout(&[0xAAu8; 1024]), None);
+        // A single packet is not enough evidence.
+        let pkt = make_packet([0x47, 0x00, 0x00, 0x10], &[]);
+        assert_eq!(detect_packet_layout(&pkt), None);
+        // A stray 0x47 at offset 0 with no grid behind it.
+        let mut fake = vec![0x47u8];
+        fake.extend_from_slice(&[0x00; 1000]);
+        assert_eq!(detect_packet_layout(&fake), None);
+        // Empty.
+        assert_eq!(detect_packet_layout(&[]), None);
     }
 
     #[test]

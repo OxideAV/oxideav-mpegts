@@ -11,6 +11,20 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **192/204-byte physical packet tolerance.** The demuxer now detects
+  and strips the two common non-188 framings: 192-byte source packets
+  (a 4-byte prefix word ahead of each packet — the `.m2ts` shape) and
+  204-byte packets (a 16-byte error-correction trailer appended by
+  transmission systems). `TsPacketLayout` names the three framings,
+  `detect_packet_layout` classifies a probe buffer by its sync-byte
+  grid (≥2 consistent packets required), and
+  `MpegTsDemuxer::packet_layout()` reports the detection. The whole
+  read layer — streaming reads, garbage resync (double-sync check one
+  packet *stride* apart), the PCR duration probe, the PCR-anchored
+  binary-search seek, and the random-access index — walks the physical
+  grid while every consumer keeps seeing plain 188-byte packets. The
+  container probe now scores all three framings.
+
 - **Typed DSM trick-mode decode (§2.4.3.7).** `DsmTrickMode` decodes
   the raw `DSM_trick_mode` byte into the Table 2-20
   `trick_mode_control` variants — fast-forward / fast-reverse (with
