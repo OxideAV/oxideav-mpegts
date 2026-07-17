@@ -11,6 +11,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Keyframe ↔ `random_access_indicator` round trip.** The muxer sets
+  the §2.4.3.5 `random_access_indicator` on the first TS packet of a
+  keyframe-flagged `Packet`'s PES envelope (on the PCR PID only when
+  that packet also carries the PCR fields, per the §2.4.3.5
+  constraint). `PesReassembler` folds the indicator into a new
+  `PesPacket::random_access` field — honouring the "next PES packet to
+  start" rule, so a flag on a payload-less carrier packet ahead of the
+  PES start still tags it — and the demuxer surfaces it as the core
+  `Packet` keyframe flag. The muxer's hand-rolled adaptation-field
+  bytes (PES stuffing + PCR-only packets) now go through the
+  `AdaptationFieldSpec` builder, and the PCR wire encoding is the
+  shared `encode_clock_reference`.
+
 - **Write-side adaptation-field builder.** `AdaptationFieldSpec` /
   `AdaptationFieldExtensionSpec` encode the complete §2.4.3.4 Table 2-6
   surface — discontinuity / random-access / ES-priority indicators, PCR,

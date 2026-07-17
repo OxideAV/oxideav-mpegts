@@ -32,13 +32,22 @@
 //!   in mid-file re-acquires the tables quickly, and once more at
 //!   `write_trailer`.
 //!
+//! * A keyframe-flagged [`Packet`] (`PacketFlags::keyframe`) sets the
+//!   `random_access_indicator` (§2.4.3.5) on the first TS packet of
+//!   its PES envelope, so a receiver can locate random-access points
+//!   without parsing the elementary stream. On the PCR PID the
+//!   indicator is only emitted when that packet also carries a PCR,
+//!   per the §2.4.3.5 constraint.
+//!
 //! Out of scope:
 //!
 //! * MPEG-DASH-style time slicing, PES-CRC, or scrambling.
-//! * Adaptation-field random-access / discontinuity / private-data
-//!   flags beyond `PCR_flag`. The PCR PID gets PCR at every PES start
-//!   plus periodic standalone PCR packets; non-PCR-PID tracks get an
-//!   adaptation field only for the tail-packet stuffing pass.
+//! * Adaptation-field discontinuity / private-data / splice flags on
+//!   the write path (the [`crate::AdaptationFieldSpec`] builder covers
+//!   them for callers assembling their own packets). The PCR PID gets
+//!   PCR at every PES start plus periodic standalone PCR packets;
+//!   non-PCR-PID tracks get an adaptation field for keyframe
+//!   random-access marking and the tail-packet stuffing pass.
 //!
 //! CodecId → MPEG-TS `stream_type` (Table 2-29 + HDMV extension
 //! 0x80..0xFF). The reverse mapping is performed at `open`; unknown
@@ -708,13 +717,13 @@ impl MpegTsMuxer {
         pkt[2] = pcr_pid as u8;
         // adaptation_field_control = 0b10 (AF only, no payload).
         pkt[3] = 0b0010_0000 | (cc & 0x0F);
-        // adaptation_field_length = 183 (rest of the packet).
-        pkt[4] = (TS_PACKET_LEN - 5) as u8;
-        // flags byte: PCR_flag set.
-        pkt[5] = 0b0001_0000;
-        let pcr_bytes = encode_pcr(pts.max(0) as u64, 0);
-        pkt[6..12].copy_from_slice(&pcr_bytes);
-        // pkt[12..] stays 0xFF stuffing (already pre-filled).
+        // AF spanning the whole 184-byte body (§2.4.3.5 requires
+        // adaptation_field_length == 183 when the AF control is '10'):
+        // PCR + 0xFF stuffing.
+        let af = crate::AdaptationFieldSpec::with_pcr(pts.max(0) as u64, 0)
+            .encode(Some(TS_PACKET_LEN - 4))
+            .map_err(|e| CoreError::invalid(format!("mpegts muxer: {e}")))?;
+        pkt[4..4 + af.len()].copy_from_slice(&af);
         self.output.write_all(&pkt).map_err(CoreError::Io)?;
         self.programs[prog_idx].last_pcr_pts = Some(pts);
         Ok(())
@@ -768,19 +777,29 @@ impl MpegTsMuxer {
         if let Some((base, _)) = pcr {
             self.programs[prog_idx].last_pcr_pts = Some(base as i64);
         }
-        self.write_pes_bytes_as_ts(track.pid, track_idx, &pes, pcr)
+        // random_access_indicator on the PES-start packet for keyframes
+        // (§2.4.3.5). On the PCR PID the indicator may only be set in a
+        // packet that carries the PCR fields, so it is suppressed for a
+        // PCR-PID PES that carries no inline PCR (e.g. no PTS).
+        let random_access = packet.flags.keyframe
+            && (track.pid != self.programs[prog_idx].pcr_pid || pcr.is_some());
+        self.write_pes_bytes_as_ts(track.pid, track_idx, &pes, pcr, random_access)
     }
 
     /// Fragment a contiguous PES byte buffer into 188-byte TS packets
     /// for `pid`, with PUSI=1 on the first packet and continuity-
-    /// counter increment per packet. `pcr` is an optional adaptation
-    /// field carried on the FIRST packet only.
+    /// counter increment per packet. `first_packet_pcr` is an optional
+    /// PCR carried in the FIRST packet's adaptation field;
+    /// `random_access` sets the §2.4.3.5 `random_access_indicator`
+    /// there (the PES starting in that packet begins at an
+    /// elementary-stream access point).
     fn write_pes_bytes_as_ts(
         &mut self,
         pid: u16,
         track_idx: usize,
         pes: &[u8],
         first_packet_pcr: Option<(u64, u16)>,
+        random_access: bool,
     ) -> CoreResult<()> {
         let mut cursor = 0usize;
         let mut first = true;
@@ -791,54 +810,38 @@ impl MpegTsMuxer {
             pkt[1] = pusi | ((pid >> 8) as u8 & 0b0001_1111);
             pkt[2] = pid as u8;
             let cc = self.tracks[track_idx].cc;
-            // adaptation_field_control: payload + maybe AF.
-            // Determine AF presence based on whether we have PCR or
-            // need stuffing to align the last fragment to 188.
             let remaining = pes.len() - cursor;
+            // Adaptation field carried when the first packet needs a
+            // PCR / random-access flag, or when the (tail) fragment is
+            // short and needs AF stuffing to land on 188 bytes
+            // (§2.4.3.5 — the only stuffing method for PES packets).
+            let spec = crate::AdaptationFieldSpec {
+                random_access_indicator: first && random_access,
+                pcr: first_packet_pcr.filter(|_| first),
+                ..Default::default()
+            };
             // Worst-case payload room with NO adaptation field.
             let payload_room_no_af = TS_PACKET_LEN - 4;
-            let needs_pcr = first && first_packet_pcr.is_some();
-            let needs_stuffing = remaining < payload_room_no_af && !needs_pcr;
-            let af_present = needs_pcr || needs_stuffing;
+            let af_present = !spec.is_empty() || remaining < payload_room_no_af;
             let afc = if af_present { 0b11 } else { 0b01 };
             pkt[3] = (afc << 4) | (cc & 0x0F);
             self.tracks[track_idx].cc = (cc + 1) & 0x0F;
 
-            let mut payload_start = 4;
             if af_present {
-                // We'll fill the AF then compute the payload window.
-                let mut af = Vec::<u8>::with_capacity(TS_PACKET_LEN - 4);
-                // Reserve flags byte (filled after we know contents).
-                let mut flags = 0u8;
-                if let Some((pcr_base, pcr_ext)) = first_packet_pcr {
-                    if first {
-                        flags |= 0b0001_0000; // PCR_flag
-                        let pcr_bytes = encode_pcr(pcr_base, pcr_ext);
-                        af.push(flags);
-                        af.extend_from_slice(&pcr_bytes);
-                    } else {
-                        // PCR only on first packet — ignore on
-                        // continuations.
-                        af.push(flags);
-                    }
+                let map_err = |e: crate::TsError| CoreError::invalid(format!("mpegts muxer: {e}"));
+                let bare = spec.encode(None).map_err(map_err)?;
+                let room_after_bare = TS_PACKET_LEN - 4 - bare.len();
+                let af = if remaining < room_after_bare {
+                    // Grow the AF with stuffing so the payload window
+                    // shrinks to exactly the remaining PES bytes.
+                    spec.encode(Some(TS_PACKET_LEN - 4 - remaining))
+                        .map_err(map_err)?
                 } else {
-                    af.push(flags);
-                }
-                // If we still need to stuff out to the 188-byte boundary,
-                // append 0xFF until the payload remaining + AF + header
-                // = 188.
-                let header_so_far = 4 + 1 /*adaptation_field_length*/ + af.len();
-                let mut payload_room = TS_PACKET_LEN - header_so_far;
-                if payload_room > remaining {
-                    let stuff_bytes = payload_room - remaining;
-                    af.resize(af.len() + stuff_bytes, 0xFF);
-                    payload_room = remaining;
-                }
-                let af_total_len = af.len() as u8;
-                pkt[4] = af_total_len;
-                pkt[5..5 + af.len()].copy_from_slice(&af);
-                payload_start = 4 + 1 + af.len();
-                let take = payload_room.min(remaining);
+                    bare
+                };
+                pkt[4..4 + af.len()].copy_from_slice(&af);
+                let payload_start = 4 + af.len();
+                let take = (TS_PACKET_LEN - payload_start).min(remaining);
                 pkt[payload_start..payload_start + take]
                     .copy_from_slice(&pes[cursor..cursor + take]);
                 cursor += take;
@@ -846,7 +849,6 @@ impl MpegTsMuxer {
                 let take = payload_room_no_af.min(remaining);
                 pkt[4..4 + take].copy_from_slice(&pes[cursor..cursor + take]);
                 cursor += take;
-                let _ = payload_start;
             }
             self.output.write_all(&pkt).map_err(CoreError::Io)?;
             first = false;
@@ -983,22 +985,6 @@ fn build_es_descriptors(track: &TrackState) -> Vec<u8> {
         out.extend_from_slice(&crate::build::iso639_language_descriptor(&[(lang, 0x00)]));
     }
     out.extend_from_slice(&track.extra_es_descriptors);
-    out
-}
-
-/// Encode a 42-bit PCR (33-bit base + 6 reserved + 9-bit extension)
-/// into the 6-byte adaptation-field field per §2.4.3.4 Table 2-6:
-/// `program_clock_reference_base` (33), `reserved` (6, all 1s),
-/// `program_clock_reference_extension` (9).
-fn encode_pcr(pcr_base: u64, pcr_ext: u16) -> [u8; 6] {
-    let base = pcr_base & 0x1_FFFF_FFFF; // 33 bits
-    let high32 = ((base >> 1) & 0xFFFF_FFFF) as u32;
-    let low_bit_of_base = (base & 1) as u8;
-    let ext = pcr_ext & 0x1FF; // 9 bits
-    let mut out = [0u8; 6];
-    out[0..4].copy_from_slice(&high32.to_be_bytes());
-    out[4] = (low_bit_of_base << 7) | 0b0111_1110 | ((ext >> 8) as u8 & 0x01);
-    out[5] = ext as u8;
     out
 }
 
@@ -1851,12 +1837,89 @@ mod tests {
         assert!(has_teletext, "expected injected teletext descriptor");
     }
 
-    /// `encode_pcr` must round-trip through the demuxer-side adaptation
-    /// field PCR decode. Pin the exact bit layout (§2.4.3.4 Table 2-6).
+    /// A keyframe-flagged core `Packet` must surface a
+    /// `random_access_indicator` on the wire (first TS packet of its
+    /// PES) and read back as a keyframe through the demuxer, per
+    /// §2.4.3.5 — including the PCR-PID constraint that the indicator
+    /// only rides packets carrying the PCR fields.
+    #[test]
+    fn keyframe_round_trips_as_random_access_indicator() {
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            let tb = TimeBase::new(1, 90_000);
+            // Video keyframe (PCR PID; PES start carries PCR → RAI
+            // legal), long enough to span several TS packets so the
+            // indicator must land on the FIRST only.
+            let kf = Packet::new(0, tb, vec![0xAB; 600])
+                .with_pts(10_000)
+                .with_keyframe(true);
+            // Non-keyframe video packet: no RAI.
+            let mid = Packet::new(0, tb, vec![0xCD; 600]).with_pts(13_600);
+            // Audio keyframe on a non-PCR PID: RAI without PCR.
+            let akf = Packet::new(1, tb, vec![0xEF; 100])
+                .with_pts(11_000)
+                .with_keyframe(true);
+            mx.write_packet(&kf).unwrap();
+            mx.write_packet(&akf).unwrap();
+            mx.write_packet(&mid).unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+
+        // Wire check: count RAI packets per PID.
+        let mut rai_by_pid: std::collections::HashMap<u16, usize> =
+            std::collections::HashMap::new();
+        let mut rai_with_pcr = 0usize;
+        for pkt in crate::iter_packets(&bytes) {
+            let pkt = pkt.expect("well-formed muxer output");
+            if let Some(af) = &pkt.adaptation_field {
+                if af.random_access_indicator {
+                    *rai_by_pid.entry(pkt.pid).or_default() += 1;
+                    assert!(
+                        pkt.payload_unit_start,
+                        "muxer sets RAI only on PES-start packets"
+                    );
+                    if af.pcr_flag {
+                        rai_with_pcr += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            rai_by_pid.values().sum::<usize>(),
+            2,
+            "exactly the two keyframes are flagged: {rai_by_pid:?}"
+        );
+        assert_eq!(rai_by_pid.len(), 2, "one video + one audio PID");
+        assert_eq!(
+            rai_with_pcr, 1,
+            "the video (PCR PID) RAI packet also carries the PCR"
+        );
+
+        // Demux check: keyframe flags survive the round trip.
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut flags_by_pts = std::collections::HashMap::new();
+        while let Ok(p) = dmx.next_packet() {
+            flags_by_pts.insert(p.pts.unwrap(), p.is_keyframe());
+        }
+        assert_eq!(flags_by_pts.get(&10_000), Some(&true));
+        assert_eq!(flags_by_pts.get(&11_000), Some(&true));
+        assert_eq!(flags_by_pts.get(&13_600), Some(&false));
+    }
+
+    /// The clock-reference encoder the mux path relies on must
+    /// round-trip through the demuxer-side adaptation field PCR
+    /// decode. Pin the exact bit layout (§2.4.3.4 Table 2-6).
     #[test]
     fn encode_pcr_bit_layout() {
         // base = 0x1_0000_0001 (33 bits, low bit set), ext = 0x155.
-        let b = encode_pcr(0x1_0000_0001, 0x155);
+        let b = crate::packet::encode_clock_reference(0x1_0000_0001, 0x155);
         // high32 = base >> 1 = 0x8000_0000.
         assert_eq!(&b[0..4], &0x8000_0000u32.to_be_bytes());
         // byte4 = (low_bit<<7) | 0b0111_1110 | (ext>>8 & 1)

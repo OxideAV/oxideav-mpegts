@@ -603,6 +603,12 @@ impl MpegTsDemuxer {
     fn finish_pes(&mut self, pid: u16, stream_idx: u32, pes: PesPacket) -> Packet {
         let tb = TimeBase::new(1, 90_000);
         let mut pkt = Packet::new(stream_idx, tb, pes.payload);
+        // A TS-level random_access_indicator (§2.4.3.5) announced this
+        // PES as beginning at an elementary-stream access point — the
+        // container-level keyframe signal.
+        if pes.random_access {
+            pkt = pkt.with_keyframe(true);
+        }
         if let Some(raw) = pes.pts_90k {
             let ext = if let Some(t) = self.pts_trackers.get_mut(&pid) {
                 t.observe(raw);

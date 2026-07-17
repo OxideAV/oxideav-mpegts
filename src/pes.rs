@@ -116,6 +116,14 @@ pub struct PesPacket {
     /// concluded). `pes_extension.is_some()` is the old
     /// "extension present" signal; the sub-fields are now decoded.
     pub pes_extension: Option<PesExtension>,
+    /// `true` when a TS-level `random_access_indicator` (§2.4.3.5)
+    /// announced this PES packet — i.e. the indicator was set on the
+    /// TS packet this PES started in, or on a preceding same-PID
+    /// packet after the previous PES start ("the next PES packet to
+    /// start in the payload of Transport Stream packets with the
+    /// current PID"). Set by [`PesReassembler`]; always `false` from a
+    /// bare [`PesPacket::parse`], which sees no TS-layer flags.
+    pub random_access: bool,
     /// Elementary-stream payload bytes (after the optional PES header).
     pub payload: Vec<u8>,
 }
@@ -235,6 +243,7 @@ impl PesPacket {
                 additional_copy_info: None,
                 previous_pes_packet_crc: None,
                 pes_extension: None,
+                random_access: false,
                 payload: bytes[6..].to_vec(),
             });
         }
@@ -403,6 +412,7 @@ impl PesPacket {
             additional_copy_info,
             previous_pes_packet_crc,
             pes_extension,
+            random_access: false,
             payload: bytes[header_end..].to_vec(),
         })
     }
@@ -601,6 +611,15 @@ pub struct PesReassembler {
     buf: Vec<u8>,
     /// Set once a PUSI=1 TS packet has populated `buf`.
     started: bool,
+    /// `random_access_indicator` state for the in-flight PES in `buf`
+    /// — the indicator seen on the TS packet the PES started in, or on
+    /// a preceding same-PID packet (§2.4.3.5: the indicator announces
+    /// "the next PES packet to start").
+    current_rai: bool,
+    /// A `random_access_indicator` observed *after* the current PES
+    /// start (e.g. on a payload-less PCR carrier packet interleaved
+    /// mid-PES); it applies to the next PES to start.
+    pending_rai: bool,
 }
 
 impl PesReassembler {
@@ -612,25 +631,45 @@ impl PesReassembler {
     /// Feed the next TS packet (must have the same PID as the prior
     /// feeds). Returns `Some(PesPacket)` when a complete PES packet
     /// has been finalised by this packet's PUSI=1.
+    ///
+    /// The TS packet's `random_access_indicator` (§2.4.3.5) is folded
+    /// into the emitted [`PesPacket::random_access`]: the indicator
+    /// marks the next PES packet to start on the PID, so a flag on the
+    /// starting packet — or on any same-PID packet since the previous
+    /// start — tags the PES that begins at the next PUSI.
     pub fn feed(&mut self, ts: &TsPacket<'_>) -> Result<Option<PesPacket>, TsError> {
+        let rai = ts
+            .adaptation_field
+            .as_ref()
+            .is_some_and(|af| af.random_access_indicator);
         if ts.payload_unit_start {
             // The arriving PES packet's PUSI=1 closes the prior PES
             // packet (if any).
             let finished = if self.started {
-                Some(PesPacket::parse(&self.buf)?)
+                let mut pes = PesPacket::parse(&self.buf)?;
+                pes.random_access = self.current_rai;
+                Some(pes)
             } else {
                 None
             };
             self.buf.clear();
             self.buf.extend_from_slice(ts.payload);
             self.started = true;
+            // The PES starting here is announced by an indicator on
+            // this very packet or one seen since the previous start.
+            self.current_rai = self.pending_rai || rai;
+            self.pending_rai = false;
             Ok(finished)
-        } else if self.started {
-            self.buf.extend_from_slice(ts.payload);
-            Ok(None)
         } else {
-            // Continuation bytes before we've seen the first PUSI=1 —
-            // discard, per spec we can't anchor the packet yet.
+            if rai {
+                // Announces the *next* PES to start on this PID.
+                self.pending_rai = true;
+            }
+            if self.started {
+                self.buf.extend_from_slice(ts.payload);
+            }
+            // Continuation bytes before we've seen the first PUSI=1
+            // are discarded — per spec we can't anchor the packet yet.
             Ok(None)
         }
     }
@@ -642,7 +681,10 @@ impl PesReassembler {
         }
         let buf = std::mem::take(&mut self.buf);
         self.started = false;
-        Ok(Some(PesPacket::parse(&buf)?))
+        let mut pes = PesPacket::parse(&buf)?;
+        pes.random_access = self.current_rai;
+        self.current_rai = false;
+        Ok(Some(pes))
     }
 }
 
@@ -1088,6 +1130,87 @@ mod tests {
             TsError::Truncated { what, .. } => assert_eq!(what, "PES_extension_field"),
             other => panic!("expected Truncated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rai_marks_the_pes_starting_in_the_flagged_packet() {
+        // Two PES packets on one PID; the second's start packet
+        // carries a random_access_indicator. Only the second emitted
+        // PesPacket must have `random_access == true`.
+        let pid = 0x101;
+        let pes1 = build_pes(0xE0, 1000, b"first");
+        let pes2 = build_pes(0xE0, 2000, b"second");
+        let ts1 = pes_into_ts(pid, &pes1, 184);
+        // Hand-build pes2's single TS packet with an AF carrying RAI:
+        // header(4) + AF {len, flags(RAI), 0xFF stuffing} + PES bytes.
+        let mut ts2 = vec![
+            TS_SYNC_BYTE,
+            0b0100_0000 | ((pid >> 8) as u8 & 0x1F),
+            (pid & 0xFF) as u8,
+            0b0011_0000, // AF + payload, cc=0
+        ];
+        let af_total = TS_PACKET_LEN - 4 - pes2.len();
+        ts2.push((af_total - 1) as u8);
+        ts2.push(0b0100_0000); // random_access_indicator
+        ts2.extend(std::iter::repeat(0xFF).take(af_total - 2));
+        ts2.extend_from_slice(&pes2);
+        assert_eq!(ts2.len(), TS_PACKET_LEN);
+
+        let mut r = PesReassembler::new();
+        let mut emitted = Vec::new();
+        for chunk in ts1.chunks(TS_PACKET_LEN).chain(ts2.chunks(TS_PACKET_LEN)) {
+            let pkt = TsPacket::parse(chunk).unwrap();
+            if let Some(pes) = r.feed(&pkt).unwrap() {
+                emitted.push(pes);
+            }
+        }
+        if let Some(pes) = r.flush().unwrap() {
+            emitted.push(pes);
+        }
+        assert_eq!(emitted.len(), 2);
+        assert!(!emitted[0].random_access, "first PES was not announced");
+        assert!(emitted[1].random_access, "second PES start carried RAI");
+        assert_eq!(emitted[1].payload, b"second");
+    }
+
+    #[test]
+    fn rai_on_payloadless_carrier_packet_marks_next_pes() {
+        // §2.4.3.5: the indicator announces "the next PES packet to
+        // start" — it may ride a payload-less (e.g. PCR-only) packet
+        // ahead of the PES start.
+        let pid = 0x101;
+        let pes = build_pes(0xE0, 5000, b"announced");
+
+        // AF-only packet with RAI, no payload.
+        let mut carrier = vec![
+            TS_SYNC_BYTE,
+            (pid >> 8) as u8 & 0x1F,
+            (pid & 0xFF) as u8,
+            0b0010_0000, // AF only, cc=0
+            183,         // adaptation_field_length spans the packet
+            0b0100_0000, // random_access_indicator
+        ];
+        carrier.extend(std::iter::repeat(0xFF).take(TS_PACKET_LEN - carrier.len()));
+
+        let start = pes_into_ts(pid, &pes, 184);
+
+        let mut r = PesReassembler::new();
+        let mut emitted = Vec::new();
+        for chunk in carrier
+            .chunks(TS_PACKET_LEN)
+            .chain(start.chunks(TS_PACKET_LEN))
+        {
+            let pkt = TsPacket::parse(chunk).unwrap();
+            if let Some(p) = r.feed(&pkt).unwrap() {
+                emitted.push(p);
+            }
+        }
+        if let Some(p) = r.flush().unwrap() {
+            emitted.push(p);
+        }
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].random_access);
+        assert_eq!(emitted[0].payload, b"announced");
     }
 
     #[test]
