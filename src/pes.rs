@@ -894,6 +894,355 @@ impl PesReassembler {
     }
 }
 
+/// Write-side specification of a PES packet header — the mirror of
+/// the [`PesPacket`] parse surface for every §2.4.3.7 Table 2-17
+/// optional field. [`Self::encode`] emits a complete PES packet
+/// (start code through payload) that reads back identically through
+/// [`PesPacket::parse`].
+#[derive(Debug, Clone, Default)]
+pub struct PesHeaderSpec {
+    /// `stream_id` (Table 2-18). The header-less IDs
+    /// (program_stream_map, padding_stream, private_stream_2, ECM,
+    /// EMM, program_stream_directory, DSM-CC, H.222.1 type E) encode
+    /// without the optional header; every field below is then
+    /// rejected if set.
+    pub stream_id: u8,
+    /// 2-bit `PES_scrambling_control` (Table 2-19).
+    pub pes_scrambling_control: u8,
+    /// `PES_priority`.
+    pub pes_priority: bool,
+    /// `data_alignment_indicator`.
+    pub data_alignment_indicator: bool,
+    /// `copyright`.
+    pub copyright: bool,
+    /// `original_or_copy`.
+    pub original_or_copy: bool,
+    /// 33-bit PTS (90 kHz).
+    pub pts_90k: Option<u64>,
+    /// 33-bit DTS (90 kHz). Legal only alongside a PTS it differs
+    /// from — §2.7.5: a DTS shall appear iff a PTS is present and the
+    /// decoding time differs.
+    pub dts_90k: Option<u64>,
+    /// 42-bit ESCR as a composed 27 MHz tick count
+    /// (`base × 300 + extension`, equation 2-13).
+    pub escr_27mhz: Option<u64>,
+    /// 22-bit `ES_rate` in 50 bytes/s units. The value 0 is forbidden
+    /// (§2.4.3.7).
+    pub es_rate_50bps: Option<u32>,
+    /// DSM trick mode (encoded via [`DsmTrickMode::to_byte`]).
+    pub trick_mode: Option<DsmTrickMode>,
+    /// 7-bit `additional_copy_info`.
+    pub additional_copy_info: Option<u8>,
+    /// 16-bit `previous_PES_packet_CRC`.
+    pub previous_pes_packet_crc: Option<u16>,
+    /// `PES_extension` body — the parsed [`PesExtension`] doubles as
+    /// the write spec.
+    pub pes_extension: Option<PesExtension>,
+    /// Emit `PES_packet_length = 0` (unbounded). Only legal for the
+    /// video stream_ids `0xE0..=0xEF` carried in a Transport Stream
+    /// (§2.4.3.7); rejected otherwise.
+    pub unbounded_length: bool,
+}
+
+impl PesHeaderSpec {
+    /// Convenience: a header with just a PTS (and optionally a DTS).
+    pub fn with_timestamps(stream_id: u8, pts_90k: u64, dts_90k: Option<u64>) -> Self {
+        Self {
+            stream_id,
+            pts_90k: Some(pts_90k),
+            dts_90k,
+            ..Default::default()
+        }
+    }
+
+    /// Encode a complete PES packet: `packet_start_code_prefix`,
+    /// `stream_id`, `PES_packet_length`, the optional header per
+    /// Table 2-17, then `payload`.
+    ///
+    /// Returns [`TsError::InvalidField`] for spec-violating requests:
+    /// field-width overflows, a DTS without a PTS (or equal to it,
+    /// §2.7.5), a zero `ES_rate`, optional fields on a header-less
+    /// `stream_id`, an optional-header area over the 8-bit
+    /// `PES_header_data_length` budget, `unbounded_length` on a
+    /// non-video `stream_id`, or a bounded packet whose length
+    /// overflows the 16-bit `PES_packet_length` field.
+    pub fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, TsError> {
+        if !has_optional_pes_header(self.stream_id) {
+            if self.pts_90k.is_some()
+                || self.dts_90k.is_some()
+                || self.escr_27mhz.is_some()
+                || self.es_rate_50bps.is_some()
+                || self.trick_mode.is_some()
+                || self.additional_copy_info.is_some()
+                || self.previous_pes_packet_crc.is_some()
+                || self.pes_extension.is_some()
+            {
+                return Err(TsError::InvalidField {
+                    what: "optional PES fields on a header-less stream_id",
+                });
+            }
+            let len = u16::try_from(payload.len()).map_err(|_| TsError::InvalidField {
+                what: "PES payload exceeds PES_packet_length",
+            })?;
+            let mut out = Vec::with_capacity(6 + payload.len());
+            out.extend_from_slice(&[0x00, 0x00, 0x01, self.stream_id]);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(payload);
+            return Ok(out);
+        }
+
+        // ---- Validate field widths + pairings. ----
+        if self.pes_scrambling_control > 0b11 {
+            return Err(TsError::InvalidField {
+                what: "PES_scrambling_control exceeds 2 bits",
+            });
+        }
+        if let Some(pts) = self.pts_90k {
+            if pts > 0x1_FFFF_FFFF {
+                return Err(TsError::InvalidField {
+                    what: "PTS exceeds 33 bits",
+                });
+            }
+        }
+        if let Some(dts) = self.dts_90k {
+            if dts > 0x1_FFFF_FFFF {
+                return Err(TsError::InvalidField {
+                    what: "DTS exceeds 33 bits",
+                });
+            }
+            match self.pts_90k {
+                None => {
+                    return Err(TsError::InvalidField {
+                        what: "DTS without PTS",
+                    })
+                }
+                Some(pts) if pts == dts => {
+                    // §2.7.5: a DTS shall appear only when the
+                    // decoding time differs from the presentation
+                    // time.
+                    return Err(TsError::InvalidField {
+                        what: "DTS equal to PTS shall not be coded",
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(escr) = self.escr_27mhz {
+            if escr / 300 > 0x1_FFFF_FFFF {
+                return Err(TsError::InvalidField {
+                    what: "ESCR base exceeds 33 bits",
+                });
+            }
+        }
+        if let Some(rate) = self.es_rate_50bps {
+            if rate == 0 {
+                return Err(TsError::InvalidField {
+                    what: "ES_rate value 0 is forbidden",
+                });
+            }
+            if rate > 0x3F_FFFF {
+                return Err(TsError::InvalidField {
+                    what: "ES_rate exceeds 22 bits",
+                });
+            }
+        }
+        if let Some(aci) = self.additional_copy_info {
+            if aci > 0x7F {
+                return Err(TsError::InvalidField {
+                    what: "additional_copy_info exceeds 7 bits",
+                });
+            }
+        }
+
+        // ---- Optional header body. ----
+        let mut opt = Vec::new();
+        let pts_dts_flags: u8 = match (self.pts_90k, self.dts_90k) {
+            (Some(pts), Some(dts)) => {
+                opt.extend_from_slice(&encode_ts33(0b0011, pts));
+                opt.extend_from_slice(&encode_ts33(0b0001, dts));
+                0b11
+            }
+            (Some(pts), None) => {
+                opt.extend_from_slice(&encode_ts33(0b0010, pts));
+                0b10
+            }
+            (None, None) => 0b00,
+            (None, Some(_)) => unreachable!("rejected above"),
+        };
+        if let Some(escr) = self.escr_27mhz {
+            opt.extend_from_slice(&encode_escr(escr));
+        }
+        if let Some(rate) = self.es_rate_50bps {
+            // marker | ES_rate(22) | marker.
+            opt.push(0b1000_0000 | ((rate >> 15) & 0x7F) as u8);
+            opt.push(((rate >> 7) & 0xFF) as u8);
+            opt.push((((rate & 0x7F) as u8) << 1) | 1);
+        }
+        if let Some(tm) = self.trick_mode {
+            opt.push(tm.to_byte());
+        }
+        if let Some(aci) = self.additional_copy_info {
+            opt.push(0b1000_0000 | aci); // marker | 7 bits
+        }
+        if let Some(crc) = self.previous_pes_packet_crc {
+            opt.extend_from_slice(&crc.to_be_bytes());
+        }
+        if let Some(ext) = &self.pes_extension {
+            encode_pes_extension(ext, &mut opt)?;
+        }
+        let header_data_length = u8::try_from(opt.len()).map_err(|_| TsError::InvalidField {
+            what: "optional PES header exceeds PES_header_data_length",
+        })?;
+
+        // ---- PES_packet_length (bytes after the length field). ----
+        let tail_len = 3 + opt.len() + payload.len();
+        let pes_packet_length: u16 = if self.unbounded_length {
+            if !(0xE0..=0xEF).contains(&self.stream_id) {
+                return Err(TsError::InvalidField {
+                    what: "unbounded PES_packet_length on a non-video stream_id",
+                });
+            }
+            0
+        } else {
+            u16::try_from(tail_len).map_err(|_| TsError::InvalidField {
+                what: "PES packet exceeds PES_packet_length (use unbounded_length)",
+            })?
+        };
+
+        let mut out = Vec::with_capacity(9 + opt.len() + payload.len());
+        out.extend_from_slice(&[0x00, 0x00, 0x01, self.stream_id]);
+        out.extend_from_slice(&pes_packet_length.to_be_bytes());
+        out.push(
+            0b1000_0000
+                | (self.pes_scrambling_control << 4)
+                | (u8::from(self.pes_priority) << 3)
+                | (u8::from(self.data_alignment_indicator) << 2)
+                | (u8::from(self.copyright) << 1)
+                | u8::from(self.original_or_copy),
+        );
+        out.push(
+            (pts_dts_flags << 6)
+                | (u8::from(self.escr_27mhz.is_some()) << 5)
+                | (u8::from(self.es_rate_50bps.is_some()) << 4)
+                | (u8::from(self.trick_mode.is_some()) << 3)
+                | (u8::from(self.additional_copy_info.is_some()) << 2)
+                | (u8::from(self.previous_pes_packet_crc.is_some()) << 1)
+                | u8::from(self.pes_extension.is_some()),
+        );
+        out.push(header_data_length);
+        out.extend_from_slice(&opt);
+        out.extend_from_slice(payload);
+        Ok(out)
+    }
+}
+
+/// Encode a 33-bit PTS/DTS into the 5-byte Table 2-17 form with the
+/// given 4-bit prefix (`0010` lone PTS, `0011` PTS of a pair, `0001`
+/// DTS).
+fn encode_ts33(prefix: u8, ts: u64) -> [u8; 5] {
+    let t = ts & 0x1_FFFF_FFFF;
+    [
+        (prefix << 4) | ((((t >> 30) & 0b111) as u8) << 1) | 1,
+        ((t >> 22) & 0xFF) as u8,
+        ((((t >> 15) & 0x7F) as u8) << 1) | 1,
+        ((t >> 7) & 0xFF) as u8,
+        (((t & 0x7F) as u8) << 1) | 1,
+    ]
+}
+
+/// Encode a composed 27 MHz ESCR (`base × 300 + extension`) into the
+/// 6-byte Table 2-17 field — the inverse of the internal decoder.
+/// Reserved bits are written as `1`.
+fn encode_escr(escr_27mhz: u64) -> [u8; 6] {
+    let base = escr_27mhz / 300;
+    let ext = escr_27mhz % 300;
+    let b32_30 = ((base >> 30) & 0b111) as u8;
+    let b29_28 = ((base >> 28) & 0b11) as u8;
+    let b27_20 = ((base >> 20) & 0xFF) as u8;
+    let b19_15 = ((base >> 15) & 0x1F) as u8;
+    let b14_13 = ((base >> 13) & 0b11) as u8;
+    let b12_5 = ((base >> 5) & 0xFF) as u8;
+    let b4_0 = (base & 0x1F) as u8;
+    let e8_7 = ((ext >> 7) & 0b11) as u8;
+    let e6_0 = (ext & 0x7F) as u8;
+    [
+        0b1100_0000 | (b32_30 << 3) | 0b100 | b29_28,
+        b27_20,
+        (b19_15 << 3) | 0b100 | b14_13,
+        b12_5,
+        (b4_0 << 3) | 0b100 | e8_7,
+        (e6_0 << 1) | 1,
+    ]
+}
+
+/// Append the `PES_extension` body (Table 2-17, concluded) for `ext`
+/// to `out`, validating field widths.
+fn encode_pes_extension(ext: &PesExtension, out: &mut Vec<u8>) -> Result<(), TsError> {
+    if let Some(ppsc) = &ext.program_packet_sequence_counter {
+        if ppsc.counter > 0x7F {
+            return Err(TsError::InvalidField {
+                what: "program_packet_sequence_counter exceeds 7 bits",
+            });
+        }
+        if ppsc.original_stuff_length > 0x3F {
+            return Err(TsError::InvalidField {
+                what: "original_stuff_length exceeds 6 bits",
+            });
+        }
+    }
+    if let Some(p_std) = &ext.p_std_buffer {
+        if p_std.size > 0x1FFF {
+            return Err(TsError::InvalidField {
+                what: "P-STD_buffer_size exceeds 13 bits",
+            });
+        }
+    }
+    if let Some(pack) = &ext.pack_header {
+        if pack.len() > 255 {
+            return Err(TsError::InvalidField {
+                what: "pack_header exceeds pack_field_length",
+            });
+        }
+    }
+    if let Some(f2) = &ext.extension_field_2 {
+        if f2.len() > 0x7F {
+            return Err(TsError::InvalidField {
+                what: "PES_extension_field_2 exceeds 7 bits of length",
+            });
+        }
+    }
+    out.push(
+        (u8::from(ext.private_data.is_some()) << 7)
+            | (u8::from(ext.pack_header.is_some()) << 6)
+            | (u8::from(ext.program_packet_sequence_counter.is_some()) << 5)
+            | (u8::from(ext.p_std_buffer.is_some()) << 4)
+            | 0b0000_1110 // reserved bits written as 1
+            | u8::from(ext.extension_field_2.is_some()),
+    );
+    if let Some(pd) = &ext.private_data {
+        out.extend_from_slice(pd);
+    }
+    if let Some(pack) = &ext.pack_header {
+        out.push(pack.len() as u8);
+        out.extend_from_slice(pack);
+    }
+    if let Some(ppsc) = &ext.program_packet_sequence_counter {
+        out.push(0b1000_0000 | ppsc.counter);
+        out.push(
+            0b1000_0000 | (u8::from(ppsc.mpeg1_mpeg2_identifier) << 6) | ppsc.original_stuff_length,
+        );
+    }
+    if let Some(p_std) = &ext.p_std_buffer {
+        out.push(0b0100_0000 | (u8::from(p_std.scale) << 5) | ((p_std.size >> 8) as u8 & 0x1F));
+        out.push(p_std.size as u8);
+    }
+    if let Some(f2) = &ext.extension_field_2 {
+        out.push(0b1000_0000 | (f2.len() as u8));
+        out.extend_from_slice(f2);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1876,181 @@ mod tests {
         // No trick-mode field → None.
         let plain = build_pes(0xE0, 1234, b"x");
         assert_eq!(PesPacket::parse(&plain).unwrap().trick_mode(), None);
+    }
+
+    #[test]
+    fn pes_header_spec_full_house_round_trips() {
+        let spec = PesHeaderSpec {
+            stream_id: 0xE0,
+            pes_scrambling_control: 0b10,
+            pes_priority: true,
+            data_alignment_indicator: true,
+            copyright: true,
+            original_or_copy: true,
+            pts_90k: Some(0x1_2345_6789),
+            dts_90k: Some(0x1_2345_0000),
+            escr_27mhz: Some(0x1_FFFF_FFFF * 300 + 299),
+            es_rate_50bps: Some(0x3F_FFFF),
+            trick_mode: Some(DsmTrickMode::SlowMotion { rep_cntrl: 5 }),
+            additional_copy_info: Some(0x55),
+            previous_pes_packet_crc: Some(0xBEEF),
+            pes_extension: Some(PesExtension {
+                private_data: Some([0xA5; 16]),
+                pack_header: Some(vec![0x01, 0x02, 0x03]),
+                program_packet_sequence_counter: Some(ProgramPacketSequenceCounter {
+                    counter: 0x7F,
+                    mpeg1_mpeg2_identifier: true,
+                    original_stuff_length: 0x3F,
+                }),
+                p_std_buffer: Some(PStdBuffer {
+                    scale: true,
+                    size: 0x1FFF,
+                }),
+                extension_field_2: Some(vec![0xEE; 7]),
+            }),
+            unbounded_length: false,
+        };
+        let payload = b"elementary bytes";
+        let bytes = spec.encode(payload).unwrap();
+        let parsed = PesPacket::parse(&bytes).unwrap();
+        assert_eq!(parsed.stream_id, 0xE0);
+        assert_eq!(parsed.pes_scrambling_control, 0b10);
+        assert!(parsed.pes_priority);
+        assert!(parsed.data_alignment_indicator);
+        assert!(parsed.copyright);
+        assert!(parsed.original_or_copy);
+        assert_eq!(parsed.pts_90k, Some(0x1_2345_6789));
+        assert_eq!(parsed.dts_90k, Some(0x1_2345_0000));
+        assert_eq!(parsed.escr_27mhz, Some(0x1_FFFF_FFFF * 300 + 299));
+        assert_eq!(parsed.es_rate_50bps, Some(0x3F_FFFF));
+        assert_eq!(
+            parsed.trick_mode(),
+            Some(DsmTrickMode::SlowMotion { rep_cntrl: 5 })
+        );
+        assert_eq!(parsed.additional_copy_info, Some(0x55));
+        assert_eq!(parsed.previous_pes_packet_crc, Some(0xBEEF));
+        assert_eq!(parsed.pes_extension, spec.pes_extension);
+        assert_eq!(parsed.payload, payload);
+        // Bounded length covers flags + optional header + payload.
+        let expect_len = (bytes.len() - 6) as u16;
+        assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]), expect_len);
+    }
+
+    #[test]
+    fn pes_header_spec_unbounded_and_headerless_forms() {
+        // Unbounded video form: PES_packet_length = 0.
+        let spec = PesHeaderSpec {
+            unbounded_length: true,
+            ..PesHeaderSpec::with_timestamps(0xE0, 90_000, None)
+        };
+        let bytes = spec.encode(&[0xAA; 32]).unwrap();
+        assert_eq!(&bytes[4..6], &[0, 0]);
+        assert_eq!(PesPacket::parse(&bytes).unwrap().pts_90k, Some(90_000));
+
+        // Header-less stream id (private_stream_2): payload directly
+        // after the 6-byte fixed header.
+        let spec = PesHeaderSpec {
+            stream_id: 0xBF,
+            ..Default::default()
+        };
+        let bytes = spec.encode(b"raw").unwrap();
+        assert_eq!(bytes.len(), 9);
+        assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]), 3);
+        let parsed = PesPacket::parse(&bytes).unwrap();
+        assert_eq!(parsed.payload, b"raw");
+        assert_eq!(parsed.pts_90k, None);
+    }
+
+    #[test]
+    fn pes_header_spec_rejects_spec_violations() {
+        let base = |f: fn(&mut PesHeaderSpec)| {
+            let mut s = PesHeaderSpec {
+                stream_id: 0xC0,
+                ..Default::default()
+            };
+            f(&mut s);
+            s
+        };
+        for spec in [
+            base(|s| s.dts_90k = Some(100)), // DTS without PTS
+            base(|s| {
+                s.pts_90k = Some(100);
+                s.dts_90k = Some(100); // DTS == PTS (§2.7.5)
+            }),
+            base(|s| s.pts_90k = Some(1 << 33)), // PTS width
+            base(|s| s.escr_27mhz = Some((1u64 << 33) * 300)), // ESCR width
+            base(|s| s.es_rate_50bps = Some(0)), // forbidden 0
+            base(|s| s.es_rate_50bps = Some(0x40_0000)), // rate width
+            base(|s| s.additional_copy_info = Some(0x80)), // 7-bit
+            base(|s| s.pes_scrambling_control = 4), // 2-bit
+            base(|s| s.unbounded_length = true), // audio id
+            base(|s| {
+                // header-less id with an optional field
+                s.stream_id = 0xBF;
+                s.pts_90k = Some(1);
+            }),
+            base(|s| {
+                s.pes_extension = Some(PesExtension {
+                    p_std_buffer: Some(PStdBuffer {
+                        scale: false,
+                        size: 0x2000, // 13-bit overflow
+                    }),
+                    ..Default::default()
+                });
+            }),
+            base(|s| {
+                s.pes_extension = Some(PesExtension {
+                    extension_field_2: Some(vec![0; 128]), // 7-bit len
+                    ..Default::default()
+                });
+            }),
+            base(|s| {
+                // optional area past the 255-byte budget
+                s.pts_90k = Some(1);
+                s.pes_extension = Some(PesExtension {
+                    pack_header: Some(vec![0; 251]),
+                    ..Default::default()
+                });
+            }),
+        ] {
+            assert!(
+                matches!(spec.encode(&[]), Err(TsError::InvalidField { .. })),
+                "spec should be rejected: {spec:?}"
+            );
+        }
+        // Bounded audio packet larger than PES_packet_length can hold.
+        let spec = PesHeaderSpec {
+            stream_id: 0xC0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            spec.encode(&vec![0u8; 70_000]),
+            Err(TsError::InvalidField { .. })
+        ));
+    }
+
+    #[test]
+    fn escr_encode_decode_round_trips() {
+        for escr in [
+            0u64,
+            1,
+            299,
+            300,
+            90_000 * 300 + 123,
+            0x1_FFFF_FFFF * 300 + 299, // maximum
+        ] {
+            let spec = PesHeaderSpec {
+                stream_id: 0xE0,
+                escr_27mhz: Some(escr),
+                ..Default::default()
+            };
+            let bytes = spec.encode(b"x").unwrap();
+            assert_eq!(
+                PesPacket::parse(&bytes).unwrap().escr_27mhz,
+                Some(escr),
+                "escr {escr}"
+            );
+        }
     }
 
     #[test]

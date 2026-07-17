@@ -766,7 +766,7 @@ impl MpegTsMuxer {
             }
             None
         };
-        let pes = build_pes(track.stream_id, packet);
+        let pes = build_pes(track.stream_id, packet)?;
         let pcr = pcr_on_this_pes.map(|p| {
             // PCR-base = PTS - ~10ms guard so the PCR never leads the
             // first access unit it accompanies. Both are 90 kHz units;
@@ -903,60 +903,27 @@ impl Muxer for MpegTsMuxer {
     }
 }
 
-/// Build one PES packet — fixed header + optional 5-byte PTS / 5-byte
-/// DTS + payload.
-fn build_pes(stream_id: u8, packet: &Packet) -> Vec<u8> {
-    let has_pts = packet.pts.is_some();
-    let has_dts = packet.dts.is_some() && packet.dts != packet.pts;
-    let pts_dts_flags: u8 = match (has_pts, has_dts) {
-        (true, true) => 0b11,
-        (true, false) => 0b10,
-        _ => 0b00,
+/// Build one PES packet through the shared write-side header builder
+/// ([`crate::pes::PesHeaderSpec`]): fixed header, optional PTS / DTS,
+/// then the payload. Video stream_ids (`0xE0..=0xEF`) get the
+/// unbounded `PES_packet_length = 0` form (what BD discs use); other
+/// IDs carry the real length per §2.4.3.7. Timestamps ride the 33-bit
+/// ring, so extended values are reduced modulo `2^33` before
+/// encoding.
+fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<u8>> {
+    let ring = |t: i64| (t as u64) & 0x1_FFFF_FFFF;
+    // Compare on the ring: two timestamps that coincide there must
+    // collapse to the PTS-only form (§2.7.5 forbids DTS == PTS).
+    let has_dts = packet.dts.is_some() && packet.dts.map(ring) != packet.pts.map(ring);
+    let spec = crate::pes::PesHeaderSpec {
+        stream_id,
+        pts_90k: packet.pts.map(ring),
+        dts_90k: if has_dts { packet.dts.map(ring) } else { None },
+        unbounded_length: (0xE0..=0xEF).contains(&stream_id),
+        ..Default::default()
     };
-    let opt_hdr_len: u8 = match pts_dts_flags {
-        0b11 => 10, // 5 PTS + 5 DTS
-        0b10 => 5,
-        _ => 0,
-    };
-    let mut out = Vec::with_capacity(9 + opt_hdr_len as usize + packet.data.len());
-    out.extend_from_slice(&[0x00, 0x00, 0x01]); // packet_start_code_prefix
-    out.push(stream_id);
-    // PES_packet_length = 0 (unbounded) for video / large audio. For
-    // small known sizes we could set the real length; '0' is always
-    // legal for video stream_ids 0xE0..0xEF and is what BD discs use.
-    out.push(0x00);
-    out.push(0x00);
-    // Flags byte 0: '10' marker + scrambling=0 + priority=0 + etc.
-    out.push(0b1000_0000);
-    // Flags byte 1: PTS_DTS_flags + the other six flag bits = 0.
-    out.push(pts_dts_flags << 6);
-    out.push(opt_hdr_len);
-    if let Some(p) = packet.pts {
-        let prefix = if has_dts { 0b0011 } else { 0b0010 };
-        out.extend_from_slice(&encode_pts_dts(prefix, p as u64));
-    }
-    if let (true, Some(d)) = (has_dts, packet.dts) {
-        out.extend_from_slice(&encode_pts_dts(0b0001, d as u64));
-    }
-    out.extend_from_slice(&packet.data);
-    out
-}
-
-/// Encode a 33-bit PTS or DTS into 5 bytes per Table 2-22 with the
-/// given 4-bit prefix nibble (`0010` PTS-only, `0011` PTS-of-PTS+DTS,
-/// `0001` DTS).
-fn encode_pts_dts(prefix: u8, ts: u64) -> [u8; 5] {
-    let t = ts & 0x1_FFFF_FFFF; // 33 bits
-    let t32_30 = ((t >> 30) & 0b0111) as u8;
-    let t29_15 = ((t >> 15) & 0x7FFF) as u16;
-    let t14_0 = (t & 0x7FFF) as u16;
-    [
-        (prefix << 4) | (t32_30 << 1) | 0b1,
-        ((t29_15 >> 7) & 0xFF) as u8,
-        ((((t29_15 << 1) | 1) & 0xFF) as u8),
-        ((t14_0 >> 7) & 0xFF) as u8,
-        (((t14_0 << 1) | 1) & 0xFF) as u8,
-    ]
+    spec.encode(&packet.data)
+        .map_err(|e| CoreError::invalid(format!("mpegts muxer: {e}")))
 }
 
 /// Normalise an arbitrary language tag into the 3-byte ISO 639-2 code

@@ -11,6 +11,23 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Write-side PES header builder (§2.4.3.7 Table 2-17).**
+  `PesHeaderSpec` encodes a complete PES packet with every optional
+  header field the parser reads — scrambling control, priority,
+  alignment, copyright, original_or_copy, PTS/DTS, ESCR (composed
+  27 MHz tick, exact inverse of the decoder including the maximum
+  42-bit value), ES_rate, typed DSM trick mode, additional_copy_info,
+  previous_PES_packet_CRC, and the full `PES_extension` body (the
+  parsed `PesExtension` doubles as the write spec) — plus both length
+  forms: real 16-bit `PES_packet_length` and the unbounded `0` form
+  (video stream_ids only, per §2.4.3.7) and the header-less
+  stream_ids. Spec-violating requests are rejected with
+  `TsError::InvalidField`: DTS without/equal-to PTS (§2.7.5), the
+  forbidden zero `ES_rate`, field-width overflows, over-budget
+  optional areas, and unbounded length on non-video IDs. The muxer's
+  PES construction now goes through the shared builder (audio PES
+  gain real lengths; video keeps the BD-style unbounded form).
+
 - **Conformance validation report.** New `validate` module:
   `validate_ts(&[u8]) -> TsValidationReport` walks a stream (any of
   the three physical framings) in two passes — PSI discovery, then
