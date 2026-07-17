@@ -11,6 +11,17 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Typed DSM trick-mode decode (§2.4.3.7).** `DsmTrickMode` decodes
+  the raw `DSM_trick_mode` byte into the Table 2-20
+  `trick_mode_control` variants — fast-forward / fast-reverse (with
+  `FieldId` per Table 2-21, `intra_slice_refresh`, and the Table 2-22
+  `CoefficientSelection` frequency truncation), slow-motion /
+  slow-reverse (5-bit `rep_cntrl`), freeze-frame (`FieldId`), and the
+  reserved control values with their raw tail bits. `to_byte()` is the
+  write-side inverse (all 256 byte values are stable through a
+  decode–encode–decode cycle), and `PesPacket::trick_mode()` lifts the
+  already-parsed raw byte.
+
 - **Random-access index + keyframe-accurate seek.**
   `MpegTsDemuxer::random_access_points()` builds (once, in a single
   forward pass with the demux cursor restored) a typed index of every

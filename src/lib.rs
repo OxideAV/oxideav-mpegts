@@ -142,7 +142,10 @@ pub use packet::{
     AdaptationFieldExtensionSpec, AdaptationFieldSpec, TsPacket, TsPacketIter,
     MAX_ADAPTATION_FIELD_LEN, TS_PACKET_LEN, TS_SYNC_BYTE,
 };
-pub use pes::{PStdBuffer, PesExtension, PesPacket, PesReassembler, ProgramPacketSequenceCounter};
+pub use pes::{
+    CoefficientSelection, DsmTrickMode, FieldId, PStdBuffer, PesExtension, PesPacket,
+    PesReassembler, ProgramPacketSequenceCounter,
+};
 pub use psi::{
     decode_utc_time, iter_sections, mpeg2_crc32, BatTransportStream, BouquetAssociationTable,
     ConditionalAccessTable, DiscontinuityInformationTable, EitDateTime, EitDuration, EitEvent,

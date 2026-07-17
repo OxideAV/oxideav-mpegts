@@ -106,6 +106,7 @@ pub struct PesPacket {
     pub es_rate_50bps: Option<u32>,
     /// Raw 8-bit DSM trick-mode byte (`trick_mode_control` in the top
     /// 3 bits, mode-specific tail in the bottom 5), when present.
+    /// [`Self::trick_mode`] decodes it per §2.4.3.7 Tables 2-20..2-22.
     pub dsm_trick_mode: Option<u8>,
     /// 7-bit `additional_copy_info`, when present.
     pub additional_copy_info: Option<u8>,
@@ -205,6 +206,197 @@ impl PStdBuffer {
     /// `size * 1024` when set (§2.4.3.7).
     pub fn size_bytes(&self) -> u32 {
         u32::from(self.size) * if self.scale { 1024 } else { 128 }
+    }
+}
+
+/// `field_id` — which field(s) of a picture to display in a trick
+/// mode (§2.4.3.7 Table 2-21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldId {
+    /// `'00'` — display from top field only.
+    TopFieldOnly,
+    /// `'01'` — display from bottom field only.
+    BottomFieldOnly,
+    /// `'10'` — display complete frame.
+    CompleteFrame,
+    /// `'11'` — reserved.
+    Reserved,
+}
+
+impl FieldId {
+    fn from_bits(b: u8) -> Self {
+        match b & 0b11 {
+            0b00 => Self::TopFieldOnly,
+            0b01 => Self::BottomFieldOnly,
+            0b10 => Self::CompleteFrame,
+            _ => Self::Reserved,
+        }
+    }
+
+    /// The 2-bit Table 2-21 code.
+    pub fn to_bits(self) -> u8 {
+        match self {
+            Self::TopFieldOnly => 0b00,
+            Self::BottomFieldOnly => 0b01,
+            Self::CompleteFrame => 0b10,
+            Self::Reserved => 0b11,
+        }
+    }
+}
+
+/// `frequency_truncation` — which restricted coefficient set may have
+/// been used to code the video in this PES packet (§2.4.3.7
+/// Table 2-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoefficientSelection {
+    /// `'00'` — only DC coefficients are non-zero.
+    DcOnly,
+    /// `'01'` — only the first three coefficients are non-zero.
+    FirstThree,
+    /// `'10'` — only the first six coefficients are non-zero.
+    FirstSix,
+    /// `'11'` — all coefficients may be non-zero.
+    All,
+}
+
+impl CoefficientSelection {
+    fn from_bits(b: u8) -> Self {
+        match b & 0b11 {
+            0b00 => Self::DcOnly,
+            0b01 => Self::FirstThree,
+            0b10 => Self::FirstSix,
+            _ => Self::All,
+        }
+    }
+
+    /// The 2-bit Table 2-22 code.
+    pub fn to_bits(self) -> u8 {
+        match self {
+            Self::DcOnly => 0b00,
+            Self::FirstThree => 0b01,
+            Self::FirstSix => 0b10,
+            Self::All => 0b11,
+        }
+    }
+}
+
+/// Decoded `DSM_trick_mode` byte (§2.4.3.7): the 3-bit
+/// `trick_mode_control` (Table 2-20) plus the mode-specific bottom
+/// five bits. The field describes the trick mode applied to the
+/// associated **video** stream; for other elementary-stream types the
+/// byte's meaning is undefined (surface the raw byte instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsmTrickMode {
+    /// `'000'` — fast-forward video stream.
+    FastForward {
+        /// Which field(s) to display (Table 2-21).
+        field_id: FieldId,
+        /// Coded slices may skip macroblocks; the decoder may
+        /// substitute co-sited macroblocks of previous pictures.
+        intra_slice_refresh: bool,
+        /// Restricted coefficient set (Table 2-22).
+        frequency_truncation: CoefficientSelection,
+    },
+    /// `'001'` — slow-motion video stream: display each picture
+    /// `N × rep_cntrl` picture/field durations (§2.4.3.7).
+    SlowMotion {
+        /// 5-bit repeat control; the value `0` is forbidden.
+        rep_cntrl: u8,
+    },
+    /// `'010'` — freeze-frame video stream. `field_id` refers to the
+    /// first video access unit commencing in this PES packet (or the
+    /// most recent one, for a zero-payload PES).
+    FreezeFrame {
+        /// Which field(s) to display (Table 2-21).
+        field_id: FieldId,
+    },
+    /// `'011'` — fast-reverse video stream (same sub-fields as
+    /// fast-forward).
+    FastReverse {
+        /// Which field(s) to display (Table 2-21).
+        field_id: FieldId,
+        /// Coded slices may skip macroblocks; the decoder may
+        /// substitute co-sited macroblocks of previous pictures.
+        intra_slice_refresh: bool,
+        /// Restricted coefficient set (Table 2-22).
+        frequency_truncation: CoefficientSelection,
+    },
+    /// `'100'` — slow-reverse video stream.
+    SlowReverse {
+        /// 5-bit repeat control; the value `0` is forbidden.
+        rep_cntrl: u8,
+    },
+    /// `'101'..'111'` — reserved `trick_mode_control` values; the
+    /// bottom five bits are surfaced raw.
+    Reserved {
+        /// The reserved 3-bit `trick_mode_control` value (5..=7).
+        trick_mode_control: u8,
+        /// The mode-specific bottom five bits, verbatim.
+        bits: u8,
+    },
+}
+
+impl DsmTrickMode {
+    /// Decode a raw `DSM_trick_mode` byte (`trick_mode_control` in the
+    /// top 3 bits, mode-specific tail in the bottom 5).
+    pub fn from_byte(b: u8) -> Self {
+        let tail = b & 0x1F;
+        match (b >> 5) & 0b111 {
+            0b000 => Self::FastForward {
+                field_id: FieldId::from_bits(tail >> 3),
+                intra_slice_refresh: (tail & 0b100) != 0,
+                frequency_truncation: CoefficientSelection::from_bits(tail),
+            },
+            0b001 => Self::SlowMotion { rep_cntrl: tail },
+            0b010 => Self::FreezeFrame {
+                field_id: FieldId::from_bits(tail >> 3),
+            },
+            0b011 => Self::FastReverse {
+                field_id: FieldId::from_bits(tail >> 3),
+                intra_slice_refresh: (tail & 0b100) != 0,
+                frequency_truncation: CoefficientSelection::from_bits(tail),
+            },
+            0b100 => Self::SlowReverse { rep_cntrl: tail },
+            control => Self::Reserved {
+                trick_mode_control: control,
+                bits: tail,
+            },
+        }
+    }
+
+    /// Encode back to the wire byte. Freeze-frame's three reserved
+    /// bits are emitted as `'111'`; a `rep_cntrl` wider than 5 bits is
+    /// masked. `from_byte(x).to_byte()` preserves every meaningful
+    /// bit.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::FastForward {
+                field_id,
+                intra_slice_refresh,
+                frequency_truncation,
+            } => {
+                (field_id.to_bits() << 3)
+                    | (u8::from(intra_slice_refresh) << 2)
+                    | frequency_truncation.to_bits()
+            }
+            Self::SlowMotion { rep_cntrl } => (0b001 << 5) | (rep_cntrl & 0x1F),
+            Self::FreezeFrame { field_id } => (0b010 << 5) | (field_id.to_bits() << 3) | 0b111,
+            Self::FastReverse {
+                field_id,
+                intra_slice_refresh,
+                frequency_truncation,
+            } => {
+                (0b011 << 5)
+                    | (field_id.to_bits() << 3)
+                    | (u8::from(intra_slice_refresh) << 2)
+                    | frequency_truncation.to_bits()
+            }
+            Self::SlowReverse { rep_cntrl } => (0b100 << 5) | (rep_cntrl & 0x1F),
+            Self::Reserved {
+                trick_mode_control,
+                bits,
+            } => ((trick_mode_control & 0b111) << 5) | (bits & 0x1F),
+        }
     }
 }
 
@@ -415,6 +607,20 @@ impl PesPacket {
             random_access: false,
             payload: bytes[header_end..].to_vec(),
         })
+    }
+}
+
+impl PesPacket {
+    /// Decode the `DSM_trick_mode` byte into its typed §2.4.3.7 view
+    /// (Table 2-20 `trick_mode_control` + the mode-specific
+    /// `field_id` / `intra_slice_refresh` / `frequency_truncation` /
+    /// `rep_cntrl` bits). `None` when the header carried no trick-mode
+    /// field. Meaningful for video elementary streams only — the spec
+    /// leaves the bits undefined for other stream types, so callers of
+    /// non-video PIDs should stick to the raw
+    /// [`Self::dsm_trick_mode`] byte.
+    pub fn trick_mode(&self) -> Option<DsmTrickMode> {
+        self.dsm_trick_mode.map(DsmTrickMode::from_byte)
     }
 }
 
@@ -1211,6 +1417,116 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert!(emitted[0].random_access);
         assert_eq!(emitted[0].payload, b"announced");
+    }
+
+    #[test]
+    fn trick_mode_decodes_all_five_modes() {
+        // fast_forward '000' | field_id '10' | refresh 1 | trunc '01'
+        assert_eq!(
+            DsmTrickMode::from_byte(0b0001_0101),
+            DsmTrickMode::FastForward {
+                field_id: FieldId::CompleteFrame,
+                intra_slice_refresh: true,
+                frequency_truncation: CoefficientSelection::FirstThree,
+            }
+        );
+        // slow_motion '001' | rep_cntrl 0b10110 (22)
+        assert_eq!(
+            DsmTrickMode::from_byte(0b0011_0110),
+            DsmTrickMode::SlowMotion { rep_cntrl: 22 }
+        );
+        // freeze_frame '010' | field_id '01' | reserved '101' (ignored)
+        assert_eq!(
+            DsmTrickMode::from_byte(0b0100_1101),
+            DsmTrickMode::FreezeFrame {
+                field_id: FieldId::BottomFieldOnly,
+            }
+        );
+        // fast_reverse '011' | field_id '00' | refresh 0 | trunc '11'
+        assert_eq!(
+            DsmTrickMode::from_byte(0b0110_0011),
+            DsmTrickMode::FastReverse {
+                field_id: FieldId::TopFieldOnly,
+                intra_slice_refresh: false,
+                frequency_truncation: CoefficientSelection::All,
+            }
+        );
+        // slow_reverse '100' | rep_cntrl 1
+        assert_eq!(
+            DsmTrickMode::from_byte(0b1000_0001),
+            DsmTrickMode::SlowReverse { rep_cntrl: 1 }
+        );
+        // reserved control values '101'..'111' surface raw.
+        assert_eq!(
+            DsmTrickMode::from_byte(0b1101_0101),
+            DsmTrickMode::Reserved {
+                trick_mode_control: 0b110,
+                bits: 0b10101,
+            }
+        );
+    }
+
+    #[test]
+    fn trick_mode_byte_round_trips() {
+        // Every byte value: decode → encode must preserve all
+        // meaningful bits (freeze_frame's 3 reserved bits and the
+        // reserved control values' tails are don't-cares on re-encode,
+        // so compare through a second decode).
+        for b in 0..=255u8 {
+            let decoded = DsmTrickMode::from_byte(b);
+            let re = DsmTrickMode::from_byte(decoded.to_byte());
+            assert_eq!(decoded, re, "byte {b:#010b} unstable through round-trip");
+        }
+        // Typed → wire → typed is identity for the spec-defined modes.
+        for tm in [
+            DsmTrickMode::FastForward {
+                field_id: FieldId::Reserved,
+                intra_slice_refresh: true,
+                frequency_truncation: CoefficientSelection::DcOnly,
+            },
+            DsmTrickMode::SlowMotion { rep_cntrl: 31 },
+            DsmTrickMode::FreezeFrame {
+                field_id: FieldId::CompleteFrame,
+            },
+            DsmTrickMode::FastReverse {
+                field_id: FieldId::BottomFieldOnly,
+                intra_slice_refresh: false,
+                frequency_truncation: CoefficientSelection::FirstSix,
+            },
+            DsmTrickMode::SlowReverse { rep_cntrl: 7 },
+        ] {
+            assert_eq!(DsmTrickMode::from_byte(tm.to_byte()), tm);
+        }
+    }
+
+    #[test]
+    fn trick_mode_field_parses_from_pes_header() {
+        // PES header with DSM_trick_mode_flag set: flags2 bit 3.
+        let payload = b"vid";
+        let trick = 0b0001_0101u8; // fast_forward, complete frame
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+        let pes_packet_length: u16 = (3 + 1 + payload.len()) as u16;
+        v.extend_from_slice(&pes_packet_length.to_be_bytes());
+        v.push(0b1000_0000);
+        v.push(0b0000_1000); // DSM_trick_mode_flag only
+        v.push(1); // PES_header_data_length = 1 (the trick byte)
+        v.push(trick);
+        v.extend_from_slice(payload);
+        let parsed = PesPacket::parse(&v).unwrap();
+        assert_eq!(parsed.dsm_trick_mode, Some(trick));
+        assert_eq!(
+            parsed.trick_mode(),
+            Some(DsmTrickMode::FastForward {
+                field_id: FieldId::CompleteFrame,
+                intra_slice_refresh: true,
+                frequency_truncation: CoefficientSelection::FirstThree,
+            })
+        );
+        assert_eq!(parsed.payload, payload);
+        // No trick-mode field → None.
+        let plain = build_pes(0xE0, 1234, b"x");
+        assert_eq!(PesPacket::parse(&plain).unwrap().trick_mode(), None);
     }
 
     #[test]
