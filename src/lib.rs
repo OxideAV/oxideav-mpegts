@@ -118,6 +118,9 @@ pub mod psi;
 pub mod stream_type;
 pub mod validate;
 
+#[cfg(test)]
+mod hostile;
+
 #[cfg(feature = "registry")]
 pub mod demuxer;
 #[cfg(feature = "registry")]

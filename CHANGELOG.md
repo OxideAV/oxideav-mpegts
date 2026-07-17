@@ -11,6 +11,15 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Deterministic hostile-input sweeps.** A test-only module drives a
+  seeded in-tree LCG through every parse surface — hundreds of
+  mutated well-formed streams (built via the crate's own write path),
+  pure-noise buffers, sync-aligned noise, truncations, an over-cap
+  `section_length` claim, and mutated demuxer open/read/seek runs
+  with hard iteration bounds — pinning the robustness contract: no
+  panics, no unbounded work or allocation, errors instead of
+  misbehaviour. Fixed seeds make any failure reproduce exactly.
+
 - **Write-side PES header builder (§2.4.3.7 Table 2-17).**
   `PesHeaderSpec` encodes a complete PES packet with every optional
   header field the parser reads — scrambling control, priority,
