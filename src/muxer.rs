@@ -1995,6 +1995,47 @@ mod tests {
         assert_eq!(landed, 10_000 + 39 * 3_000 + 500);
     }
 
+    /// Muxer output must pass the crate's own §2.4.3.3/§2.4.3.5/§2.7.2
+    /// conformance validator with zero violations.
+    #[test]
+    fn muxer_output_is_conformant() {
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let sink = SharedSink::new();
+        let tb = TimeBase::new(1, 90_000);
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            for i in 0..50i64 {
+                let pts = 5_000 + i * 3_000;
+                let v = Packet::new(0, tb, vec![(i & 0xFF) as u8; 400])
+                    .with_pts(pts)
+                    .with_keyframe(i % 10 == 0);
+                mx.write_packet(&v).unwrap();
+                let a = Packet::new(1, tb, vec![0x11; 80]).with_pts(pts + 700);
+                mx.write_packet(&a).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(
+            report.is_conformant(),
+            "muxer output violates the spec: {:?}",
+            report.violations
+        );
+        assert_eq!(report.programs, vec![(1, 0x0100)]);
+        assert_eq!(report.pcr.len(), 1);
+        let pcr = &report.pcr[0];
+        assert!(pcr.samples >= 50, "PCR on every video PES start");
+        // §2.7.2: every inter-PCR gap within 0,1 s.
+        assert!(pcr.max_interval_27mhz.unwrap() <= crate::validate::MAX_PCR_INTERVAL_27MHZ);
+        assert!(pcr.estimated_rate_bps.unwrap() > 0);
+        // PSI repetition produced multiple PATs.
+        assert!(report.pat_sections >= 2);
+        assert!(report.pat_max_gap_packets.is_some());
+    }
+
     /// Re-frame a plain 188-byte TS byte stream into 192-byte
     /// (4-byte-prefixed) source packets.
     fn wrap_192(bytes: &[u8]) -> Vec<u8> {

@@ -11,6 +11,26 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Conformance validation report.** New `validate` module:
+  `validate_ts(&[u8]) -> TsValidationReport` walks a stream (any of
+  the three physical framings) in two passes — PSI discovery, then
+  packet-level checks — and tallies normative-rule violations with
+  bounded state: §2.4.3.3 continuity-counter errors (drops +
+  over-cap duplicates, per PID and overall), Table 2-5 reserved
+  `adaptation_field_control` packets, §2.4.3.5 adaptation-field length
+  bounds (183 with AF-only control, ≤182 with AF+payload), §2.4.3.5
+  field pairings (OPCR without PCR, `seamless_splice` without
+  `splicing_point_flag`, RAI on a PCR PID without PCR fields), §2.7.2
+  unsignalled inter-PCR gaps over 0,1 s (`MAX_PCR_INTERVAL_27MHZ`),
+  `transport_error_indicator` packets, and PAT/PMT sections failing
+  CRC / length checks. Per-PCR-PID reports carry sample counts, the
+  max inter-PCR interval, signalled discontinuities, and a §2.4.2.2
+  transport-rate estimate; the report also exposes per-PID stats,
+  null-packet counts, PAT repetition gaps, and an `is_conformant()`
+  verdict. The muxer's own output is pinned conformant in tests;
+  hostile-input tests cover CC gaps, oversized PCR gaps (signalled vs
+  not), pairing violations, corrupt PSI CRC, garbage, and truncation.
+
 - **192/204-byte physical packet tolerance.** The demuxer now detects
   and strips the two common non-188 framings: 192-byte source packets
   (a 4-byte prefix word ahead of each packet — the `.m2ts` shape) and
