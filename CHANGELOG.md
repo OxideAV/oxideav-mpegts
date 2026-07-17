@@ -11,6 +11,23 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Write-side adaptation-field builder.** `AdaptationFieldSpec` /
+  `AdaptationFieldExtensionSpec` encode the complete §2.4.3.4 Table 2-6
+  surface — discontinuity / random-access / ES-priority indicators, PCR,
+  OPCR, signed `splice_countdown`, `transport_private_data`, and the
+  adaptation-field extension (`ltw_valid_flag` + 15-bit `ltw_offset`,
+  22-bit `piecewise_rate`, `seamless_splice` with 4-bit `splice_type` +
+  33-bit `DTS_next_AU`) — including the `adaptation_field_length == 0`
+  single-stuffing-byte form and `0xFF`-stuffed padding to a requested
+  size (the §2.4.3.5 PES tail-alignment mechanism). §2.4.3.5-forbidden
+  combinations are rejected with the new `TsError::InvalidField`: OPCR
+  without PCR, `seamless_splice` without a `splice_countdown`
+  (`seamless_splice_flag` requires `splicing_point_flag`), field-width
+  overflows, and content or padding beyond the 184-byte AF ceiling
+  (`MAX_ADAPTATION_FIELD_LEN`). Every spec round-trips bit-exactly
+  through `TsPacket::parse`. The 6-byte PCR/OPCR wire shape is exposed
+  as `encode_clock_reference`.
+
 - **End-to-end mux → demux round-trip harness.** A single test builds a
   two-program transport stream carrying SDT + NIT + present/following EIT
   + per-stream `stream_identifier` descriptors and PES with distinct

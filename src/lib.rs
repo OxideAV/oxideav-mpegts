@@ -138,8 +138,9 @@ pub use descriptor::{
 };
 pub use error::TsError;
 pub use packet::{
-    iter_packets, AdaptationField, AdaptationFieldExtension, TsPacket, TsPacketIter, TS_PACKET_LEN,
-    TS_SYNC_BYTE,
+    encode_clock_reference, iter_packets, AdaptationField, AdaptationFieldExtension,
+    AdaptationFieldExtensionSpec, AdaptationFieldSpec, TsPacket, TsPacketIter,
+    MAX_ADAPTATION_FIELD_LEN, TS_PACKET_LEN, TS_SYNC_BYTE,
 };
 pub use pes::{PStdBuffer, PesExtension, PesPacket, PesReassembler, ProgramPacketSequenceCounter};
 pub use psi::{

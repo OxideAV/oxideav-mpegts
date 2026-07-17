@@ -514,6 +514,317 @@ fn parse_extension(raw: &[u8], cursor: &mut usize) -> Result<AdaptationFieldExte
     })
 }
 
+/// Maximum byte size of an adaptation field including its length byte
+/// (§2.4.3.5 — `adaptation_field_length` caps at 183, so the field
+/// occupies at most 184 of the packet's 184 non-header bytes).
+pub const MAX_ADAPTATION_FIELD_LEN: usize = 184;
+
+/// Encode a 6-byte clock reference (33-bit base + 6 reserved bits set
+/// to `1` + 9-bit extension) per §2.4.3.4 Table 2-6. Used for both the
+/// PCR and the OPCR (which share the wire shape per §2.4.3.5).
+///
+/// `base` is masked to 33 bits and `extension` to 9 bits; use
+/// [`AdaptationFieldSpec::encode`] when out-of-range values must be
+/// rejected instead.
+pub fn encode_clock_reference(base: u64, extension: u16) -> [u8; 6] {
+    let base = base & 0x1_FFFF_FFFF;
+    let ext = extension & 0x1FF;
+    [
+        ((base >> 25) & 0xFF) as u8,
+        ((base >> 17) & 0xFF) as u8,
+        ((base >> 9) & 0xFF) as u8,
+        ((base >> 1) & 0xFF) as u8,
+        (((base & 1) as u8) << 7) | 0b0111_1110 | ((ext >> 8) as u8 & 1),
+        ext as u8,
+    ]
+}
+
+/// Write-side specification of an `adaptation_field_extension` body
+/// (§2.4.3.4 Table 2-6 / §2.4.3.5). Mirror of the parsed
+/// [`AdaptationFieldExtension`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdaptationFieldExtensionSpec {
+    /// `(ltw_valid_flag, ltw_offset)` — the 15-bit legal-time-window
+    /// offset in `(300/fs)`-second units; the offset value is defined
+    /// only when the valid flag is set (§2.4.3.5).
+    pub ltw: Option<(bool, u16)>,
+    /// 22-bit `piecewise_rate` — the hypothetical bitrate R that
+    /// extends the Legal Time Windows of following same-PID packets
+    /// that carry no `ltw_offset` of their own (§2.4.3.5). Only
+    /// meaningful alongside a valid `ltw`.
+    pub piecewise_rate: Option<u32>,
+    /// `(splice_type, DTS_next_AU)` — the 4-bit Table 2-7..2-16
+    /// splice-conditions index (`0000` for audio) plus the 33-bit
+    /// 90 kHz decoding time of the first access unit after the splice
+    /// point (§2.4.3.5).
+    pub seamless_splice: Option<(u8, u64)>,
+}
+
+impl AdaptationFieldExtensionSpec {
+    /// `true` when no optional sub-field is present.
+    pub fn is_empty(&self) -> bool {
+        self.ltw.is_none() && self.piecewise_rate.is_none() && self.seamless_splice.is_none()
+    }
+}
+
+/// Write-side specification of a TS adaptation field (§2.4.3.4
+/// Table 2-6). [`Self::encode`] emits the wire bytes, which round-trip
+/// through [`TsPacket::parse`] / the [`AdaptationField`] view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdaptationFieldSpec {
+    /// `discontinuity_indicator` (§2.4.3.5 — time-base or
+    /// continuity-counter discontinuity state).
+    pub discontinuity_indicator: bool,
+    /// `random_access_indicator` (§2.4.3.5 — the next PES to start on
+    /// this PID begins at an elementary-stream access point).
+    pub random_access_indicator: bool,
+    /// `elementary_stream_priority_indicator`.
+    pub elementary_stream_priority_indicator: bool,
+    /// `(program_clock_reference_base, program_clock_reference_extension)`.
+    pub pcr: Option<(u64, u16)>,
+    /// `(original_program_clock_reference_base, ..._extension)`. Legal
+    /// only alongside [`Self::pcr`] — §2.4.3.5: "The OPCR field shall
+    /// be coded only in Transport Stream packets in which the PCR
+    /// field is present."
+    pub opcr: Option<(u64, u16)>,
+    /// Signed `splice_countdown` (§2.4.3.5 — packets on this PID until
+    /// the splicing point; negative counts packets past it).
+    pub splice_countdown: Option<i8>,
+    /// `private_data_byte` run (length-prefixed on the wire; at most
+    /// 255 bytes and bounded by the packet).
+    pub transport_private_data: Option<Vec<u8>>,
+    /// Optional `adaptation_field_extension` body. A `Some` with all
+    /// sub-fields `None` still emits the (legal) empty extension.
+    pub extension: Option<AdaptationFieldExtensionSpec>,
+}
+
+impl AdaptationFieldSpec {
+    /// Convenience: an adaptation field carrying only a PCR.
+    pub fn with_pcr(base: u64, extension: u16) -> Self {
+        Self {
+            pcr: Some((base, extension)),
+            ..Default::default()
+        }
+    }
+
+    /// `true` when the spec carries no flag and no optional field —
+    /// encoding it yields the single-stuffing-byte form
+    /// (`adaptation_field_length == 0`) unless padding is requested.
+    pub fn is_empty(&self) -> bool {
+        !self.discontinuity_indicator
+            && !self.random_access_indicator
+            && !self.elementary_stream_priority_indicator
+            && self.pcr.is_none()
+            && self.opcr.is_none()
+            && self.splice_countdown.is_none()
+            && self.transport_private_data.is_none()
+            && self.extension.is_none()
+    }
+
+    /// Encode the adaptation field per §2.4.3.4 Table 2-6, returning
+    /// the wire bytes **including** the leading
+    /// `adaptation_field_length` byte.
+    ///
+    /// `min_total_len`, when given, stuffs the field with `0xFF` bytes
+    /// (§2.4.3.5 — the only stuffing method for TS packets carrying
+    /// PES) so the returned buffer is at least that many bytes long.
+    /// This is how a muxer aligns a short PES tail to the 188-byte
+    /// packet boundary.
+    ///
+    /// Returns [`TsError::InvalidField`] when a value overflows its
+    /// spec-fixed width, when a §2.4.3.5-forbidden combination is
+    /// requested (OPCR without PCR; `seamless_splice` without a
+    /// `splice_countdown`, since `seamless_splice_flag` shall not be
+    /// set in packets whose `splicing_point_flag` is clear), or when
+    /// the encoded field would exceed
+    /// [`MAX_ADAPTATION_FIELD_LEN`] bytes.
+    pub fn encode(&self, min_total_len: Option<usize>) -> Result<Vec<u8>, TsError> {
+        if let Some(want) = min_total_len {
+            if want > MAX_ADAPTATION_FIELD_LEN {
+                return Err(TsError::InvalidField {
+                    what: "adaptation field padding beyond 184 bytes",
+                });
+            }
+        }
+        let want = min_total_len.unwrap_or(0);
+        if self.is_empty() && want <= 1 {
+            // adaptation_field_length = 0: the single-stuffing-byte
+            // form (§2.4.3.5).
+            return Ok(vec![0]);
+        }
+
+        if let Some((base, ext)) = self.pcr {
+            if base > 0x1_FFFF_FFFF {
+                return Err(TsError::InvalidField {
+                    what: "PCR base exceeds 33 bits",
+                });
+            }
+            if ext > 0x1FF {
+                return Err(TsError::InvalidField {
+                    what: "PCR extension exceeds 9 bits",
+                });
+            }
+        }
+        if let Some((base, ext)) = self.opcr {
+            if self.pcr.is_none() {
+                // §2.4.3.5: the OPCR shall be coded only in packets in
+                // which the PCR is present.
+                return Err(TsError::InvalidField {
+                    what: "OPCR without PCR",
+                });
+            }
+            if base > 0x1_FFFF_FFFF {
+                return Err(TsError::InvalidField {
+                    what: "OPCR base exceeds 33 bits",
+                });
+            }
+            if ext > 0x1FF {
+                return Err(TsError::InvalidField {
+                    what: "OPCR extension exceeds 9 bits",
+                });
+            }
+        }
+        if let Some(data) = &self.transport_private_data {
+            if data.len() > 255 {
+                return Err(TsError::InvalidField {
+                    what: "transport_private_data exceeds 255 bytes",
+                });
+            }
+        }
+        if let Some(ext) = &self.extension {
+            if let Some((_, offset)) = ext.ltw {
+                if offset > 0x7FFF {
+                    return Err(TsError::InvalidField {
+                        what: "ltw_offset exceeds 15 bits",
+                    });
+                }
+            }
+            if let Some(rate) = ext.piecewise_rate {
+                if rate > 0x3F_FFFF {
+                    return Err(TsError::InvalidField {
+                        what: "piecewise_rate exceeds 22 bits",
+                    });
+                }
+            }
+            if let Some((splice_type, dts)) = ext.seamless_splice {
+                if splice_type > 0xF {
+                    return Err(TsError::InvalidField {
+                        what: "splice_type exceeds 4 bits",
+                    });
+                }
+                if dts > 0x1_FFFF_FFFF {
+                    return Err(TsError::InvalidField {
+                        what: "DTS_next_AU exceeds 33 bits",
+                    });
+                }
+                if self.splice_countdown.is_none() {
+                    // §2.4.3.5: seamless_splice_flag shall not be set
+                    // to '1' in packets in which the
+                    // splicing_point_flag is not set to '1'.
+                    return Err(TsError::InvalidField {
+                        what: "seamless_splice without splice_countdown",
+                    });
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(MAX_ADAPTATION_FIELD_LEN.min(want.max(16)));
+        out.push(0); // adaptation_field_length backfilled below.
+        let mut flags = 0u8;
+        if self.discontinuity_indicator {
+            flags |= 0b1000_0000;
+        }
+        if self.random_access_indicator {
+            flags |= 0b0100_0000;
+        }
+        if self.elementary_stream_priority_indicator {
+            flags |= 0b0010_0000;
+        }
+        if self.pcr.is_some() {
+            flags |= 0b0001_0000;
+        }
+        if self.opcr.is_some() {
+            flags |= 0b0000_1000;
+        }
+        if self.splice_countdown.is_some() {
+            flags |= 0b0000_0100;
+        }
+        if self.transport_private_data.is_some() {
+            flags |= 0b0000_0010;
+        }
+        if self.extension.is_some() {
+            flags |= 0b0000_0001;
+        }
+        out.push(flags);
+        if let Some((base, ext)) = self.pcr {
+            out.extend_from_slice(&encode_clock_reference(base, ext));
+        }
+        if let Some((base, ext)) = self.opcr {
+            out.extend_from_slice(&encode_clock_reference(base, ext));
+        }
+        if let Some(countdown) = self.splice_countdown {
+            out.push(countdown as u8);
+        }
+        if let Some(data) = &self.transport_private_data {
+            out.push(data.len() as u8);
+            out.extend_from_slice(data);
+        }
+        if let Some(ext) = &self.extension {
+            // adaptation_field_extension_length counts the bytes after
+            // it: the flags byte + the present sub-fields.
+            let ext_len = 1
+                + if ext.ltw.is_some() { 2 } else { 0 }
+                + if ext.piecewise_rate.is_some() { 3 } else { 0 }
+                + if ext.seamless_splice.is_some() { 5 } else { 0 };
+            out.push(ext_len as u8);
+            let mut ext_flags = 0b0001_1111u8; // reserved bits all 1.
+            if ext.ltw.is_some() {
+                ext_flags |= 0b1000_0000;
+            }
+            if ext.piecewise_rate.is_some() {
+                ext_flags |= 0b0100_0000;
+            }
+            if ext.seamless_splice.is_some() {
+                ext_flags |= 0b0010_0000;
+            }
+            out.push(ext_flags);
+            if let Some((valid, offset)) = ext.ltw {
+                let hi = (if valid { 0b1000_0000 } else { 0 }) | ((offset >> 8) as u8 & 0x7F);
+                out.push(hi);
+                out.push(offset as u8);
+            }
+            if let Some(rate) = ext.piecewise_rate {
+                // 2 reserved bits (set to 1) + 22-bit rate.
+                out.push(0b1100_0000 | ((rate >> 16) as u8 & 0x3F));
+                out.push((rate >> 8) as u8);
+                out.push(rate as u8);
+            }
+            if let Some((splice_type, dts)) = ext.seamless_splice {
+                // splice_type(4) | DTS[32..30](3) | marker(1)
+                // DTS[29..22](8)
+                // DTS[21..15](7) | marker(1)
+                // DTS[14..7](8)
+                // DTS[6..0](7) | marker(1)
+                out.push((splice_type << 4) | (((dts >> 30) as u8 & 0b111) << 1) | 1);
+                out.push((dts >> 22) as u8);
+                out.push((((dts >> 15) as u8 & 0x7F) << 1) | 1);
+                out.push((dts >> 7) as u8);
+                out.push(((dts as u8 & 0x7F) << 1) | 1);
+            }
+        }
+        if out.len() > MAX_ADAPTATION_FIELD_LEN {
+            return Err(TsError::InvalidField {
+                what: "adaptation field content exceeds 184 bytes",
+            });
+        }
+        if out.len() < want {
+            out.resize(want, 0xFF); // stuffing_byte run (§2.4.3.5).
+        }
+        out[0] = (out.len() - 1) as u8;
+        Ok(out)
+    }
+}
+
 /// Iterator over a contiguous sequence of 188-byte TS packets.
 #[derive(Debug)]
 pub struct TsPacketIter<'a> {
@@ -886,6 +1197,267 @@ mod tests {
         assert_eq!(ext.length, 3);
         assert_eq!(ext.ltw_valid_flag, Some(false));
         assert_eq!(ext.ltw_offset, Some(0));
+    }
+
+    /// Wrap encoded AF bytes into a full TS packet (AF + payload) and
+    /// parse it back.
+    fn parse_encoded_af(af_bytes: &[u8]) -> Vec<u8> {
+        let header = [0x47, 0x01, 0x00, 0b0011_0000];
+        let mut tail = Vec::new();
+        tail.extend_from_slice(af_bytes);
+        make_packet(header, &tail)
+    }
+
+    #[test]
+    fn af_spec_empty_encodes_single_stuffing_byte() {
+        let spec = AdaptationFieldSpec::default();
+        let bytes = spec.encode(None).unwrap();
+        assert_eq!(bytes, vec![0]);
+        let pkt_bytes = parse_encoded_af(&bytes);
+        let pkt = TsPacket::parse(&pkt_bytes).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert_eq!(af.length, 0);
+        assert!(!af.pcr_flag);
+    }
+
+    #[test]
+    fn af_spec_empty_with_padding_round_trips() {
+        let spec = AdaptationFieldSpec::default();
+        let bytes = spec.encode(Some(10)).unwrap();
+        assert_eq!(bytes.len(), 10);
+        assert_eq!(bytes[0], 9); // adaptation_field_length
+        assert_eq!(bytes[1], 0); // no flags
+        assert!(bytes[2..].iter().all(|&b| b == 0xFF));
+        let pkt = parse_encoded_af(&bytes);
+        let pkt = TsPacket::parse(&pkt).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert_eq!(af.length, 9);
+        assert!(!af.random_access_indicator);
+    }
+
+    #[test]
+    fn af_spec_full_house_round_trips() {
+        let spec = AdaptationFieldSpec {
+            discontinuity_indicator: true,
+            random_access_indicator: true,
+            elementary_stream_priority_indicator: true,
+            pcr: Some((0x1_2345_6789, 0x0AB)),
+            opcr: Some((0x0_00AB_CDEF, 0x1FF)),
+            splice_countdown: Some(-7),
+            transport_private_data: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            extension: Some(AdaptationFieldExtensionSpec {
+                ltw: Some((true, 0x1234)),
+                piecewise_rate: Some(0x2A_3B4C),
+                seamless_splice: Some((5, 0x1_2345_6789)),
+            }),
+        };
+        let bytes = spec.encode(None).unwrap();
+        let pkt = parse_encoded_af(&bytes);
+        let pkt = TsPacket::parse(&pkt).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert!(af.discontinuity_indicator);
+        assert!(af.random_access_indicator);
+        assert!(af.elementary_stream_priority_indicator);
+        assert_eq!(af.pcr_base, Some(0x1_2345_6789));
+        assert_eq!(af.pcr_extension, Some(0x0AB));
+        assert_eq!(af.opcr_base, Some(0x0_00AB_CDEF));
+        assert_eq!(af.opcr_extension, Some(0x1FF));
+        assert_eq!(af.splice_countdown, Some(-7));
+        assert_eq!(
+            af.transport_private_data,
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
+        );
+        let ext = af.adaptation_field_extension.expect("ext");
+        assert_eq!(ext.ltw_valid_flag, Some(true));
+        assert_eq!(ext.ltw_offset, Some(0x1234));
+        assert_eq!(ext.piecewise_rate, Some(0x2A_3B4C));
+        assert_eq!(ext.splice_type, Some(5));
+        assert_eq!(ext.dts_next_au, Some(0x1_2345_6789));
+    }
+
+    #[test]
+    fn af_spec_padding_lands_after_fields() {
+        let spec = AdaptationFieldSpec::with_pcr(1234, 0);
+        // Content is 8 bytes (len + flags + 6 PCR); pad to 20.
+        let bytes = spec.encode(Some(20)).unwrap();
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes[0], 19);
+        assert!(bytes[8..].iter().all(|&b| b == 0xFF));
+        let pkt = parse_encoded_af(&bytes);
+        let pkt = TsPacket::parse(&pkt).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert_eq!(af.pcr_base, Some(1234));
+        assert_eq!(af.pcr_extension, Some(0));
+    }
+
+    #[test]
+    fn af_spec_empty_extension_round_trips() {
+        // A Some(extension) with no sub-fields is still emitted (and
+        // legal): ext_len = 1 (just the flags byte).
+        let spec = AdaptationFieldSpec {
+            extension: Some(AdaptationFieldExtensionSpec::default()),
+            ..Default::default()
+        };
+        let bytes = spec.encode(None).unwrap();
+        let pkt = parse_encoded_af(&bytes);
+        let pkt = TsPacket::parse(&pkt).unwrap();
+        let ext = pkt
+            .adaptation_field
+            .unwrap()
+            .adaptation_field_extension
+            .expect("ext");
+        assert!(!ext.ltw_flag);
+        assert!(!ext.piecewise_rate_flag);
+        assert!(!ext.seamless_splice_flag);
+    }
+
+    #[test]
+    fn af_spec_rejects_forbidden_combinations() {
+        // OPCR without PCR (§2.4.3.5).
+        let spec = AdaptationFieldSpec {
+            opcr: Some((1, 0)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            spec.encode(None),
+            Err(TsError::InvalidField { .. })
+        ));
+
+        // seamless_splice without splice_countdown (§2.4.3.5:
+        // seamless_splice_flag requires splicing_point_flag).
+        let spec = AdaptationFieldSpec {
+            extension: Some(AdaptationFieldExtensionSpec {
+                seamless_splice: Some((0, 42)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            spec.encode(None),
+            Err(TsError::InvalidField { .. })
+        ));
+    }
+
+    #[test]
+    fn af_spec_rejects_out_of_range_values() {
+        for spec in [
+            AdaptationFieldSpec::with_pcr(1 << 33, 0),
+            AdaptationFieldSpec::with_pcr(0, 512),
+            AdaptationFieldSpec {
+                pcr: Some((0, 0)),
+                opcr: Some((1 << 33, 0)),
+                ..Default::default()
+            },
+            AdaptationFieldSpec {
+                extension: Some(AdaptationFieldExtensionSpec {
+                    ltw: Some((true, 0x8000)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AdaptationFieldSpec {
+                extension: Some(AdaptationFieldExtensionSpec {
+                    piecewise_rate: Some(0x40_0000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AdaptationFieldSpec {
+                splice_countdown: Some(1),
+                extension: Some(AdaptationFieldExtensionSpec {
+                    seamless_splice: Some((16, 0)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AdaptationFieldSpec {
+                splice_countdown: Some(1),
+                extension: Some(AdaptationFieldExtensionSpec {
+                    seamless_splice: Some((0, 1 << 33)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                matches!(spec.encode(None), Err(TsError::InvalidField { .. })),
+                "spec should be rejected: {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn af_spec_rejects_oversize() {
+        // 200 bytes of private data exceeds even the 255-byte length
+        // prefix's reach inside a 184-byte AF.
+        let spec = AdaptationFieldSpec {
+            transport_private_data: Some(vec![0xAA; 200]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            spec.encode(None),
+            Err(TsError::InvalidField { .. })
+        ));
+        // Padding request beyond the AF ceiling.
+        let spec = AdaptationFieldSpec::default();
+        assert!(matches!(
+            spec.encode(Some(185)),
+            Err(TsError::InvalidField { .. })
+        ));
+        // 256-byte private data overflows the u8 length prefix.
+        let spec = AdaptationFieldSpec {
+            transport_private_data: Some(vec![0xAA; 256]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            spec.encode(None),
+            Err(TsError::InvalidField { .. })
+        ));
+    }
+
+    #[test]
+    fn af_spec_max_size_content_accepted() {
+        // Largest legal AF: flags + private data filling the rest.
+        // len(1) + flags(1) + priv_len(1) + N = 184 → N = 181.
+        let spec = AdaptationFieldSpec {
+            transport_private_data: Some(vec![0x55; 181]),
+            ..Default::default()
+        };
+        let bytes = spec.encode(None).unwrap();
+        assert_eq!(bytes.len(), MAX_ADAPTATION_FIELD_LEN);
+        assert_eq!(bytes[0], 183);
+        let pkt = parse_encoded_af(&bytes);
+        let pkt = TsPacket::parse(&pkt).unwrap();
+        let af = pkt.adaptation_field.expect("af");
+        assert_eq!(af.transport_private_data.map(|d| d.len()), Some(181));
+        assert!(pkt.payload.is_empty() || pkt.payload.iter().all(|&b| b == 0xFF));
+        // One more byte must be rejected.
+        let spec = AdaptationFieldSpec {
+            transport_private_data: Some(vec![0x55; 182]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            spec.encode(None),
+            Err(TsError::InvalidField { .. })
+        ));
+    }
+
+    #[test]
+    fn public_clock_reference_encoder_matches_test_helper() {
+        // The test module keeps its own independent derivation of
+        // §2.4.3.4 Table 2-6 (`encode_clock_reference` above, used by
+        // the parser tests); cross-check the public helper against it.
+        for (base, ext) in [
+            (0u64, 0u16),
+            (1, 511),
+            (0x1_FFFF_FFFF, 0x1FF),
+            (0x0_DEAD_BEEF, 0x123),
+        ] {
+            assert_eq!(
+                super::encode_clock_reference(base, ext),
+                encode_clock_reference(base, ext)
+            );
+        }
     }
 
     #[test]

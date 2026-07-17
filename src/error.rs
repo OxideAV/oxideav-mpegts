@@ -31,4 +31,9 @@ pub enum TsError {
     /// (e.g. a TS_program_map_section variant we haven't wired).
     #[error("{0}")]
     Unsupported(&'static str),
+    /// A write-side builder was handed a value that overflows its
+    /// spec-fixed field width, or a field combination §2.4.3.5
+    /// forbids (e.g. OPCR without PCR).
+    #[error("invalid field: {what}")]
+    InvalidField { what: &'static str },
 }
