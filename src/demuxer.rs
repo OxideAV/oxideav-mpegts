@@ -131,6 +131,35 @@ pub struct MpegTsDemuxer {
     /// Tail-anchor PCR and its byte offset; the upper bracket of the
     /// seek search.
     last_pcr: Option<(Pcr, u64)>,
+    /// Random-access index built lazily by
+    /// [`Self::random_access_points`] from the §2.4.3.5
+    /// `random_access_indicator` packets on the tracked PIDs. `None`
+    /// until the first index request.
+    rap_index: Option<Vec<RandomAccessPoint>>,
+}
+
+/// One random-access point discovered by scanning the stream for TS
+/// packets whose adaptation field sets the `random_access_indicator`
+/// (§2.4.3.5) on one of the selected program's elementary PIDs. The
+/// indicator announces that the next PES packet to start on the PID
+/// begins at an elementary-stream access point (a video sequence
+/// header / audio frame boundary), making the flagged packet a legal
+/// re-entry point for decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RandomAccessPoint {
+    /// Byte offset of the TS packet that carried the indicator
+    /// (packet-aligned; a demuxer repositioned here picks the access
+    /// point up as its first PES on the PID).
+    pub byte_offset: u64,
+    /// PID the indicator rode on.
+    pub pid: u16,
+    /// `StreamInfo.index` of the elementary stream on that PID.
+    pub stream_index: u32,
+    /// PTS (raw 33-bit, 90 kHz) of the announced PES packet — §2.4.3.5
+    /// requires one to be present. `None` when the PES start could not
+    /// be located or carried no decodable timestamp (a conformance
+    /// violation this index tolerates).
+    pub pts_90k: Option<u64>,
 }
 
 impl std::fmt::Debug for MpegTsDemuxer {
@@ -345,6 +374,7 @@ impl MpegTsDemuxer {
             duration_micros: None,
             first_pcr: None,
             last_pcr: None,
+            rap_index: None,
         };
 
         // Probe the container duration from the PCR span (§2.4.2.2).
@@ -531,6 +561,149 @@ impl MpegTsDemuxer {
         }
         self.reposition(best.0);
         Ok(best.1)
+    }
+
+    /// The stream's random-access index, built on first call by a
+    /// single forward scan for `random_access_indicator` packets
+    /// (§2.4.3.5) on the selected program's elementary PIDs.
+    ///
+    /// Each [`RandomAccessPoint`] records the flagged packet's byte
+    /// offset, PID / stream index, and the PTS of the PES packet the
+    /// indicator announces ("the next PES packet to start in the
+    /// payload of Transport Stream packets with the current PID") —
+    /// resolved in the same pass, so an indicator riding a
+    /// payload-less carrier packet still gets the following PES
+    /// start's timestamp. The scan reads the whole stream once and
+    /// restores the demux cursor; the index is cached for reuse.
+    /// Streams that never set the indicator yield an empty index.
+    ///
+    /// Returns an error only when the source cannot be walked (not
+    /// seekable / short read at a packet boundary).
+    pub fn random_access_points(&mut self) -> CoreResult<&[RandomAccessPoint]> {
+        if self.rap_index.is_none() {
+            let index = self.scan_random_access_points()?;
+            self.rap_index = Some(index);
+        }
+        Ok(self.rap_index.as_deref().unwrap_or(&[]))
+    }
+
+    /// One-pass builder for [`Self::random_access_points`].
+    fn scan_random_access_points(&mut self) -> CoreResult<Vec<RandomAccessPoint>> {
+        use std::io::SeekFrom;
+        // Remember the exact streaming cursor; the scan is an
+        // out-of-band probe.
+        let resume = {
+            use std::io::Seek;
+            self.input.stream_position().map_err(CoreError::Io)?
+        };
+        let len = self.input.seek(SeekFrom::End(0)).map_err(CoreError::Io)?;
+        let aligned_len = (len / TS_PACKET_LEN as u64) * TS_PACKET_LEN as u64;
+        self.input.seek(SeekFrom::Start(0)).map_err(CoreError::Io)?;
+
+        let mut out: Vec<RandomAccessPoint> = Vec::new();
+        // Indices into `out` of RAPs on a PID whose announced PES
+        // start (the next PUSI=1 packet on that PID) hasn't been seen
+        // yet.
+        let mut unresolved: HashMap<u16, Vec<usize>> = HashMap::new();
+        let mut buf = [0u8; TS_PACKET_LEN];
+        let mut off = 0u64;
+        while off + TS_PACKET_LEN as u64 <= aligned_len {
+            if read_exact_packet(&mut self.input, &mut buf).is_err() {
+                break;
+            }
+            // A stray mid-stream corruption shouldn't abort the index;
+            // skip unparseable packets (the streaming path has its own
+            // resync story).
+            if let Ok(pkt) = TsPacket::parse(&buf) {
+                if let Some(&stream_index) = self.pid_to_stream.get(&pkt.pid) {
+                    let rai = pkt
+                        .adaptation_field
+                        .as_ref()
+                        .is_some_and(|af| af.random_access_indicator);
+                    if rai {
+                        unresolved.entry(pkt.pid).or_default().push(out.len());
+                        out.push(RandomAccessPoint {
+                            byte_offset: off,
+                            pid: pkt.pid,
+                            stream_index,
+                            pts_90k: None,
+                        });
+                    }
+                    if pkt.payload_unit_start {
+                        if let Some(pending) = unresolved.remove(&pkt.pid) {
+                            // This PES start is the one the pending
+                            // indicator(s) announced; lift its PTS.
+                            let pts = PesPacket::parse(pkt.payload).ok().and_then(|p| p.pts_90k);
+                            for i in pending {
+                                out[i].pts_90k = pts;
+                            }
+                        }
+                    }
+                }
+            }
+            off += TS_PACKET_LEN as u64;
+        }
+        self.input
+            .seek(SeekFrom::Start(resume))
+            .map_err(CoreError::Io)?;
+        Ok(out)
+    }
+
+    /// Seek to the last random-access point at or before `target_90k`
+    /// (a PTS in the stream's 90 kHz time base), so the next demuxed
+    /// PES on the point's PID is a keyframe / elementary-stream access
+    /// point (§2.4.3.5). This is the keyframe-accurate companion to
+    /// the PCR-granular [`oxideav_core::Demuxer::seek_to`]: where the
+    /// PCR search lands on clock samples and relies on the caller to
+    /// decode forward, this lands decoding directly on an access
+    /// point.
+    ///
+    /// `stream_index` restricts the candidate points to one elementary
+    /// stream — typically the video track, whose keyframes gate the
+    /// whole program's decodability; `None` considers every indexed
+    /// point.
+    ///
+    /// Builds (and caches) the [`Self::random_access_points`] index on
+    /// first use — one full forward scan. A target before the first
+    /// indexed point clamps to that first point. Returns the landed
+    /// point's PTS.
+    ///
+    /// Errors with `Unsupported` when the stream carries no matching
+    /// `random_access_indicator` with a resolvable PTS — the caller
+    /// falls back to the PCR-based `seek_to`.
+    pub fn seek_to_random_access(
+        &mut self,
+        stream_index: Option<u32>,
+        target_90k: i64,
+    ) -> CoreResult<i64> {
+        self.random_access_points()?;
+        let index = self.rap_index.as_deref().unwrap_or(&[]);
+        // Last point with a known PTS at or before the target; else
+        // the first known-PTS point (clamp-up for early targets).
+        let mut best: Option<(u64, u64)> = None; // (byte_offset, pts)
+        let mut first: Option<(u64, u64)> = None;
+        for rap in index {
+            if stream_index.is_some_and(|want| rap.stream_index != want) {
+                continue;
+            }
+            let pts = match rap.pts_90k {
+                Some(p) => p,
+                None => continue,
+            };
+            if first.is_none() {
+                first = Some((rap.byte_offset, pts));
+            }
+            if pts as i64 <= target_90k {
+                best = Some((rap.byte_offset, pts));
+            }
+        }
+        let (offset, pts) = best.or(first).ok_or_else(|| {
+            CoreError::unsupported(
+                "mpegts: stream carries no random_access_indicator with a PTS to seek against",
+            )
+        })?;
+        self.reposition(offset);
+        Ok(pts as i64)
     }
 
     /// Re-home the streaming state at byte `offset` (packet-aligned):

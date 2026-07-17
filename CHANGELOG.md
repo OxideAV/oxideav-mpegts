@@ -11,6 +11,21 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Random-access index + keyframe-accurate seek.**
+  `MpegTsDemuxer::random_access_points()` builds (once, in a single
+  forward pass with the demux cursor restored) a typed index of every
+  §2.4.3.5 `random_access_indicator` packet on the selected program's
+  elementary PIDs — byte offset, PID, stream index, and the PTS of the
+  announced PES packet, resolved per the "next PES packet to start"
+  rule so indicators riding payload-less carrier packets still get the
+  following PES start's timestamp. `seek_to_random_access(stream_index,
+  target_90k)` then lands the demuxer on the last access point at or
+  before the target (optionally restricted to one stream — typically
+  the video track), so the next demuxed PES is a keyframe; it is the
+  keyframe-accurate companion to the PCR-granular `seek_to`, and
+  reports `Unsupported` for indicator-less streams so callers can fall
+  back.
+
 - **Keyframe ↔ `random_access_indicator` round trip.** The muxer sets
   the §2.4.3.5 `random_access_indicator` on the first TS packet of a
   keyframe-flagged `Packet`'s PES envelope (on the PCR PID only when

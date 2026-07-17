@@ -1913,6 +1913,115 @@ mod tests {
         assert_eq!(flags_by_pts.get(&13_600), Some(&false));
     }
 
+    /// Mux a GOP-shaped video+audio stream (keyframe every 4th video
+    /// packet) and drive the demuxer's random-access index + keyframe
+    /// seek over it.
+    #[test]
+    fn random_access_index_and_keyframe_seek() {
+        use oxideav_core::Demuxer as _;
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let sink = SharedSink::new();
+        let tb = TimeBase::new(1, 90_000);
+        let mut keyframe_pts: Vec<i64> = Vec::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            for i in 0..40i64 {
+                let pts = 10_000 + i * 3_000; // ~30 fps steps
+                let kf = i % 4 == 0;
+                if kf {
+                    keyframe_pts.push(pts);
+                }
+                let v = Packet::new(0, tb, vec![(i & 0xFF) as u8; 300])
+                    .with_pts(pts)
+                    .with_keyframe(kf);
+                mx.write_packet(&v).unwrap();
+                let a = Packet::new(1, tb, vec![0x55; 64])
+                    .with_pts(pts + 500)
+                    .with_keyframe(true);
+                mx.write_packet(&a).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = crate::demuxer::MpegTsDemuxer::open_program(input, 1).expect("open demuxer");
+
+        // Index: every muxed keyframe appears, with the right PTS.
+        let video_idx = dmx
+            .streams()
+            .iter()
+            .position(|s| s.params.codec_id.as_str() == "h264")
+            .unwrap() as u32;
+        let raps: Vec<crate::demuxer::RandomAccessPoint> =
+            dmx.random_access_points().expect("index").to_vec();
+        let video_rap_pts: Vec<i64> = raps
+            .iter()
+            .filter(|r| r.stream_index == video_idx)
+            .map(|r| r.pts_90k.expect("§2.4.3.5 requires a PTS") as i64)
+            .collect();
+        assert_eq!(video_rap_pts, keyframe_pts);
+        // Audio keyframes are indexed too (every audio packet here).
+        assert_eq!(raps.len(), 10 + 40);
+
+        // Keyframe seek: target between keyframes → lands on the one
+        // at or before it, and the next video packet demuxed IS that
+        // keyframe.
+        let target = keyframe_pts[5] + 4_000; // past kf[5], before kf[6]
+        let landed = dmx
+            .seek_to_random_access(Some(video_idx), target)
+            .expect("seek");
+        assert_eq!(landed, keyframe_pts[5]);
+        loop {
+            let p = dmx.next_packet().expect("packet after seek");
+            if p.stream_index == video_idx {
+                assert_eq!(p.pts, Some(keyframe_pts[5]));
+                assert!(p.is_keyframe(), "seek landed on a random-access point");
+                break;
+            }
+        }
+
+        // Early target clamps up to the first indexed point (the
+        // first muxed keyframe — video, PTS 10_000).
+        let landed = dmx.seek_to_random_access(None, 0).expect("seek to start");
+        assert_eq!(landed, keyframe_pts[0]);
+        // Late target lands on the last indexed point with PTS ≤
+        // target (the final audio packet at +500).
+        let landed = dmx
+            .seek_to_random_access(None, i64::MAX)
+            .expect("seek to end");
+        assert_eq!(landed, 10_000 + 39 * 3_000 + 500);
+    }
+
+    /// A stream that never sets the random_access_indicator yields an
+    /// empty index and an `Unsupported` keyframe seek.
+    #[test]
+    fn keyframe_seek_unsupported_without_rai() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        let tb = TimeBase::new(1, 90_000);
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            for i in 0..8i64 {
+                let v = Packet::new(0, tb, vec![0xAA; 100]).with_pts(1_000 + i * 3_000);
+                mx.write_packet(&v).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = crate::demuxer::MpegTsDemuxer::open_program(input, 1).expect("open demuxer");
+        assert!(dmx.random_access_points().expect("index").is_empty());
+        assert!(matches!(
+            dmx.seek_to_random_access(None, 5_000),
+            Err(CoreError::Unsupported(_))
+        ));
+    }
+
     /// The clock-reference encoder the mux path relies on must
     /// round-trip through the demuxer-side adaptation field PCR
     /// decode. Pin the exact bit layout (§2.4.3.4 Table 2-6).

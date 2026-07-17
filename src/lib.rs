@@ -160,7 +160,9 @@ pub use psi::{
 pub use stream_type::StreamType;
 
 #[cfg(feature = "registry")]
-pub use demuxer::{open as open_demuxer, probe as probe_mpegts, MpegTsDemuxer, TsProgram};
+pub use demuxer::{
+    open as open_demuxer, probe as probe_mpegts, MpegTsDemuxer, RandomAccessPoint, TsProgram,
+};
 
 #[cfg(feature = "registry")]
 pub use muxer::{open as open_muxer, MpegTsMuxer};
