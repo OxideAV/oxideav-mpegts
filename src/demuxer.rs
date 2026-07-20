@@ -143,28 +143,55 @@ pub struct MpegTsDemuxer {
     layout: crate::packet::TsPacketLayout,
 }
 
-/// One random-access point discovered by scanning the stream for TS
-/// packets whose adaptation field sets the `random_access_indicator`
-/// (§2.4.3.5) on one of the selected program's elementary PIDs. The
-/// indicator announces that the next PES packet to start on the PID
-/// begins at an elementary-stream access point (a video sequence
-/// header / audio frame boundary), making the flagged packet a legal
-/// re-entry point for decoding.
+/// How an access point announced itself on the wire — the two
+/// container-level signals ISO/IEC 13818-1 offers, in decreasing
+/// strength.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AccessPointKind {
+    /// Adaptation-field `random_access_indicator` (§2.4.3.5): the next
+    /// PES packet to start on the PID contains the first byte of a
+    /// video sequence header (stream types 1/2) or an audio frame
+    /// (types 3/4), with a presentation timestamp present — the
+    /// container's full random-access guarantee.
+    RandomAccessIndicator,
+    /// PES `data_alignment_indicator` (§2.4.3.7) on a PES start whose
+    /// packet carried no random-access indicator: the payload begins
+    /// at the alignment the `data_stream_alignment_descriptor`
+    /// (§2.6.10) names, or — absent the descriptor — at a slice /
+    /// video access unit or audio sync word (alignment_type '01',
+    /// Tables 2-47/2-48). A decodable *parse* point; for video it does
+    /// **not** promise an intra-coded picture, so it is the fallback
+    /// tier for streams that never set the §2.4.3.5 indicator.
+    DataAligned,
+}
+
+/// One elementary-stream access point discovered by scanning the
+/// stream on the selected program's elementary PIDs — a TS packet
+/// whose adaptation field sets the `random_access_indicator`
+/// (§2.4.3.5), or a data-aligned PES start (§2.4.3.7) on a PID; see
+/// [`AccessPointKind`] for what each tier guarantees. Repositioning a
+/// demuxer at `byte_offset` picks the access point up as its first
+/// PES on the PID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RandomAccessPoint {
-    /// Byte offset of the TS packet that carried the indicator
-    /// (packet-aligned; a demuxer repositioned here picks the access
-    /// point up as its first PES on the PID).
+    /// Byte offset of the TS packet that carried the indicator (for
+    /// [`AccessPointKind::RandomAccessIndicator`]) or the PES-start
+    /// packet (for [`AccessPointKind::DataAligned`]); packet-aligned.
     pub byte_offset: u64,
-    /// PID the indicator rode on.
+    /// PID the access point rode on.
     pub pid: u16,
     /// `StreamInfo.index` of the elementary stream on that PID.
     pub stream_index: u32,
-    /// PTS (raw 33-bit, 90 kHz) of the announced PES packet — §2.4.3.5
-    /// requires one to be present. `None` when the PES start could not
-    /// be located or carried no decodable timestamp (a conformance
+    /// PTS of the announced PES packet on the **extended** 64-bit
+    /// 90 kHz timeline (§2.4.3.7 unwrap — the same axis `next_packet`
+    /// emits and `seek_to` accepts), so index entries stay ordered and
+    /// addressable across a `2^33` wrap. §2.4.3.5 requires a PTS at a
+    /// random-access point; `None` when the PES start could not be
+    /// located or carried no decodable timestamp (a conformance
     /// violation this index tolerates).
     pub pts_90k: Option<u64>,
+    /// Which container signal announced this point.
+    pub kind: AccessPointKind,
 }
 
 impl std::fmt::Debug for MpegTsDemuxer {
@@ -643,19 +670,23 @@ impl MpegTsDemuxer {
         Ok(landed)
     }
 
-    /// The stream's random-access index, built on first call by a
-    /// single forward scan for `random_access_indicator` packets
-    /// (§2.4.3.5) on the selected program's elementary PIDs.
+    /// The stream's access-point index, built on first call by a
+    /// single forward scan of the selected program's elementary PIDs
+    /// for `random_access_indicator` packets (§2.4.3.5) and — the
+    /// fallback tier — data-aligned PES starts (§2.4.3.7).
     ///
-    /// Each [`RandomAccessPoint`] records the flagged packet's byte
-    /// offset, PID / stream index, and the PTS of the PES packet the
-    /// indicator announces ("the next PES packet to start in the
-    /// payload of Transport Stream packets with the current PID") —
-    /// resolved in the same pass, so an indicator riding a
-    /// payload-less carrier packet still gets the following PES
-    /// start's timestamp. The scan reads the whole stream once and
-    /// restores the demux cursor; the index is cached for reuse.
-    /// Streams that never set the indicator yield an empty index.
+    /// Each [`RandomAccessPoint`] records the anchor packet's byte
+    /// offset, PID / stream index, tier ([`AccessPointKind`]), and the
+    /// **extended** PTS of the PES packet the point announces ("the
+    /// next PES packet to start in the payload of Transport Stream
+    /// packets with the current PID") — resolved in the same pass, so
+    /// an indicator riding a payload-less carrier packet still gets
+    /// the following PES start's timestamp. A PES start that resolves
+    /// a pending indicator is recorded once, as the indicator's point,
+    /// not again as a data-aligned one. The scan reads the whole
+    /// stream once and restores the demux cursor; the index is cached
+    /// for reuse. Streams that signal neither tier yield an empty
+    /// index.
     ///
     /// Returns an error only when the source cannot be walked (not
     /// seekable / short read at a packet boundary).
@@ -686,6 +717,12 @@ impl MpegTsDemuxer {
         // start (the next PUSI=1 packet on that PID) hasn't been seen
         // yet.
         let mut unresolved: HashMap<u16, Vec<usize>> = HashMap::new();
+        // Per-PID reference time for the out-of-order-tolerant PTS
+        // unwrap: each PES start's raw 33-bit PTS extends to the epoch
+        // nearest the previous one on the PID (`extend_near`), exactly
+        // tracking the wraps the streaming PtsTracker would count while
+        // shrugging off B-picture reordering.
+        let mut pts_ref: HashMap<u16, u64> = HashMap::new();
         let mut buf = [0u8; MAX_PHYSICAL_PACKET];
         let mut off = 0u64;
         while off + psize <= aligned_len {
@@ -708,16 +745,36 @@ impl MpegTsDemuxer {
                             pid: pkt.pid,
                             stream_index,
                             pts_90k: None,
+                            kind: AccessPointKind::RandomAccessIndicator,
                         });
                     }
                     if pkt.payload_unit_start {
+                        let pes = PesPacket::parse(pkt.payload).ok();
+                        let pts = pes.as_ref().and_then(|p| p.pts_90k).map(|raw| {
+                            let ext = match pts_ref.get(&pkt.pid) {
+                                Some(&r) => crate::clock::extend_near(raw, r),
+                                None => raw,
+                            };
+                            pts_ref.insert(pkt.pid, ext);
+                            ext
+                        });
                         if let Some(pending) = unresolved.remove(&pkt.pid) {
                             // This PES start is the one the pending
                             // indicator(s) announced; lift its PTS.
-                            let pts = PesPacket::parse(pkt.payload).ok().and_then(|p| p.pts_90k);
                             for i in pending {
                                 out[i].pts_90k = pts;
                             }
+                        } else if pes.is_some_and(|p| p.data_alignment_indicator) && pts.is_some() {
+                            // No indicator announced this PES, but its
+                            // payload starts data-aligned (§2.4.3.7) —
+                            // the fallback access-point tier.
+                            out.push(RandomAccessPoint {
+                                byte_offset: off,
+                                pid: pkt.pid,
+                                stream_index,
+                                pts_90k: pts,
+                                kind: AccessPointKind::DataAligned,
+                            });
                         }
                     }
                 }
@@ -745,9 +802,12 @@ impl MpegTsDemuxer {
     /// point.
     ///
     /// Builds (and caches) the [`Self::random_access_points`] index on
-    /// first use — one full forward scan. A target before the first
-    /// indexed point clamps to that first point. Returns the landed
-    /// point's PTS.
+    /// first use — one full forward scan. Only
+    /// [`AccessPointKind::RandomAccessIndicator`] points qualify (this
+    /// surface is the full §2.4.3.5 guarantee; the tiered fallback is
+    /// [`Self::seek_to_access_point`]). A target before the first
+    /// indexed point clamps to that first point. `target_90k` and the
+    /// returned landing are on the **extended** 90 kHz timeline.
     ///
     /// Errors with `Unsupported` when the stream carries no matching
     /// `random_access_indicator` with a resolvable PTS — the caller
@@ -764,6 +824,11 @@ impl MpegTsDemuxer {
         let mut best: Option<(u64, u64)> = None; // (byte_offset, pts)
         let mut first: Option<(u64, u64)> = None;
         for rap in index {
+            // This surface is the §2.4.3.5 guarantee only; the tiered
+            // fallback lives in `seek_to_access_point`.
+            if rap.kind != AccessPointKind::RandomAccessIndicator {
+                continue;
+            }
             if stream_index.is_some_and(|want| rap.stream_index != want) {
                 continue;
             }
@@ -783,6 +848,231 @@ impl MpegTsDemuxer {
                 "mpegts: stream carries no random_access_indicator with a PTS to seek against",
             )
         })?;
+        self.reposition(offset, Some(pts as i64));
+        Ok(pts as i64)
+    }
+
+    /// Keyframe-aware seek — the [`oxideav_core::Demuxer::seek_to`]
+    /// contract ("nearest keyframe at or before `pts`") realised over
+    /// the two container-level access-point signals, without paying a
+    /// full-stream scan on well-behaved inputs.
+    ///
+    /// Strategy, in order:
+    /// 1. **PCR bisection + windowed scan.** Locate the last PCR at or
+    ///    before the target ([`Self::locate_pcr_at_or_before`]) and
+    ///    walk forward from it collecting access points on the
+    ///    stream's PID — `random_access_indicator` announcements
+    ///    (§2.4.3.5, preferred) and data-aligned PES starts (§2.4.3.7,
+    ///    fallback; see [`AccessPointKind`]) — until the PES timeline
+    ///    passes the target. If the window holds no point at or before
+    ///    the target (the keyframe interval outruns the ≤100 ms
+    ///    §2.7.2 PCR spacing), re-bisect progressively further back
+    ///    (1 s, 2 s, 4 s, …) until one is found or the stream head is
+    ///    reached.
+    /// 2. **Cached full index.** PCR-less streams — or targets with no
+    ///    access point anywhere at or before them — fall back to the
+    ///    [`Self::random_access_points`] index, which also handles the
+    ///    clamp-up to the first point of an early target.
+    ///
+    /// The landing repositions the demux state at the access point's
+    /// anchor packet (for an indicator point, the flagged packet — so
+    /// the reassembler re-derives the keyframe flag on the emitted
+    /// [`Packet`]) and re-seeds the timestamp trackers there. Returns
+    /// the landed access point's **extended** PTS.
+    ///
+    /// Errors with `Unsupported` when the stream signals no access
+    /// points for the stream at all — the caller degrades to the
+    /// PCR-granular [`Self::seek_by_pcr`] landing.
+    pub fn seek_to_access_point(&mut self, stream_index: u32, target_90k: i64) -> CoreResult<i64> {
+        let pid = self
+            .pid_to_stream
+            .iter()
+            .find_map(|(&pid, &idx)| (idx == stream_index).then_some(pid))
+            .ok_or_else(|| {
+                CoreError::invalid(format!("mpegts: no stream with index {stream_index}"))
+            })?;
+
+        // Once the full index exists it is definitive AND cheap —
+        // prefer it over re-scanning windows on every subsequent seek.
+        if self.rap_index.is_some() || self.first_pcr.is_none() || self.last_pcr.is_none() {
+            return self.seek_via_index(stream_index, target_90k);
+        }
+
+        let first_off = self.first_pcr.map(|(_, off)| off).unwrap_or(0);
+        // Backoff loop: each round bisects to an earlier landing and
+        // rescans forward to the target. `back` doubles per round, so
+        // a keyframe K seconds before the target is found after
+        // O(log K) bisections of O(K) window bytes.
+        let mut probe_target = target_90k;
+        let mut back: i64 = 90_000; // 1 s
+        loop {
+            let (from_off, from_time) = self.locate_pcr_at_or_before(probe_target)?;
+            let (best_rai, best_dai) =
+                self.scan_access_points_window(pid, from_off, from_time, target_90k)?;
+            if let Some((off, pts)) = best_rai {
+                self.reposition(off, Some(pts));
+                return Ok(pts);
+            }
+            if let Some((off, pts)) = best_dai {
+                // Only the weak tier in the window. The §2.4.3.5
+                // indicator is a per-stream mux property — if this PID
+                // uses it anywhere, an indicator keyframe further back
+                // must win over a nearby aligned-but-maybe-predicted
+                // PES. That is a stream-global question, so answer it
+                // with the (cached, one full scan) index.
+                self.random_access_points()?;
+                let pid_uses_rai = self
+                    .rap_index
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|r| r.pid == pid && r.kind == AccessPointKind::RandomAccessIndicator);
+                if pid_uses_rai {
+                    return self.seek_via_index(stream_index, target_90k);
+                }
+                self.reposition(off, Some(pts));
+                return Ok(pts);
+            }
+            if from_off <= first_off {
+                // Window already started at the stream head — nothing
+                // at or before the target exists.
+                break;
+            }
+            probe_target = from_time.saturating_sub(back);
+            back = back.saturating_mul(2);
+        }
+
+        // No access point at or before the target anywhere: the full
+        // index decides (clamping up to the first point when the
+        // target precedes them all).
+        self.seek_via_index(stream_index, target_90k)
+    }
+
+    /// Scan forward from packet-aligned `from_off` (whose extended
+    /// stream time is `from_time`) collecting access points on `pid`;
+    /// return the last candidate at or before `target_90k` per tier as
+    /// `(indicator_announced, data_aligned)`, each an
+    /// `(anchor_byte_offset, extended_pts)` pair. The caller owns the
+    /// tier arbitration.
+    ///
+    /// The scan stops once a PES start's extended PTS passes the
+    /// target by a reorder-grace second (B-picture presentation times
+    /// legitimately step backward around a keyframe, so the first
+    /// PTS > target is not proof that none ≤ target follows) or the
+    /// stream ends. The input cursor is left wherever the scan
+    /// stopped; callers reposition afterwards.
+    #[allow(clippy::type_complexity)]
+    fn scan_access_points_window(
+        &mut self,
+        pid: u16,
+        from_off: u64,
+        from_time: i64,
+        target_90k: i64,
+    ) -> CoreResult<(Option<(u64, i64)>, Option<(u64, i64)>)> {
+        /// Keep scanning until the PID's PES timeline is this far past
+        /// the seek target — one second covers any realistic
+        /// B-picture reorder window.
+        const REORDER_GRACE_90K: i64 = 90_000;
+
+        let psize = self.layout.packet_size as u64;
+        self.input
+            .seek(std::io::SeekFrom::Start(from_off))
+            .map_err(CoreError::Io)?;
+
+        let mut best_rai: Option<(u64, i64)> = None;
+        let mut best_dai: Option<(u64, i64)> = None;
+        // Anchor of an unresolved §2.4.3.5 indicator: the flagged
+        // packet's offset, waiting for the next PES start on the PID.
+        let mut pending_rai: Option<u64> = None;
+        // Reference for the epoch-nearest PTS unwrap, advanced to each
+        // resolved PES time; seeded by the PCR landing time.
+        let mut pts_ref = from_time.max(0) as u64;
+
+        let mut off = from_off;
+        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
+        loop {
+            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
+                break; // end of stream — window exhausted
+            }
+            let pkt_off = off;
+            off += psize;
+            let Ok(pkt) = TsPacket::parse(self.layout.window(&buf)) else {
+                continue; // stray corruption: skip, as the index scan does
+            };
+            if pkt.pid != pid {
+                continue;
+            }
+            let rai = pkt
+                .adaptation_field
+                .as_ref()
+                .is_some_and(|af| af.random_access_indicator);
+            if rai && pending_rai.is_none() {
+                pending_rai = Some(pkt_off);
+            }
+            if !pkt.payload_unit_start {
+                continue;
+            }
+            let pes = match PesPacket::parse(pkt.payload) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let Some(raw_pts) = pes.pts_90k else {
+                pending_rai = None; // consumed by a PTS-less PES start
+                continue;
+            };
+            let ext = crate::clock::extend_near(raw_pts, pts_ref) as i64;
+            pts_ref = ext.max(0) as u64;
+            if let Some(anchor) = pending_rai.take() {
+                if ext <= target_90k {
+                    best_rai = Some((anchor, ext));
+                }
+            } else if pes.data_alignment_indicator && ext <= target_90k {
+                best_dai = Some((pkt_off, ext));
+            }
+            if ext > target_90k.saturating_add(REORDER_GRACE_90K) {
+                break;
+            }
+        }
+        Ok((best_rai, best_dai))
+    }
+
+    /// Index-backed access-point seek: the definitive (whole-stream)
+    /// fallback behind [`Self::seek_to_access_point`]. Uses the cached
+    /// [`Self::random_access_points`] index, preferring
+    /// indicator-announced points over data-aligned ones, the last at
+    /// or before `target_90k` over the clamp-up first.
+    fn seek_via_index(&mut self, stream_index: u32, target_90k: i64) -> CoreResult<i64> {
+        self.random_access_points()?;
+        let index = self.rap_index.as_deref().unwrap_or(&[]);
+        // (byte_offset, pts) per tier: last at-or-before + first seen.
+        let mut best: [Option<(u64, u64)>; 2] = [None, None];
+        let mut first: [Option<(u64, u64)>; 2] = [None, None];
+        for rap in index {
+            if rap.stream_index != stream_index {
+                continue;
+            }
+            let Some(pts) = rap.pts_90k else { continue };
+            let tier = match rap.kind {
+                AccessPointKind::RandomAccessIndicator => 0,
+                AccessPointKind::DataAligned => 1,
+            };
+            if first[tier].is_none() {
+                first[tier] = Some((rap.byte_offset, pts));
+            }
+            if pts as i64 <= target_90k {
+                best[tier] = Some((rap.byte_offset, pts));
+            }
+        }
+        let (offset, pts) = best[0]
+            .or(best[1])
+            .or(first[0])
+            .or(first[1])
+            .ok_or_else(|| {
+                CoreError::unsupported(
+                    "mpegts: stream signals no access point (random_access_indicator or \
+                     data-aligned PES start) with a PTS to seek against",
+                )
+            })?;
         self.reposition(offset, Some(pts as i64));
         Ok(pts as i64)
     }
@@ -987,12 +1277,21 @@ impl Demuxer for MpegTsDemuxer {
         self.duration_micros
     }
 
-    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> CoreResult<i64> {
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> CoreResult<i64> {
         // MPEG-TS time base is 90 kHz for every stream, and PTS / PCR
         // share that base, so the requested `pts` is already in the
-        // units the PCR search compares against — no per-stream
-        // rescale is needed.
-        self.seek_by_pcr(pts)
+        // units the access-point / PCR searches compare against — no
+        // per-stream rescale is needed.
+        //
+        // Keyframe-accurate landing first (the trait contract); a
+        // stream that signals no access points at all degrades to the
+        // PCR-granular landing, which still positions at or before the
+        // target so the caller can decode forward.
+        match self.seek_to_access_point(stream_index, pts) {
+            Ok(landed) => Ok(landed),
+            Err(CoreError::Unsupported(_)) => self.seek_by_pcr(pts),
+            Err(e) => Err(e),
+        }
     }
 
     fn next_packet(&mut self) -> CoreResult<Packet> {
@@ -2286,6 +2585,327 @@ mod tests {
         assert_eq!(landed, (m + 36_000) as i64);
         let pkt = dmx.next_packet().expect("tail PES");
         assert_eq!(pkt.pts, Some((m + 36_000) as i64));
+    }
+
+    /// A TS packet on `pid` carrying a PES payload with full control
+    /// over the adaptation field: optional PCR and/or the §2.4.3.5
+    /// `random_access_indicator`. PUSI is a parameter so indicator
+    /// carrier packets (no PES start) can be built too.
+    fn ts_pes_ex(
+        pid: u16,
+        cc: u8,
+        pusi: bool,
+        pcr: Option<(u64, u16)>,
+        rai: bool,
+        pes: &[u8],
+    ) -> [u8; TS_PACKET_LEN] {
+        let mut pkt = [0xFFu8; TS_PACKET_LEN];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = (if pusi { 0b0100_0000 } else { 0 }) | ((pid >> 8) as u8 & 0x1F);
+        pkt[2] = pid as u8;
+        let mut off = 4;
+        if pcr.is_some() || rai {
+            pkt[3] = 0b0011_0000 | (cc & 0x0F); // AF + payload
+            let af_flags =
+                (if rai { 0b0100_0000 } else { 0 }) | (if pcr.is_some() { 0b0001_0000 } else { 0 });
+            if let Some((base, ext)) = pcr {
+                pkt[4] = 7; // flags(1) + PCR(6)
+                pkt[5] = af_flags;
+                pkt[6..12].copy_from_slice(&encode_pcr(base, ext));
+                off = 12;
+            } else {
+                pkt[4] = 1; // flags only
+                pkt[5] = af_flags;
+                off = 6;
+            }
+        } else {
+            pkt[3] = 0b0001_0000 | (cc & 0x0F); // payload only
+        }
+        let take = (TS_PACKET_LEN - off).min(pes.len());
+        pkt[off..off + take].copy_from_slice(&pes[..take]);
+        for b in &mut pkt[off + take..] {
+            *b = 0xFF;
+        }
+        pkt
+    }
+
+    /// A PES packet body like [`pes_with_pts`] but with the §2.4.3.7
+    /// `data_alignment_indicator` set in flags1.
+    fn pes_with_pts_aligned(pts: u64, payload: &[u8]) -> Vec<u8> {
+        let mut pes = pes_with_pts(pts, payload);
+        pes[6] |= 0b0000_0100;
+        pes
+    }
+
+    /// Single-program AVC stream on PID 0x101 (also the PCR PID):
+    /// `count` PES packets `step` ticks apart starting at `base0`,
+    /// every packet carrying a PCR, with the `random_access_indicator`
+    /// on packets whose index is a multiple of `gop`.
+    fn synth_rai_gop_ts(count: u64, step: u64, base0: u64, gop: u64) -> Vec<u8> {
+        let mut buf = pat_pmt_header();
+        for i in 0..count {
+            let t = base0 + i * step;
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                (i & 0x0F) as u8,
+                true,
+                Some((t, 0)),
+                i % gop == 0,
+                &pes_with_pts(t, b"frame"),
+            ));
+        }
+        buf
+    }
+
+    #[test]
+    fn seek_to_lands_on_random_access_point_before_target() {
+        // 60 frames 3_000 ticks apart, keyframe (RAI) every 10:
+        // keyframe PTS = 0, 30_000, 60_000, 90_000, 120_000, 150_000.
+        let bytes = synth_rai_gop_ts(60, 3_000, 0, 10);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+
+        // Target mid-GOP: frame 47 (141_000) → keyframe at 120_000,
+        // NOT the PCR right before the target (which would be 141_000).
+        let landed = dmx.seek_to(0, 141_000).expect("seek");
+        assert_eq!(landed, 120_000);
+        let pkt = dmx.next_packet().expect("PES after seek");
+        assert_eq!(pkt.pts, Some(120_000));
+        assert!(
+            pkt.flags.keyframe,
+            "landing PES must re-derive the keyframe flag from the indicator"
+        );
+
+        // Exactly on a keyframe stays on it.
+        let landed = dmx.seek_to(0, 90_000).expect("seek exact");
+        assert_eq!(landed, 90_000);
+        assert_eq!(dmx.next_packet().expect("kf").pts, Some(90_000));
+    }
+
+    #[test]
+    fn seek_to_backs_off_across_long_gop() {
+        // 120 frames 3_000 ticks apart; the ONLY keyframes sit at
+        // frame 0 and frame 10 (t = 30_000). A target near the tail
+        // (frame 115, t = 345_000) is ~3.5 s past the last keyframe,
+        // so the first windows (PCR landing, −1 s, −2 s) hold no
+        // access point and the search must widen back to find it.
+        let bytes = synth_rai_gop_ts(120, 3_000, 0, 110);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        let landed = dmx.seek_to(0, 345_000).expect("seek");
+        assert_eq!(landed, 330_000, "keyframes at 0 and 330_000 (110×3_000)");
+        let pkt = dmx.next_packet().expect("PES");
+        assert_eq!(pkt.pts, Some(330_000));
+        assert!(pkt.flags.keyframe);
+    }
+
+    #[test]
+    fn seek_to_clamps_up_to_first_access_point() {
+        // Keyframes only from frame 10 (t = 130_000) on; a target
+        // before every access point clamps UP to the first one.
+        let mut buf = pat_pmt_header();
+        for i in 0..30u64 {
+            let t = 100_000 + i * 3_000;
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                (i & 0x0F) as u8,
+                true,
+                Some((t, 0)),
+                i >= 10 && (i - 10) % 10 == 0,
+                &pes_with_pts(t, b"frame"),
+            ));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        let landed = dmx.seek_to(0, 103_000).expect("seek");
+        assert_eq!(landed, 130_000, "first indicator-announced PES");
+        let pkt = dmx.next_packet().expect("PES");
+        assert_eq!(pkt.pts, Some(130_000));
+        assert!(pkt.flags.keyframe);
+    }
+
+    #[test]
+    fn seek_to_uses_data_alignment_tier_when_no_indicator() {
+        // No random_access_indicator anywhere; every 5th PES sets the
+        // §2.4.3.7 data_alignment_indicator. Aligned PES at t = 0,
+        // 15_000, 30_000, 45_000, …
+        let mut buf = pat_pmt_header();
+        for i in 0..40u64 {
+            let t = i * 3_000;
+            let pes = if i % 5 == 0 {
+                pes_with_pts_aligned(t, b"frame")
+            } else {
+                pes_with_pts(t, b"frame")
+            };
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                (i & 0x0F) as u8,
+                true,
+                Some((t, 0)),
+                false,
+                &pes,
+            ));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        let landed = dmx.seek_to(0, 52_000).expect("seek");
+        assert_eq!(landed, 45_000, "last data-aligned PES at or before 52_000");
+        let pkt = dmx.next_packet().expect("PES");
+        assert_eq!(pkt.pts, Some(45_000));
+        // The §2.4.3.5 keyframe promise was never made — the emitted
+        // packet must NOT claim one.
+        assert!(!pkt.flags.keyframe);
+        // seek_to_random_access, the strict §2.4.3.5 surface, refuses.
+        assert!(matches!(
+            dmx.seek_to_random_access(Some(0), 52_000),
+            Err(CoreError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn seek_to_prefers_indicator_over_data_alignment() {
+        // Every PES is data-aligned; every 10th ALSO carries the
+        // indicator. The indicator tier must win even though a nearer
+        // data-aligned point exists.
+        let mut buf = pat_pmt_header();
+        for i in 0..40u64 {
+            let t = i * 3_000;
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                (i & 0x0F) as u8,
+                true,
+                Some((t, 0)),
+                i % 10 == 0,
+                &pes_with_pts_aligned(t, b"frame"),
+            ));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        let landed = dmx.seek_to(0, 57_000).expect("seek");
+        assert_eq!(
+            landed, 30_000,
+            "indicator keyframe at 30_000 beats aligned PES at 57_000"
+        );
+        assert!(dmx.next_packet().expect("PES").flags.keyframe);
+    }
+
+    #[test]
+    fn seek_to_anchors_on_indicator_carrier_packet() {
+        // The indicator rides a payload-less carrier packet (PUSI=0,
+        // adaptation-only); the announced PES starts one packet later.
+        // The landing must anchor on the CARRIER so the reassembler
+        // re-derives the keyframe flag.
+        let mut buf = pat_pmt_header();
+        for i in 0..20u64 {
+            let t = 50_000 + i * 3_000;
+            if i % 10 == 0 {
+                // Carrier: RAI + PCR, no payload-unit start, no PES.
+                buf.extend_from_slice(&ts_pes_ex(
+                    0x0101,
+                    (i & 0x0F) as u8,
+                    false,
+                    Some((t, 0)),
+                    true,
+                    &[],
+                ));
+            }
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                ((i + 1) & 0x0F) as u8,
+                true,
+                if i % 10 == 0 { None } else { Some((t, 0)) },
+                false,
+                &pes_with_pts(t, b"frame"),
+            ));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        let landed = dmx.seek_to(0, 95_000).expect("seek");
+        assert_eq!(landed, 80_000, "keyframes at 50_000 and 80_000");
+        let pkt = dmx.next_packet().expect("PES");
+        assert_eq!(pkt.pts, Some(80_000));
+        assert!(pkt.flags.keyframe, "indicator folded from carrier packet");
+    }
+
+    #[test]
+    fn access_point_index_tiers_and_extended_pts() {
+        // Index contents: kinds, per-tier counts, and extended PTS
+        // across a 2^33 wrap.
+        let m = crate::TIMESTAMP_MODULUS_90KHZ;
+        let base0 = m - 15_000;
+        let mut buf = pat_pmt_header();
+        for i in 0..12u64 {
+            let t = (base0 + i * 3_000) & (m - 1); // wraps at i == 5
+            let rai = i % 6 == 0;
+            let pes = if i % 3 == 0 && !rai {
+                pes_with_pts_aligned(t, b"f")
+            } else {
+                pes_with_pts(t, b"f")
+            };
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                (i & 0x0F) as u8,
+                true,
+                Some((t, 0)),
+                rai,
+                &pes,
+            ));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        let index: Vec<RandomAccessPoint> = dmx.random_access_points().expect("index").to_vec();
+        let rai: Vec<_> = index
+            .iter()
+            .filter(|r| r.kind == AccessPointKind::RandomAccessIndicator)
+            .collect();
+        let dai: Vec<_> = index
+            .iter()
+            .filter(|r| r.kind == AccessPointKind::DataAligned)
+            .collect();
+        // RAI at i = 0, 6; data-aligned at i = 3, 9 (i % 3 == 0 minus
+        // the indicator ones).
+        assert_eq!(rai.len(), 2);
+        assert_eq!(dai.len(), 2);
+        assert_eq!(rai[0].pts_90k, Some(base0));
+        // i = 6 crossed the wrap: extended, not the small raw value.
+        assert_eq!(rai[1].pts_90k, Some(base0 + 18_000));
+        assert!(rai[1].pts_90k.unwrap() > m, "extended past the wrap");
+        assert_eq!(dai[0].pts_90k, Some(base0 + 9_000));
+        assert_eq!(dai[1].pts_90k, Some(base0 + 27_000));
+
+        // And the access-point seek works across the wrap end-to-end.
+        let landed = dmx.seek_to(0, (base0 + 20_000) as i64).expect("seek");
+        assert_eq!(landed, (base0 + 18_000) as i64);
+        let pkt = dmx.next_packet().expect("PES");
+        assert_eq!(pkt.pts, Some((base0 + 18_000) as i64));
+        assert!(pkt.flags.keyframe);
+    }
+
+    #[test]
+    fn seek_to_sparse_pcr_still_lands_on_access_point() {
+        // PCR only on every 8th packet (sparse); keyframes every 4th.
+        // The window scan from the (distant) PCR landing must still
+        // find the exact keyframe at or before the target.
+        let mut buf = pat_pmt_header();
+        for i in 0..64u64 {
+            let t = i * 3_000;
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                (i & 0x0F) as u8,
+                true,
+                (i % 8 == 0).then_some((t, 0)),
+                i % 4 == 0,
+                &pes_with_pts(t, b"frame"),
+            ));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        for target in [50_000i64, 100_000, 150_000, 187_000] {
+            let landed = dmx.seek_to(0, target).expect("seek");
+            let expect = (target / 12_000) * 12_000; // keyframe grid
+            assert_eq!(landed, expect, "target {target}");
+            assert_eq!(dmx.next_packet().expect("PES").pts, Some(expect));
+        }
     }
 
     #[test]

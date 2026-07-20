@@ -713,6 +713,17 @@ fn nearest_epoch(raw: u64, hint: u64) -> u64 {
     best_k
 }
 
+/// Extend a raw 33-bit 90 kHz timestamp onto the 64-bit timeline by
+/// picking the wrap epoch whose extended value lies nearest
+/// `reference` — the stateless companion to [`PtsTracker::seed`], used
+/// by scan passes that walk timestamps out of stream order (PES
+/// presentation times reorder around B-pictures) where a sequential
+/// previous-value tracker would misread a small backward step.
+pub(crate) fn extend_near(raw_timestamp: u64, reference: u64) -> u64 {
+    let raw = raw_timestamp & (TIMESTAMP_MODULUS_90KHZ - 1);
+    nearest_epoch(raw, reference) * TIMESTAMP_MODULUS_90KHZ + raw
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

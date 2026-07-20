@@ -193,7 +193,8 @@ pub use validate::{
 
 #[cfg(feature = "registry")]
 pub use demuxer::{
-    open as open_demuxer, probe as probe_mpegts, MpegTsDemuxer, RandomAccessPoint, TsProgram,
+    open as open_demuxer, probe as probe_mpegts, AccessPointKind, MpegTsDemuxer, RandomAccessPoint,
+    TsProgram,
 };
 
 #[cfg(feature = "registry")]
