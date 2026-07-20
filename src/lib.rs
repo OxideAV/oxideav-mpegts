@@ -124,6 +124,9 @@ pub mod validate;
 #[cfg(test)]
 mod hostile;
 
+#[cfg(all(test, feature = "registry"))]
+mod seek_roundtrip;
+
 #[cfg(feature = "registry")]
 pub mod demuxer;
 #[cfg(feature = "registry")]
