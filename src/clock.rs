@@ -582,6 +582,10 @@ pub struct PtsTracker {
     /// Most recent **raw** 33-bit timestamp, or `None` before the first
     /// observation (and after a `reset`).
     last_raw: Option<u64>,
+    /// Extended-timeline hint installed by [`Self::seed`]; consumed by
+    /// the first `observe` after the seed to pick the wrap epoch whose
+    /// extended value lies nearest the hint.
+    seed_hint: Option<u64>,
 }
 
 impl PtsTracker {
@@ -600,6 +604,9 @@ impl PtsTracker {
         let prev = match self.last_raw {
             None => {
                 self.last_raw = Some(raw);
+                if let Some(hint) = self.seed_hint.take() {
+                    self.wrap_count = nearest_epoch(raw, hint);
+                }
                 return TimestampEvent::First;
             }
             Some(p) => p,
@@ -657,7 +664,53 @@ impl PtsTracker {
     pub fn reset(&mut self) {
         self.wrap_count = 0;
         self.last_raw = None;
+        self.seed_hint = None;
     }
+
+    /// Reset the tracker and install an **extended-timeline hint** for
+    /// the next observation — the seek-continuity companion to
+    /// [`Self::reset`].
+    ///
+    /// A demuxer that repositions its byte cursor (a seek) knows the
+    /// extended 90 kHz time of the landing point (e.g. from the PCR it
+    /// landed on) but must discard the raw-timestamp history, which no
+    /// longer precedes the next observation. A plain `reset` would
+    /// re-anchor the extended timeline at the next raw value — so a
+    /// stream that had wrapped past `2^33` would suddenly report small
+    /// post-wrap raw values, tearing the timeline the caller seeked
+    /// along. `seed` instead makes the first `observe` after it pick
+    /// the wrap epoch `k` whose extended value `k × 2^33 + raw` lies
+    /// nearest `extended_hint`, so the emitted timeline stays on the
+    /// same extended axis across the seek. Subsequent observations
+    /// unwrap from there exactly as after any first observation.
+    pub fn seed(&mut self, extended_hint: u64) {
+        self.reset();
+        self.seed_hint = Some(extended_hint);
+    }
+}
+
+/// Wrap-epoch count `k ≥ 0` minimising the distance between
+/// `k × 2^33 + raw` and `hint` — how [`PtsTracker::seed`] re-enters an
+/// extended timeline from a raw 33-bit observation. The minimising `k`
+/// is `hint / 2^33` or that plus one (the hint's own epoch, or the next
+/// when `raw` sits just past a wrap the hint precedes); both candidates
+/// are compared and one epoch below is considered too so a raw value
+/// just *before* a wrap boundary the hint follows resolves backward
+/// correctly.
+fn nearest_epoch(raw: u64, hint: u64) -> u64 {
+    let m = TIMESTAMP_MODULUS_90KHZ;
+    let base = hint / m;
+    let mut best_k = 0u64;
+    let mut best_d = u64::MAX;
+    for k in [base.saturating_sub(1), base, base + 1] {
+        let ext = k * m + raw;
+        let d = ext.abs_diff(hint);
+        if d < best_d {
+            best_d = d;
+            best_k = k;
+        }
+    }
+    best_k
 }
 
 #[cfg(test)]
@@ -1016,5 +1069,57 @@ mod tests {
         assert_eq!(t.last_raw(), None);
         assert_eq!(t.extended(), None);
         assert_eq!(t.observe(42), TimestampEvent::First);
+    }
+
+    #[test]
+    fn pts_tracker_seed_reenters_post_wrap_epoch() {
+        let m = TIMESTAMP_MODULUS_90KHZ;
+        let mut t = PtsTracker::new();
+        // Seek landed at extended time m + 45_000 (past one wrap). The
+        // first raw observation (45_500) must extend into epoch 1, not
+        // re-anchor at the small raw value.
+        t.seed(m + 45_000);
+        assert_eq!(t.observe(45_500), TimestampEvent::First);
+        assert_eq!(t.extended(), Some(m + 45_500));
+        assert_eq!(t.wrap_count(), 1);
+        // Subsequent observations unwrap normally from there.
+        assert_eq!(t.observe(45_500 + 3_000), TimestampEvent::Forward);
+        assert_eq!(t.extended(), Some(m + 48_500));
+    }
+
+    #[test]
+    fn pts_tracker_seed_resolves_epoch_boundary_both_ways() {
+        let m = TIMESTAMP_MODULUS_90KHZ;
+        // Hint just AFTER a wrap boundary, raw just BEFORE it: the
+        // nearest extended value is one epoch below the hint's.
+        let mut t = PtsTracker::new();
+        t.seed(2 * m + 100);
+        t.observe(m - 50);
+        assert_eq!(t.extended(), Some(2 * m - 50));
+        // Hint just BEFORE a wrap boundary, raw just after it: the
+        // nearest extended value is one epoch above the hint's.
+        let mut t = PtsTracker::new();
+        t.seed(m - 100);
+        t.observe(50);
+        assert_eq!(t.extended(), Some(m + 50));
+    }
+
+    #[test]
+    fn pts_tracker_seed_epoch_zero_hint_stays_unwrapped() {
+        let mut t = PtsTracker::new();
+        t.seed(90_000);
+        t.observe(91_000);
+        assert_eq!(t.extended(), Some(91_000));
+        assert_eq!(t.wrap_count(), 0);
+    }
+
+    #[test]
+    fn pts_tracker_reset_discards_pending_seed() {
+        let m = TIMESTAMP_MODULUS_90KHZ;
+        let mut t = PtsTracker::new();
+        t.seed(3 * m);
+        t.reset();
+        t.observe(500);
+        assert_eq!(t.extended(), Some(500), "reset must discard the hint");
     }
 }
