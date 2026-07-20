@@ -154,8 +154,9 @@ pub use build::{
     teletext_descriptor, EitEventEntry, NitTsEntry, PmtStreamEntry, SdtServiceEntry,
 };
 pub use clock::{
-    ContinuityEvent, ContinuityTracker, DiscontinuityReason, Pcr, PcrEvent, PcrTracker, PtsTracker,
-    TimestampEvent, PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ, TIMESTAMP_MODULUS_90KHZ,
+    extend_near, ContinuityEvent, ContinuityTracker, DiscontinuityReason, Pcr, PcrEvent,
+    PcrTracker, PtsTracker, TimestampEvent, PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ,
+    TIMESTAMP_MODULUS_90KHZ,
 };
 pub use descriptor::{
     iter_descriptors, parse_descriptors, AacDescriptor, Ac3Descriptor, AncillaryDataDescriptor,

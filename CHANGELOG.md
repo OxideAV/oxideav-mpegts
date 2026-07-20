@@ -39,7 +39,11 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   timeline instead of re-anchoring at small raw values. Every seek
   landing re-seeds the per-PID PTS/DTS trackers with the landed time
   and drops in-flight PES state (continuation bytes are discarded
-  until the next PUSI, as after a §2.4.3.4 discontinuity).
+  until the next PUSI, as after a §2.4.3.4 discontinuity). The
+  stateless companion `clock::extend_near(raw, reference)` — extend a
+  raw 33-bit timestamp to the wrap epoch nearest a reference — is
+  public too; it is what the index scan unwraps B-frame-reordered PES
+  times with.
 - **Round-trip seek accuracy suite.** Self-muxed fixtures (the muxer
   writes PCR + indicator keyframes at known timestamps) pin the
   landing exactness: a 15-target CBR sweep and a 64 B–24 KiB VBR
