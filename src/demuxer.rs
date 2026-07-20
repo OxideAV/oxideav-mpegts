@@ -859,7 +859,7 @@ impl MpegTsDemuxer {
     ///
     /// Strategy, in order:
     /// 1. **PCR bisection + windowed scan.** Locate the last PCR at or
-    ///    before the target ([`Self::locate_pcr_at_or_before`]) and
+    ///    before the target (the same locator the plain PCR seek uses) and
     ///    walk forward from it collecting access points on the
     ///    stream's PID — `random_access_indicator` announcements
     ///    (§2.4.3.5, preferred) and data-aligned PES starts (§2.4.3.7,
@@ -882,7 +882,7 @@ impl MpegTsDemuxer {
     ///
     /// Errors with `Unsupported` when the stream signals no access
     /// points for the stream at all — the caller degrades to the
-    /// PCR-granular [`Self::seek_by_pcr`] landing.
+    /// PCR-granular landing of the plain `Demuxer::seek_to` fallback.
     pub fn seek_to_access_point(&mut self, stream_index: u32, target_90k: i64) -> CoreResult<i64> {
         let pid = self
             .pid_to_stream

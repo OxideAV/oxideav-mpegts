@@ -11,6 +11,49 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Keyframe-accurate, wrap-aware seeking.** `Demuxer::seek_to` now
+  honours the core contract (nearest keyframe at or before the
+  target) end to end: the PCR bisection compares every probed PCR on
+  the extended 64-bit timeline (head-anchored zero-wrap modular
+  delta), so a mid-stream `2^33` wrap no longer breaks the search
+  invariant or the tail clamp; a windowed forward scan from the PCR
+  landing then lands on the last access point at or before the
+  target, with a doubling backoff for GOPs longer than the window and
+  the cached full index as the definitive fallback / clamp-up path.
+  Access points are tiered via the new `AccessPointKind`:
+  §2.4.3.5 `random_access_indicator` announcements (landing anchored
+  on the flagged packet so the emitted `Packet` re-derives its
+  keyframe flag) over §2.4.3.7 data-aligned PES starts for
+  indicator-less streams — a window-local aligned point never
+  shadows an indicator keyframe further back — over the PCR-granular
+  landing when neither is signalled. `RandomAccessPoint` gained the
+  `kind` field and its `pts_90k` is now the **extended** PTS
+  (B-frame-tolerant epoch-nearest unwrap), keeping the index ordered
+  across a wrap; `seek_to_random_access` remains the strict
+  §2.4.3.5-only surface. New `MpegTsDemuxer::seek_to_access_point`
+  exposes the tiered search directly.
+- **Post-seek timeline continuity.** `PtsTracker::seed(extended_hint)`
+  re-enters a wrap epoch after a reposition: the first observation
+  picks the epoch whose extended value lies nearest the hint, so
+  packets demuxed after a seek past `2^33` continue the extended
+  timeline instead of re-anchoring at small raw values. Every seek
+  landing re-seeds the per-PID PTS/DTS trackers with the landed time
+  and drops in-flight PES state (continuation bytes are discarded
+  until the next PUSI, as after a §2.4.3.4 discontinuity).
+- **Round-trip seek accuracy suite.** Self-muxed fixtures (the muxer
+  writes PCR + indicator keyframes at known timestamps) pin the
+  landing exactness: a 15-target CBR sweep and a 64 B–24 KiB VBR
+  layout land exactly on the keyframe grid (worst delta under one
+  GOP), a two-program mux proves the bisection follows the selected
+  program's own `PCR_PID`, flag-less streams degrade to a PCR landing
+  within one frame + T-STD offset of the target, seeking revives a
+  demuxer that already streamed to EOF, and hand-rolled streams cover
+  wrap-crossing seeks both directions, sparse-PCR exact landings,
+  carrier-packet indicator anchoring, long-GOP backoff, clamp-up, and
+  tier preference. Cross-checked black-box against a validator-muxed
+  20 s H.264 transport stream: nine targets all landed exactly on the
+  validator-reported keyframe grid.
+
 - **Deterministic hostile-input sweeps.** A test-only module drives a
   seeded in-tree LCG through every parse surface — hundreds of
   mutated well-formed streams (built via the crate's own write path),

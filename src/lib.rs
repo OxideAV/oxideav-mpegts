@@ -49,19 +49,31 @@
 //!   monotonic 64-bit extended timeline, while distinguishing a genuine
 //!   `2^33` wrap from a backward splice / seek discontinuity
 //!   ([`clock::TimestampEvent`]).
-//! - Duration + time-based seeking on the `demuxer::MpegTsDemuxer`.
-//!   `duration_micros()` is probed once at open from the head-to-tail
-//!   PCR span (§2.4.2.2); `seek_to()` is a PCR-anchored binary search
-//!   over the byte stream (no in-container index — the demuxer brackets
-//!   the target PTS between the head/tail PCR anchors and bisects),
-//!   landing on the packet boundary of the last PCR at or before the
-//!   request and resetting the per-PID reassembler + timestamp state.
+//! - Duration + keyframe-accurate seeking on the
+//!   `demuxer::MpegTsDemuxer`. `duration_micros()` is probed once at
+//!   open from the head-to-tail PCR span (§2.4.2.2). `seek_to()`
+//!   honours the core contract (nearest keyframe at or before the
+//!   target): a PCR-anchored binary search over the byte stream — no
+//!   in-container index exists, so the demuxer brackets the target
+//!   between the head/tail PCR anchors and bisects, comparing on the
+//!   **extended** 64-bit timeline so a mid-stream `2^33` wrap doesn't
+//!   break the search — then a windowed forward scan lands on the last
+//!   access point at or before the target, with a doubling backoff for
+//!   GOPs longer than the window and a cached full index as the
+//!   definitive fallback. Access points are tiered
+//!   (`demuxer::AccessPointKind`): §2.4.3.5 `random_access_indicator`
+//!   announcements first, data-aligned PES starts (§2.4.3.7 /
+//!   §2.6.10) for streams that never set the indicator, and a
+//!   PCR-granular landing when neither is signalled. Every landing
+//!   resets the PES reassemblers (continuity state is void after a
+//!   byte jump) and re-seeds the PTS/DTS trackers at the landed time
+//!   so post-seek packets continue the extended timeline.
 //! - Random-access surface (§2.4.3.5): the muxer flags keyframe PES
 //!   starts with the `random_access_indicator`, the reassembler folds
 //!   the indicator into [`pes::PesPacket::random_access`], and the
-//!   demuxer both maps it onto core keyframe flags and offers a
-//!   keyframe-accurate seek (`random_access_points()` index +
-//!   `seek_to_random_access()`).
+//!   demuxer both maps it onto core keyframe flags and exposes the
+//!   tiered access-point index (`random_access_points()`) plus the
+//!   strict §2.4.3.5-only `seek_to_random_access()`.
 //! - Write-side adaptation fields ([`packet::AdaptationFieldSpec`]) —
 //!   the full §2.4.3.4 Table 2-6 optional-field set with §2.4.3.5
 //!   pairing/width validation and `0xFF` stuffing.
