@@ -533,25 +533,41 @@ impl MpegTsDemuxer {
         i64::try_from(micros).ok()
     }
 
-    /// Seek the demux position to the PCR nearest `target_90k` (a
-    /// presentation time in the stream's 90 kHz time base) by a
-    /// PCR-anchored binary search over the byte stream (§2.4.2.2).
+    /// Extend a raw 33-bit PCR base onto the same 64-bit timeline the
+    /// demuxed PTS/DTS use (§2.4.3.7 unwrap semantics), anchored at the
+    /// stream's head PCR: `first_base + ((raw − first_base) mod 2^33)`.
+    ///
+    /// Every PCR in a stream shorter than one 33-bit wrap (~26.5 h,
+    /// which also bounds the open-time duration probe) is at its exact
+    /// zero-wrap modular delta from the head anchor, so this maps the
+    /// whole file's PCRs onto one monotonic extended axis — the axis a
+    /// caller's seek target (an extended PTS from `next_packet`) lives
+    /// on, since the PTS unwrap counts the same `2^33` wraps from the
+    /// same stream head. Without this, a bisection comparing raw bases
+    /// breaks the moment the PCR crosses `2^33` mid-stream.
+    fn pcr_ext_90k(&self, raw_base: u64) -> i64 {
+        let m = crate::TIMESTAMP_MODULUS_90KHZ;
+        match self.first_pcr {
+            Some((first, _)) => {
+                let fb = first.base_90khz();
+                (fb + ((raw_base + m - fb) % m)) as i64
+            }
+            None => raw_base as i64,
+        }
+    }
+
+    /// Locate the byte offset and **extended** 90 kHz time of the last
+    /// PCR at or before `target_90k` by a PCR-anchored binary search
+    /// over the byte stream (§2.4.2.2), without repositioning any demux
+    /// state. Out-of-bracket targets clamp to the head / tail anchor.
     ///
     /// MPEG-TS has no in-container random-access index, so this brackets
     /// the target between the open-time head/tail PCR anchors and
     /// bisects the byte range, at each step scanning forward to the next
-    /// PCR on the `PCR_PID` and steering the search by its
-    /// `base_90khz`. It lands on the packet boundary of the last PCR at
-    /// or before the target, resets every per-PID reassembler and the
-    /// PTS/PCR trackers (so the next `next_packet` starts a fresh PES at
-    /// the landing point), and returns that PCR's `base_90khz`.
-    ///
-    /// PCR carries the program *system* clock, whose epoch matches the
-    /// PTS epoch up to the constant T-STD buffering delay (§2.4.2.2); a
-    /// PCR-accurate landing is the random-access granularity an
-    /// index-free TS demuxer can offer. The caller decodes forward to
-    /// the first frame whose PTS reaches its exact request.
-    fn seek_by_pcr(&mut self, target_90k: i64) -> CoreResult<i64> {
+    /// PCR on the `PCR_PID` and steering the search by its base —
+    /// extended past any `2^33` wrap via [`Self::pcr_ext_90k`] so the
+    /// comparison axis matches the caller's extended-PTS target.
+    fn locate_pcr_at_or_before(&mut self, target_90k: i64) -> CoreResult<(u64, i64)> {
         let (first_pcr, first_off) = self.first_pcr.ok_or_else(|| {
             CoreError::unsupported("mpegts: stream carries no PCR to seek against")
         })?;
@@ -559,27 +575,27 @@ impl MpegTsDemuxer {
             .last_pcr
             .ok_or_else(|| CoreError::unsupported("mpegts: stream carries only one PCR"))?;
 
-        let first_base = first_pcr.base_90khz() as i64;
-        let last_base = last_pcr.base_90khz() as i64;
+        // The head anchor extends to its own raw base (zero delta); the
+        // tail anchor extends across however many wraps the span holds.
+        let first_ext = self.pcr_ext_90k(first_pcr.base_90khz());
+        let last_ext = self.pcr_ext_90k(last_pcr.base_90khz());
 
         // Clamp the request to the bracket. A target at or before the
         // head lands on the first PCR; at or after the tail, the last.
-        if target_90k <= first_base {
-            self.reposition(first_off);
-            return Ok(first_base);
+        if target_90k <= first_ext {
+            return Ok((first_off, first_ext));
         }
-        if target_90k >= last_base {
-            self.reposition(last_off);
-            return Ok(last_base);
+        if target_90k >= last_ext {
+            return Ok((last_off, last_ext));
         }
 
         // Binary search the byte range [lo, hi) (packet-aligned) for the
-        // last PCR with base ≤ target. `best` tracks the closest landing
-        // found so far that does not overshoot.
+        // last PCR with extended base ≤ target. `best` tracks the
+        // closest landing found so far that does not overshoot.
         let psize = self.layout.packet_size as u64;
         let mut lo = first_off;
         let mut hi = last_off;
-        let mut best = (first_off, first_base);
+        let mut best = (first_off, first_ext);
         while hi - lo > psize {
             let mid_raw = lo + (hi - lo) / 2;
             let mid = (mid_raw / psize) * psize;
@@ -589,9 +605,9 @@ impl MpegTsDemuxer {
             // `hi` to `mid` and keep bisecting the lower half.
             match self.scan_pcr_forward(mid, hi) {
                 Some((pcr, off)) => {
-                    let base = pcr.base_90khz() as i64;
-                    if base <= target_90k {
-                        best = (off, base);
+                    let ext = self.pcr_ext_90k(pcr.base_90khz());
+                    if ext <= target_90k {
+                        best = (off, ext);
                         // Advance past this PCR's packet so we don't
                         // re-find the same one and stall.
                         lo = off + psize;
@@ -604,8 +620,27 @@ impl MpegTsDemuxer {
                 }
             }
         }
-        self.reposition(best.0);
-        Ok(best.1)
+        Ok(best)
+    }
+
+    /// Seek the demux position to the PCR nearest `target_90k` (a
+    /// presentation time on the stream's **extended** 90 kHz timeline —
+    /// the same axis `next_packet` emits PTS on) via
+    /// [`Self::locate_pcr_at_or_before`]. Lands on the packet boundary
+    /// of the last PCR at or before the target, resets every per-PID
+    /// reassembler and re-seeds the PTS/DTS trackers at the landing
+    /// time (so post-seek packets continue the extended timeline), and
+    /// returns the landed PCR's extended time.
+    ///
+    /// PCR carries the program *system* clock, whose epoch matches the
+    /// PTS epoch up to the constant T-STD buffering delay (§2.4.2.2); a
+    /// PCR-accurate landing is the random-access granularity an
+    /// index-free TS demuxer can offer. The caller decodes forward to
+    /// the first frame whose PTS reaches its exact request.
+    fn seek_by_pcr(&mut self, target_90k: i64) -> CoreResult<i64> {
+        let (off, landed) = self.locate_pcr_at_or_before(target_90k)?;
+        self.reposition(off, Some(landed));
+        Ok(landed)
     }
 
     /// The stream's random-access index, built on first call by a
@@ -748,15 +783,26 @@ impl MpegTsDemuxer {
                 "mpegts: stream carries no random_access_indicator with a PTS to seek against",
             )
         })?;
-        self.reposition(offset);
+        self.reposition(offset, Some(pts as i64));
         Ok(pts as i64)
     }
 
     /// Re-home the streaming state at byte `offset` (packet-aligned):
     /// seek the input cursor, drop every in-flight PES and the pending
     /// queue, and reset the PCR / PTS / DTS trackers so the timeline
-    /// rebuilds from the landing point.
-    fn reposition(&mut self, offset: u64) {
+    /// rebuilds from the landing point. Dropping the in-flight PES
+    /// state means a landing that falls mid-PES simply discards
+    /// continuation bytes until the next `payload_unit_start` — the
+    /// continuity-counter history is void after a byte-position jump,
+    /// exactly as after a signalled discontinuity (§2.4.3.4).
+    ///
+    /// `time_hint_90k` is the landing point's time on the **extended**
+    /// 90 kHz timeline (the landed PCR / access-point PTS). When given,
+    /// the PTS/DTS trackers are re-seeded with it instead of blindly
+    /// reset, so the first post-seek timestamps re-enter the wrap epoch
+    /// the caller seeked along rather than re-anchoring at their raw
+    /// 33-bit values ([`PtsTracker::seed`]).
+    fn reposition(&mut self, offset: u64, time_hint_90k: Option<i64>) {
         let _ = self.input.seek(std::io::SeekFrom::Start(offset));
         self.bytes_read = offset;
         self.putback.clear();
@@ -766,11 +812,16 @@ impl MpegTsDemuxer {
         for r in self.reassemblers.values_mut() {
             *r = PesReassembler::new();
         }
-        for t in self.pts_trackers.values_mut() {
-            t.reset();
-        }
-        for t in self.dts_trackers.values_mut() {
-            t.reset();
+        let hint = time_hint_90k.and_then(|t| u64::try_from(t).ok());
+        for t in self
+            .pts_trackers
+            .values_mut()
+            .chain(self.dts_trackers.values_mut())
+        {
+            match hint {
+                Some(h) => t.seed(h),
+                None => t.reset(),
+            }
         }
     }
 
@@ -2176,6 +2227,65 @@ mod tests {
             dmx.seek_to(0, 500_000),
             Err(CoreError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn seek_crosses_2pow33_wrap_on_extended_timeline() {
+        // 21 PCR-bearing PES packets 9_000 ticks (0.1 s) apart whose
+        // bases start 45_000 ticks below the 2^33 wrap — the PCR (and
+        // PTS) ring wraps between packets #4 and #5. The synth helpers
+        // mask to 33 bits, so the wire carries genuine wrapped values.
+        let m = crate::TIMESTAMP_MODULUS_90KHZ;
+        let base0 = m - 45_000;
+        let bytes = synth_pcr_span_ts(21, 9_000, base0);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+
+        // Duration spans the wrap: 20 × 9_000 ticks = 2.0 s.
+        assert_eq!(dmx.duration_micros(), Some(2_000_000));
+
+        // Seek PAST the wrap on the extended axis. Extended bases run
+        // …, m − 9_000, m, m + 9_000, m + 18_000, m + 27_000, …; the
+        // last at or before m + 20_000 is m + 18_000.
+        let landed = dmx.seek_to(0, (m + 20_000) as i64).expect("seek");
+        assert_eq!(landed, (m + 18_000) as i64);
+        // The post-seek PES carries raw PTS 18_000 on the wire; the
+        // seeded trackers must re-enter epoch 1, not re-anchor at the
+        // small raw value.
+        let pkt = dmx.next_packet().expect("PES after wrap seek");
+        assert_eq!(pkt.pts, Some((m + 18_000) as i64));
+
+        // And BACK before the wrap: extended target m − 30_000 lands on
+        // m − 36_000 (raw base 2^33 − 36_000, epoch 0).
+        let landed = dmx.seek_to(0, (m - 30_000) as i64).expect("seek back");
+        assert_eq!(landed, (m - 36_000) as i64);
+        let pkt = dmx.next_packet().expect("PES after backward seek");
+        assert_eq!(pkt.pts, Some((m - 36_000) as i64));
+
+        // Forward progress from a post-wrap landing stays monotonic on
+        // the extended axis across further reads.
+        let landed = dmx.seek_to(0, (m - 4_000) as i64).expect("pre-wrap seek");
+        assert_eq!(landed, (m - 9_000) as i64);
+        let a = dmx.next_packet().expect("last pre-wrap PES");
+        let b = dmx.next_packet().expect("first post-wrap PES");
+        assert_eq!(a.pts, Some((m - 9_000) as i64));
+        assert_eq!(b.pts, Some(m as i64), "wrap crossed while streaming");
+    }
+
+    #[test]
+    fn seek_clamps_on_wrapped_tail_anchor() {
+        // Head base sits 9_000 ticks below the wrap, tail extends past
+        // it: clamping past-the-end targets must use the EXTENDED tail
+        // time, not its small raw base.
+        let m = crate::TIMESTAMP_MODULUS_90KHZ;
+        let bytes = synth_pcr_span_ts(6, 9_000, m - 9_000);
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+        // Extended tail = (m − 9_000) + 5 × 9_000 = m + 36_000.
+        let landed = dmx.seek_to(0, i64::MAX).expect("clamp to tail");
+        assert_eq!(landed, (m + 36_000) as i64);
+        let pkt = dmx.next_packet().expect("tail PES");
+        assert_eq!(pkt.pts, Some((m + 36_000) as i64));
     }
 
     #[test]
