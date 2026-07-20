@@ -2909,6 +2909,53 @@ mod tests {
     }
 
     #[test]
+    fn pcr_fallback_landing_mid_pes_discards_partial_and_resumes_clean() {
+        // Each PES spans exactly two TS packets: a PUSI start (184
+        // payload bytes) and a continuation packet that carries the
+        // PCR in its adaptation field (176 payload bytes). No RAI, no
+        // data alignment → the seek degrades to the PCR landing, whose
+        // packet sits MID-PES. The reposition must discard the partial
+        // PES (continuity history is void) and emit the NEXT PES
+        // cleanly.
+        let mut buf = pat_pmt_header();
+        let n = 12u64;
+        for i in 0..n {
+            let pts = 10_000 + i * 3_000;
+            let pes = pes_with_pts(pts, &[0xB7u8; 346]); // 360 bytes total
+            assert_eq!(pes.len(), 360);
+            let cc0 = ((2 * i) & 0x0F) as u8;
+            let cc1 = ((2 * i + 1) & 0x0F) as u8;
+            buf.extend_from_slice(&ts_pes_ex(0x0101, cc0, true, None, false, &pes[..184]));
+            // Continuation packet: AF(PCR) + the remaining 176 bytes.
+            buf.extend_from_slice(&ts_pes_ex(
+                0x0101,
+                cc1,
+                false,
+                Some((pts, 0)),
+                false,
+                &pes[184..],
+            ));
+        }
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+
+        // Target between PES #5 (25_000) and #6 (28_000): the last PCR
+        // at or before it rides PES #5's continuation packet.
+        let landed = dmx.seek_to(0, 26_500).expect("seek");
+        assert_eq!(landed, 25_000, "PCR-granular landing");
+        // The landing packet is the tail half of PES #5 — unusable.
+        // The first emitted packet must be PES #6, intact.
+        let pkt = dmx.next_packet().expect("clean PES after mid-PES landing");
+        assert_eq!(pkt.pts, Some(28_000));
+        assert_eq!(
+            pkt.data.len(),
+            346,
+            "full reassembled payload, no tail bytes"
+        );
+        assert!(pkt.data.iter().all(|&b| b == 0xB7), "payload uncorrupted");
+    }
+
+    #[test]
     fn duration_handles_pcr_extension_in_span() {
         // Two PCRs 2.0 s apart with a non-zero extension on the tail to
         // confirm the 27 MHz composition (base × 300 + ext) is used.

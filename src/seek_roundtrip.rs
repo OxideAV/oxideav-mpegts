@@ -314,6 +314,35 @@ fn roundtrip_unflagged_stream_degrades_to_pcr_landing() {
     assert!(a >= landed && a <= target + 3_600);
 }
 
+/// The same self-muxed stream reframed as 192-byte (4-byte-prefixed)
+/// source packets: the layout is detected at open and every seek
+/// machinery piece — PCR probes, bisection, window scan, index,
+/// reposition — must walk the physical 192-byte grid.
+#[test]
+fn roundtrip_seek_exact_on_192_byte_framing() {
+    let plain = mux_video(0, 120, 3_600, 12, |_| 300);
+    assert_eq!(plain.len() % 188, 0);
+    let mut framed = Vec::with_capacity(plain.len() / 188 * 192);
+    for (i, chunk) in plain.chunks(188).enumerate() {
+        // 4-byte copy-permission / arrival-timestamp prefix.
+        framed.extend_from_slice(&(i as u32).to_be_bytes());
+        framed.extend_from_slice(chunk);
+    }
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(framed));
+    let mut dmx = MpegTsDemuxer::open_program(input, 1).expect("open 192");
+    assert_eq!(dmx.packet_layout().packet_size, 192);
+
+    // Keyframe grid 43_200; sweep a few targets.
+    for target in [50_000i64, 200_000, 259_200, 400_000] {
+        let expect = (target / 43_200) * 43_200;
+        let landed = dmx.seek_to(0, target).expect("seek");
+        assert_eq!(landed, expect, "target {target}");
+        let pkt = dmx.next_packet().expect("PES");
+        assert_eq!(pkt.pts, Some(expect));
+        assert!(pkt.flags.keyframe);
+    }
+}
+
 /// Seeking after streaming to EOF must fully revive the demuxer (the
 /// eof flag, reassemblers, pending queue, trackers).
 #[test]
