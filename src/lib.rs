@@ -214,7 +214,7 @@ pub use demuxer::{
 };
 
 #[cfg(feature = "registry")]
-pub use muxer::{open as open_muxer, MpegTsMuxer};
+pub use muxer::{open as open_muxer, MpegTsMuxer, SeamlessSpliceSpec, SpliceSpec};
 
 #[cfg(feature = "registry")]
 pub use registry::{register, register_containers};

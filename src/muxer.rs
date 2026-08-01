@@ -90,6 +90,51 @@ pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> CoreResult<Bo
     MpegTsMuxer::new(output, streams).map(|m| Box::new(m) as Box<dyn Muxer>)
 }
 
+/// Seamless-splice signalling carried in the adaptation-field
+/// extension across a splice countdown (§2.4.3.5 / Annex K.1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeamlessSpliceSpec {
+    /// 4-bit `splice_type` — the Table 2-7..2-16 splice-conditions
+    /// index the video elementary stream honours. Shall be `0` when
+    /// the PID carries audio (§2.4.3.5).
+    pub splice_type: u8,
+    /// 33-bit `DTS_next_AU` — the 90 kHz decoding time of the first
+    /// access unit after the splicing point, on the time base valid in
+    /// the packet where the countdown reaches zero (§2.4.3.5).
+    pub dts_next_au: u64,
+}
+
+/// A splice-point request for one stream, applied to the **next**
+/// [`Packet`] written for it (§2.4.3.4 / §2.4.3.5 / Annex K).
+///
+/// The splicing point lands immediately after the last byte of the
+/// last payload-carrying TS packet of that packet's PES envelope: the
+/// muxer sets `splicing_point_flag` and a positive `splice_countdown`
+/// on the PES's payload packets, counting down to zero on the last
+/// one. Because the muxer maps one [`Packet`] to one PES envelope and
+/// stuffs the tail packet through the adaptation field, the §2.4.3.5
+/// alignment constraint — the countdown-zero packet's last payload
+/// byte is the last byte of the coded frame, and the next payload on
+/// the PID starts a PES packet — holds by construction. Whether the
+/// *elementary-stream* bytes at the boundary form an access point
+/// (video sequence header / audio frame start, per §2.4.3.4) is the
+/// caller's contract; the container layer cannot verify codec
+/// payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpliceSpec {
+    /// Seamless-splice info (§2.4.3.5 / Annex K.1.2). When set, every
+    /// countdown-annotated packet also carries the adaptation-field
+    /// extension's `seamless_splice` fields, satisfying the §2.4.3.5
+    /// rule that the flag, once set with a positive countdown, stays
+    /// set through the countdown-zero packet.
+    pub seamless: Option<SeamlessSpliceSpec>,
+    /// Number of payload-carrying TS packets *after* the splicing
+    /// point to annotate with negative `splice_countdown` values
+    /// (`-1`, `-2`, …) per §2.4.3.5. Capped at 127 (the `tcimsbf`
+    /// field is signed 8-bit).
+    pub post_splice_packets: u8,
+}
+
 /// Human-readable service metadata carried in the DVB SDT for one
 /// program (ETSI EN 300 468 §5.2.3 / §6.2.33). When a [`ProgramSpec`]
 /// carries one, the muxer emits an SDT `service_descriptor` for the
@@ -296,6 +341,13 @@ struct TrackState {
     /// Caller-supplied extra ES_info descriptor bytes (teletext /
     /// subtitling / AC-3 / …) appended verbatim after the auto ones.
     extra_es_descriptors: Vec<u8>,
+    /// Splice request armed by [`MpegTsMuxer::signal_splice_after`],
+    /// consumed by the next PES written for this track.
+    pending_splice: Option<SpliceSpec>,
+    /// `(next, total)` — negative post-splice countdown state: the
+    /// next payload packet on this PID gets `splice_countdown = -next`
+    /// until `next > total` (§2.4.3.5).
+    post_splice: Option<(u8, u8)>,
 }
 
 impl MpegTsMuxer {
@@ -401,6 +453,8 @@ impl MpegTsMuxer {
                     component_tag,
                     language,
                     extra_es_descriptors,
+                    pending_splice: None,
+                    post_splice: None,
                 });
                 idx_to_track.insert(sidx, track_idx);
                 track_indices.push(track_idx);
@@ -460,6 +514,58 @@ impl MpegTsMuxer {
     /// `write_header`.
     pub fn set_psi_repetition_interval(&mut self, ticks: Option<i64>) {
         self.psi_repetition_90k = ticks;
+    }
+
+    /// Arm a splicing point after the **next** [`Packet`] written for
+    /// `stream_index` (§2.4.3.4 / §2.4.3.5 / Annex K).
+    ///
+    /// The next PES envelope on that stream's PID carries
+    /// `splicing_point_flag = 1` with a positive `splice_countdown`
+    /// counting down across its payload-carrying TS packets to zero on
+    /// the last one — the splicing point sits immediately after that
+    /// packet's last byte. When [`SpliceSpec::seamless`] is set, the
+    /// same packets carry the adaptation-field-extension
+    /// `splice_type` / `DTS_next_AU` pair (Annex K.1.2 seamless
+    /// splicing point); §2.4.3.5 requires `splice_type == 0` for audio
+    /// streams, which is enforced here. A PES spanning more than 128
+    /// payload packets starts the countdown at 127 (the field is a
+    /// signed 8-bit `tcimsbf`) on the 128th-from-last packet.
+    ///
+    /// Errors with `Error::Invalid` for an unknown `stream_index`, an
+    /// over-width `splice_type` / `DTS_next_AU`, or a non-zero
+    /// `splice_type` on a non-video stream.
+    pub fn signal_splice_after(&mut self, stream_index: u32, spec: SpliceSpec) -> CoreResult<()> {
+        let track_idx = *self.idx_to_track.get(&stream_index).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "mpegts muxer: splice for unknown stream_index {stream_index}"
+            ))
+        })?;
+        if let Some(seamless) = &spec.seamless {
+            if seamless.splice_type > 0xF {
+                return Err(CoreError::invalid(
+                    "mpegts muxer: splice_type exceeds 4 bits",
+                ));
+            }
+            if seamless.dts_next_au > 0x1_FFFF_FFFF {
+                return Err(CoreError::invalid(
+                    "mpegts muxer: DTS_next_AU exceeds 33 bits",
+                ));
+            }
+            if !self.tracks[track_idx].is_video && seamless.splice_type != 0 {
+                // §2.4.3.5: "If the elementary stream carried in this
+                // PID is an audio stream, this field shall have the
+                // value '0000'."
+                return Err(CoreError::invalid(
+                    "mpegts muxer: non-zero splice_type on a non-video stream",
+                ));
+            }
+        }
+        let post = spec.post_splice_packets.min(127);
+        self.tracks[track_idx].pending_splice = Some(SpliceSpec {
+            post_splice_packets: post,
+            ..spec
+        });
+        Ok(())
     }
 
     /// Re-emit the full PSI set (PAT + every PMT + SDT) mid-stream when
@@ -783,7 +889,19 @@ impl MpegTsMuxer {
         // PCR-PID PES that carries no inline PCR (e.g. no PTS).
         let random_access = packet.flags.keyframe
             && (track.pid != self.programs[prog_idx].pcr_pid || pcr.is_some());
-        self.write_pes_bytes_as_ts(track.pid, track_idx, &pes, pcr, random_access)
+        let splice = self.tracks[track_idx].pending_splice.take();
+        self.write_pes_bytes_as_ts(track.pid, track_idx, &pes, pcr, random_access, splice)
+    }
+
+    /// Number of TS packets a `remaining`-byte run fragments into when
+    /// the first packet offers `cap_first` payload bytes and every
+    /// following packet `cap_cont`.
+    fn packets_needed(remaining: usize, cap_first: usize, cap_cont: usize) -> usize {
+        if remaining <= cap_first {
+            1
+        } else {
+            1 + (remaining - cap_first).div_ceil(cap_cont)
+        }
     }
 
     /// Fragment a contiguous PES byte buffer into 188-byte TS packets
@@ -793,6 +911,17 @@ impl MpegTsMuxer {
     /// `random_access` sets the §2.4.3.5 `random_access_indicator`
     /// there (the PES starting in that packet begins at an
     /// elementary-stream access point).
+    ///
+    /// `splice` requests a splicing point immediately after this PES's
+    /// last payload byte (§2.4.3.5): the payload packets carry
+    /// `splice_countdown` counting down to zero on the last one (the
+    /// tail-stuffing pass makes its last payload byte the last byte of
+    /// the coded frame), with the seamless `splice_type` /
+    /// `DTS_next_AU` extension when requested. Annotation starts on
+    /// the first packet from which the remaining run fits the signed
+    /// 8-bit countdown (at most 128 packets, countdown 127..=0).
+    /// Packets *after* an armed splicing point pick up the negative
+    /// countdown from the track's `post_splice` state.
     fn write_pes_bytes_as_ts(
         &mut self,
         pid: u16,
@@ -800,9 +929,26 @@ impl MpegTsMuxer {
         pes: &[u8],
         first_packet_pcr: Option<(u64, u16)>,
         random_access: bool,
+        splice: Option<SpliceSpec>,
     ) -> CoreResult<()> {
+        // A fresh splicing point supersedes any negative-countdown run
+        // left over from the previous one — the field can only carry
+        // one value per packet.
+        if splice.is_some() {
+            self.tracks[track_idx].post_splice = None;
+        }
+        let seamless_ext =
+            splice
+                .and_then(|s| s.seamless)
+                .map(|s| crate::AdaptationFieldExtensionSpec {
+                    seamless_splice: Some((s.splice_type, s.dts_next_au)),
+                    ..Default::default()
+                });
         let mut cursor = 0usize;
         let mut first = true;
+        // `Some(n)` once countdown annotation has started: this packet
+        // and `n - 1` more finish the PES (countdown value `n - 1`).
+        let mut splice_run: Option<usize> = None;
         while cursor < pes.len() {
             let mut pkt = [0xFFu8; TS_PACKET_LEN];
             pkt[0] = TS_SYNC_BYTE;
@@ -815,11 +961,53 @@ impl MpegTsMuxer {
             // PCR / random-access flag, or when the (tail) fragment is
             // short and needs AF stuffing to land on 188 bytes
             // (§2.4.3.5 — the only stuffing method for PES packets).
-            let spec = crate::AdaptationFieldSpec {
+            let mut spec = crate::AdaptationFieldSpec {
                 random_access_indicator: first && random_access,
                 pcr: first_packet_pcr.filter(|_| first),
                 ..Default::default()
             };
+            if splice.is_some() {
+                if splice_run.is_none() {
+                    // Would the remaining run fit the signed 8-bit
+                    // countdown if annotation starts here? Capacity is
+                    // position-dependent: this packet keeps its PCR /
+                    // RAI fields, continuations carry only the splice
+                    // fields.
+                    let map_err =
+                        |e: crate::TsError| CoreError::invalid(format!("mpegts muxer: {e}"));
+                    let here = crate::AdaptationFieldSpec {
+                        splice_countdown: Some(0),
+                        extension: seamless_ext,
+                        ..spec.clone()
+                    };
+                    let cont = crate::AdaptationFieldSpec {
+                        splice_countdown: Some(0),
+                        extension: seamless_ext,
+                        ..Default::default()
+                    };
+                    let cap_here = TS_PACKET_LEN - 4 - here.encode(None).map_err(map_err)?.len();
+                    let cap_cont = TS_PACKET_LEN - 4 - cont.encode(None).map_err(map_err)?.len();
+                    let n = Self::packets_needed(remaining, cap_here, cap_cont);
+                    if n <= 128 {
+                        splice_run = Some(n);
+                    }
+                }
+                if let Some(n) = splice_run {
+                    debug_assert!((1..=128).contains(&n));
+                    spec.splice_countdown = Some((n - 1) as i8);
+                    spec.extension = seamless_ext;
+                    splice_run = Some(n - 1);
+                }
+            } else if let Some((next, total)) = self.tracks[track_idx].post_splice {
+                // §2.4.3.5 negative countdown: this payload packet is
+                // the `next`-th one following the splicing point.
+                spec.splice_countdown = Some(-(next as i8));
+                self.tracks[track_idx].post_splice = if next < total {
+                    Some((next + 1, total))
+                } else {
+                    None
+                };
+            }
             // Worst-case payload room with NO adaptation field.
             let payload_room_no_af = TS_PACKET_LEN - 4;
             let af_present = !spec.is_empty() || remaining < payload_room_no_af;
@@ -852,6 +1040,14 @@ impl MpegTsMuxer {
             }
             self.output.write_all(&pkt).map_err(CoreError::Io)?;
             first = false;
+        }
+        // The splicing point is now behind us; arm the §2.4.3.5
+        // negative countdown for the following payload packets when
+        // requested.
+        if let Some(s) = splice {
+            if s.post_splice_packets > 0 {
+                self.tracks[track_idx].post_splice = Some((1, s.post_splice_packets));
+            }
         }
         Ok(())
     }
@@ -2226,5 +2422,258 @@ mod tests {
         let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
         let r = MpegTsMuxer::new(output, &[s]);
         assert!(r.is_err());
+    }
+
+    /// One packet's splice view: `(splice_countdown, seamless pair)`.
+    type SpliceAnnotation = (Option<i8>, Option<(u8, u64)>);
+
+    /// Collect the [`SpliceAnnotation`] of every packet on `pid`, in
+    /// stream order.
+    fn splice_annotations(bytes: &[u8], pid: u16) -> Vec<SpliceAnnotation> {
+        let mut out = Vec::new();
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pkt = crate::TsPacket::parse(chunk).expect("well-formed packet");
+            if pkt.pid != pid {
+                continue;
+            }
+            let countdown = pkt
+                .adaptation_field
+                .as_ref()
+                .and_then(|af| af.splice_countdown);
+            let seamless = pkt
+                .adaptation_field
+                .as_ref()
+                .and_then(|af| af.adaptation_field_extension.as_ref())
+                .and_then(|ext| match (ext.splice_type, ext.dts_next_au) {
+                    (Some(t), Some(d)) => Some((t, d)),
+                    _ => None,
+                });
+            out.push((countdown, seamless));
+        }
+        out
+    }
+
+    /// An armed seamless splice must count down to zero on the last
+    /// payload packet of the next PES, carry the splice_type /
+    /// DTS_next_AU pair on every annotated packet, and mark the
+    /// following packets with the negative countdown. The stream must
+    /// stay §2.4.3.x-conformant and demux round-trip cleanly.
+    #[test]
+    fn seamless_splice_counts_down_to_zero_then_negative() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            mx.signal_splice_after(
+                0,
+                SpliceSpec {
+                    seamless: Some(SeamlessSpliceSpec {
+                        splice_type: 0x3,
+                        dts_next_au: 48_000,
+                    }),
+                    post_splice_packets: 2,
+                },
+            )
+            .unwrap();
+            // ~1 KiB payload → several TS packets to count down over.
+            mx.write_packet(
+                &Packet::new(0, TimeBase::new(1, 90_000), vec![0xAB; 1000]).with_pts(45_000),
+            )
+            .unwrap();
+            // The next PES supplies the negative-countdown packets.
+            mx.write_packet(
+                &Packet::new(0, TimeBase::new(1, 90_000), vec![0xCD; 1000]).with_pts(48_000),
+            )
+            .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+
+        // PID of the sole elementary stream is FIRST_ES_PID.
+        let ann = splice_annotations(&bytes, FIRST_ES_PID);
+        let countdowns: Vec<i8> = ann.iter().filter_map(|(c, _)| *c).collect();
+        // Positive run down to zero, then the negative post-splice run.
+        let zero_at = countdowns
+            .iter()
+            .position(|&c| c == 0)
+            .expect("countdown 0");
+        let start = countdowns[0];
+        assert!(start > 0, "countdown must start positive: {countdowns:?}");
+        for (k, &c) in countdowns[..=zero_at].iter().enumerate() {
+            assert_eq!(c as i64, start as i64 - k as i64, "run {countdowns:?}");
+        }
+        assert_eq!(&countdowns[zero_at + 1..], &[-1, -2], "run {countdowns:?}");
+        // Every positively-annotated packet carries the seamless pair.
+        for (c, seamless) in &ann {
+            match c {
+                Some(c) if *c >= 0 => assert_eq!(*seamless, Some((0x3, 48_000))),
+                _ => assert_eq!(*seamless, None),
+            }
+        }
+        // The countdown-zero packet's payload must end the PES: the
+        // next payload packet on the PID starts a new PES (PUSI).
+        let mut after_zero = false;
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pkt = crate::TsPacket::parse(chunk).unwrap();
+            if pkt.pid != FIRST_ES_PID {
+                continue;
+            }
+            if after_zero && !pkt.payload.is_empty() {
+                assert!(
+                    pkt.payload_unit_start,
+                    "post-splice payload must start a PES"
+                );
+                after_zero = false;
+            }
+            if pkt
+                .adaptation_field
+                .as_ref()
+                .and_then(|af| af.splice_countdown)
+                == Some(0)
+            {
+                after_zero = true;
+            }
+        }
+
+        // Conformance + demux round-trip are unaffected.
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let p1 = dmx.next_packet().expect("p1");
+        let p2 = dmx.next_packet().expect("p2");
+        assert_eq!(p1.data, vec![0xAB; 1000]);
+        assert_eq!(p2.data, vec![0xCD; 1000]);
+        assert_eq!(p1.pts, Some(45_000));
+        assert_eq!(p2.pts, Some(48_000));
+    }
+
+    /// An ordinary (non-seamless) splicing point carries only the
+    /// countdown — no adaptation-field extension.
+    #[test]
+    fn ordinary_splice_carries_no_extension() {
+        let streams = vec![stream_info(0, "ac3", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            mx.signal_splice_after(0, SpliceSpec::default()).unwrap();
+            mx.write_packet(
+                &Packet::new(0, TimeBase::new(1, 90_000), vec![0x11; 400]).with_pts(9_000),
+            )
+            .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let ann = splice_annotations(&bytes, FIRST_ES_PID);
+        let countdowns: Vec<i8> = ann.iter().filter_map(|(c, _)| *c).collect();
+        assert!(!countdowns.is_empty());
+        assert_eq!(*countdowns.last().unwrap(), 0);
+        assert!(ann.iter().all(|(_, s)| s.is_none()));
+        assert!(crate::validate::validate_ts(&bytes).is_conformant());
+    }
+
+    /// A PES spanning more than 128 payload packets must start the
+    /// countdown at 127 on the 128th-from-last packet (the field is a
+    /// signed 8-bit tcimsbf) and still reach zero on the last one.
+    #[test]
+    fn splice_countdown_caps_at_127_for_long_pes() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            mx.signal_splice_after(0, SpliceSpec::default()).unwrap();
+            // ~40 KiB → well over 128 TS packets of ~184 bytes.
+            mx.write_packet(
+                &Packet::new(0, TimeBase::new(1, 90_000), vec![0x42; 40_000]).with_pts(90_000),
+            )
+            .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let ann = splice_annotations(&bytes, FIRST_ES_PID);
+        let countdowns: Vec<i8> = ann.iter().filter_map(|(c, _)| *c).collect();
+        assert_eq!(countdowns.first(), Some(&127), "run head {countdowns:?}");
+        assert_eq!(countdowns.len(), 128);
+        assert_eq!(*countdowns.last().unwrap(), 0);
+        // The unannotated leading packets must outnumber zero (the PES
+        // is longer than the annotated window).
+        let total_payload_packets = bytes
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|c| {
+                let pkt = crate::TsPacket::parse(c).unwrap();
+                pkt.pid == FIRST_ES_PID && !pkt.payload.is_empty()
+            })
+            .count();
+        assert!(total_payload_packets > 128);
+        assert!(crate::validate::validate_ts(&bytes).is_conformant());
+    }
+
+    /// §2.4.3.5: audio streams must carry splice_type '0000'; the
+    /// 4-bit / 33-bit field widths are enforced at arm time.
+    #[test]
+    fn splice_spec_validation() {
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+        // Unknown stream.
+        assert!(mx.signal_splice_after(9, SpliceSpec::default()).is_err());
+        // Non-zero splice_type on audio.
+        assert!(mx
+            .signal_splice_after(
+                1,
+                SpliceSpec {
+                    seamless: Some(SeamlessSpliceSpec {
+                        splice_type: 1,
+                        dts_next_au: 0,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .is_err());
+        // Zero splice_type on audio is fine.
+        assert!(mx
+            .signal_splice_after(
+                1,
+                SpliceSpec {
+                    seamless: Some(SeamlessSpliceSpec {
+                        splice_type: 0,
+                        dts_next_au: 0,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .is_ok());
+        // Width overflows.
+        assert!(mx
+            .signal_splice_after(
+                0,
+                SpliceSpec {
+                    seamless: Some(SeamlessSpliceSpec {
+                        splice_type: 0x10,
+                        dts_next_au: 0,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .is_err());
+        assert!(mx
+            .signal_splice_after(
+                0,
+                SpliceSpec {
+                    seamless: Some(SeamlessSpliceSpec {
+                        splice_type: 0,
+                        dts_next_au: 1 << 33,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .is_err());
     }
 }

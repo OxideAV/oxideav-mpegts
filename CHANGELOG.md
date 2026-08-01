@@ -11,6 +11,30 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Splice-point mux API (§2.4.3.4 / §2.4.3.5 / Annex K).**
+  `MpegTsMuxer::signal_splice_after(stream_index, SpliceSpec)` arms a
+  splicing point immediately after the next written `Packet`'s PES
+  envelope: its payload-carrying TS packets gain `splicing_point_flag`
+  with a positive `splice_countdown` counting down to zero on the last
+  one — whose last payload byte is the last byte of the coded frame by
+  construction (one `Packet` = one PES + adaptation-field tail
+  stuffing), and the next payload on the PID starts a PES packet, the
+  two §2.4.3.5 alignment constraints. `SpliceSpec::seamless`
+  (`SeamlessSpliceSpec { splice_type, dts_next_au }`) additionally
+  rides the adaptation-field extension's `splice_type` / `DTS_next_AU`
+  pair on every annotated packet, honouring the §2.4.3.5 rule that
+  `seamless_splice_flag`, once set with a positive countdown, stays
+  set through the countdown-zero packet (Annex K.1.2 seamless splicing
+  point). `SpliceSpec::post_splice_packets` continues the annotation
+  past the splicing point with the negative countdown (`-1`, `-2`, …)
+  across following PES envelopes. A PES spanning more than 128
+  payload packets starts the countdown at 127 (the field is a signed
+  8-bit `tcimsbf`) on the 128th-from-last packet. Arming rejects a
+  non-zero `splice_type` on a non-video stream (§2.4.3.5), over-width
+  `splice_type` / `DTS_next_AU`, and unknown stream indices. Splice
+  output is pinned §2.4.3.x-conformant via `validate_ts` and
+  round-trips through the demuxer unchanged.
+
 - **Keyframe-accurate, wrap-aware seeking.** `Demuxer::seek_to` now
   honours the core contract (nearest keyframe at or before the
   target) end to end: the PCR bisection compares every probed PCR on
