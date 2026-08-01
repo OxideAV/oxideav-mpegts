@@ -11,6 +11,45 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **T-STD buffer model (§2.4.2).** New `tstd` module:
+  `analyze_tstd(&[u8], &TStdConfig) -> TStdReport` replays a whole
+  transport stream (any physical framing) through the Transport
+  Stream system target decoder. The §2.4.2.2 arrival clock is
+  reconstructed from the PCRs on the configured `PCR_PID` (equations
+  2-1 to 2-5: piecewise-constant transport rate between PCR pairs,
+  wrap-aware on the 33+9-bit field, and the discontinuity rule —
+  the previous interval's rate carries across a signalled time-base
+  change, with decode times re-anchored on the new base). Each
+  configured elementary PID runs its §2.4.2.3 chain as a fluid
+  (piecewise-linear) model: whole TS packets enter the fixed
+  512-byte `TBn` and drain at `Rxn` FIFO; PES bytes continue into
+  the main buffer `Bn` (audio — PES headers are held until the
+  access-unit removal, per the audio rule) or into `MBn → EBn` via
+  the leak method (`Rbxn`, PES headers discarded at transfer, EBn
+  back-pressure stalling the leak); whole access units leave at
+  their decode time (DTS when coded, else PTS; access units are
+  PES-granular, timestamp-less continuation PES packets extend the
+  open unit). `system_pids` share the `TBsys → Bsys` chain with the
+  equation 2-7 `Rsys` drain. Violations follow §2.4.2.6: `TbOverflow`
+  / `TbBusyOverOneSecond` (empty-once-a-second), `MainOverflow` /
+  `MainUnderflow`, `MbOverflow` / `MbBusyOverOneSecond`,
+  `EbUnderflow`, `DelayOverOneSecond` (`tdn(j) − t(i) ≤ 1 s`), and
+  `BsysOverflow`, deduplicated per rule + PID with the worst figure
+  kept and every occurrence counted. `TStdStreamModel::audio()`
+  carries the spec-fixed non-ADTS numbers (`Rxn` 2 Mbit/s, `BSn`
+  3584); `video_low_main_level` / `video_high_level` apply the
+  §2.4.2.3 `Rxn = 1.2 × Rmax`, `Rbxn`, and `MBSn = BSmux + BSoh
+  (+ VBVmax − vbv_buffer_size)` formulas over caller-supplied
+  `Rmax` / VBV figures (the values live in ISO/IEC 13818-2 tables).
+  Per-chain stats report peak `TBn` / main / `EBn` occupancy, access
+  units, and worst delay. Pinned by hand-built rate-exact streams:
+  a conformant audio stream and a conformant 25 fps video stream
+  pass; a 40 Mbit/s audio burst trips `TbOverflow`, hoarded audio
+  trips `MainOverflow`, late data `MainUnderflow`, a 2 s decode
+  offset `DelayOverOneSecond`, an under-provisioned leak
+  `EbUnderflow`; the clock survives a PCR wrap and a signalled
+  discontinuity; PSI loads ride the system branch.
+
 - **PES splitting on the mux path (§2.4.3.7).** A bounded-length
   (non-video) frame whose payload exceeds the 16-bit
   `PES_packet_length` budget — the field counts the 3 post-length

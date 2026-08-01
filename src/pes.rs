@@ -54,7 +54,7 @@ use crate::{TsError, TsPacket};
 /// Per ISO/IEC 13818-1 §2.4.3.7: program_stream_map, padding_stream,
 /// private_stream_2, ECM, EMM, program_stream_directory, DSMCC_stream,
 /// H.222.1 type E.
-fn has_optional_pes_header(stream_id: u8) -> bool {
+pub(crate) fn has_optional_pes_header(stream_id: u8) -> bool {
     !matches!(
         stream_id,
         0xBC // program_stream_map

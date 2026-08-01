@@ -131,6 +131,7 @@ pub mod packet;
 pub mod pes;
 pub mod psi;
 pub mod stream_type;
+pub mod tstd;
 pub mod validate;
 
 #[cfg(test)]
@@ -203,6 +204,11 @@ pub use psi::{
     SIT_TABLE_ID, ST_TABLE_ID, TDT_TABLE_ID, TDT_TOT_PID, TOT_TABLE_ID, TSDT_PID, TSDT_TABLE_ID,
 };
 pub use stream_type::StreamType;
+pub use tstd::{
+    analyze_tstd, TStdBranch, TStdChainStats, TStdConfig, TStdReport, TStdStreamModel,
+    TStdViolation, AUDIO_MAIN_BUFFER_SIZE, AUDIO_RX_BPS, BSYS_SIZE, MAX_TSTD_DELAY_SECONDS,
+    RSYS_MIN_BPS, RXSYS_BPS, TB_SIZE,
+};
 pub use validate::{
     validate_ts, PcrReport, PidReport, TsValidationReport, ViolationCounts, MAX_PCR_INTERVAL_27MHZ,
 };
