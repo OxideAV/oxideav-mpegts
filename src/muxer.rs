@@ -82,6 +82,26 @@ const DEFAULT_PROGRAM_NUMBER: u16 = 1;
 /// `last_pcr_pts + PCR_MAX_INTERVAL_90K`, a standalone PCR-only TS
 /// packet is injected on the PCR_PID ahead of the PES.
 const PCR_MAX_INTERVAL_90K: i64 = 3600;
+/// The null (stuffing) PID (§2.4.3.2 Table 2-3).
+const NULL_PID: u16 = 0x1FFF;
+/// CBR mode: target delivery lead — how far ahead of its decode time
+/// a frame's first byte should arrive (27 MHz ticks). 0.25 s sits
+/// comfortably inside the §2.4.2.6 one-second bound while leaving the
+/// T-STD chains time to drain.
+const CBR_TARGET_LEAD_27MHZ: i64 = 27_000_000 / 4;
+/// CBR mode: emit a PCR at least this often on the byte clock
+/// (§2.7.2 bounds the interval at 0,1 s; aim at 40 ms).
+const CBR_PCR_INTERVAL_27MHZ: i64 = 27_000_000 / 25;
+/// Full modulus of the 33+9-bit PCR field.
+const PCR_MODULUS_27MHZ: i64 = (1i64 << 33) * 300;
+/// §2.4.2.3 transport-buffer size — the CBR pacer keeps every paced
+/// PID's TB inside it.
+const TB_SIZE_BYTES: f64 = 512.0;
+/// §2.4.2.3 `Rxn` for non-ADTS audio (bit/s) — the drain the pacer
+/// assumes for audio / private-stream tracks.
+const AUDIO_TB_RX_BPS: f64 = 2_000_000.0;
+/// §2.4.2.3 `Rxsys` (bit/s) — the drain the pacer assumes for PSI.
+const SYS_TB_RX_BPS: f64 = 1_000_000.0;
 
 /// `Open` factory matching `oxideav_core::OpenMuxerFn`. Registered
 /// under the `"mpegts"` container name. Produces a single-program
@@ -288,6 +308,50 @@ pub struct MpegTsMuxer {
     last_psi_pts: Option<i64>,
     /// `true` once `write_header` has run.
     header_written: bool,
+    /// CBR pacing state, `Some` once [`Self::set_mux_rate`] enabled it.
+    cbr: Option<CbrState>,
+}
+
+/// Constant-bit-rate pacing state (§2.4.2 T-STD delivery schedule).
+///
+/// With a fixed mux rate the byte position IS the arrival clock:
+/// `stream_time(bytes) = anchor_time + (bytes − anchor_bytes) × 8 /
+/// rate`. The muxer anchors the clock on the first timestamped frame
+/// (its first byte arrives [`CBR_TARGET_LEAD_27MHZ`] ahead of its
+/// decode time), stamps every PCR from the byte clock, inserts null
+/// packets to burn stream time when a frame would otherwise arrive
+/// too early, and spaces payload packets so each paced PID's
+/// §2.4.2.3 transport buffer never exceeds 512 bytes.
+#[derive(Debug, Clone)]
+struct CbrState {
+    /// Mux rate in bit/s.
+    rate_bps: u64,
+    /// `(anchor_bytes, anchor_time_27mhz)`, set at the first
+    /// timestamped frame.
+    anchor: Option<(u64, i64)>,
+    /// Total bytes emitted so far.
+    bytes_out: u64,
+    /// Byte position of the last PCR emitted on each program's
+    /// PCR_PID (index-aligned with `MpegTsMuxer::programs`).
+    last_pcr_bytes: Vec<Option<u64>>,
+    /// Per-PID transport-buffer pacer: `(fullness_bytes,
+    /// bytes_out_at_last_update, rx_bytes_per_second)`.
+    tb: HashMap<u16, (f64, u64, f64)>,
+}
+
+impl CbrState {
+    /// Arrival-clock value (27 MHz) at byte position `bytes`, once
+    /// anchored.
+    fn time_at(&self, bytes: u64) -> Option<i64> {
+        let (ab, at) = self.anchor?;
+        let delta = bytes as i64 - ab as i64;
+        Some(at + delta * 8 * 27_000_000 / self.rate_bps as i64)
+    }
+
+    /// Seconds worth of stream time per emitted byte.
+    fn seconds_per_byte(&self) -> f64 {
+        8.0 / self.rate_bps as f64
+    }
 }
 
 impl std::fmt::Debug for MpegTsMuxer {
@@ -505,7 +569,129 @@ impl MpegTsMuxer {
             psi_repetition_90k: Some(18_000),
             last_psi_pts: None,
             header_written: false,
+            cbr: None,
         })
+    }
+
+    /// Enable constant-bit-rate output at `rate_bps` (call before
+    /// `write_header`; `None` restores the unpaced variable-rate
+    /// behaviour).
+    ///
+    /// In CBR mode the byte position defines the §2.4.2.2 arrival
+    /// clock, and the muxer shapes its output to the T-STD (§2.4.2):
+    /// every PCR is stamped from the byte clock (so the §2.4.2.2
+    /// transport rate the receiver reconstructs equals `rate_bps`
+    /// exactly); null packets (PID 0x1FFF) burn stream time so a
+    /// frame's first byte arrives [`CBR_TARGET_LEAD_27MHZ`] (0.25 s)
+    /// — never a full second — ahead of its decode time; PCR-only
+    /// packets keep the §2.7.2 inter-PCR bound across null runs; and
+    /// audio / PSI packets are spaced with nulls whenever emitting one
+    /// back-to-back would push that PID's §2.4.2.3 512-byte transport
+    /// buffer past its size at the spec drain rates (2 Mbit/s audio,
+    /// 1 Mbit/s system). Video PIDs are not TB-paced: their §2.4.2.3
+    /// drain (`1.2 × Rmax`) exceeds any mux rate this pacer would be
+    /// asked for. `write_packet` errors when the byte clock has
+    /// already passed a frame's decode time — the configured rate is
+    /// too low to deliver it.
+    pub fn set_mux_rate(&mut self, rate_bps: Option<u64>) {
+        self.cbr = rate_bps.map(|rate_bps| CbrState {
+            rate_bps: rate_bps.max(1),
+            anchor: None,
+            bytes_out: 0,
+            last_pcr_bytes: vec![None; self.programs.len()],
+            tb: HashMap::new(),
+        });
+    }
+
+    /// Emit one 188-byte packet, advancing the CBR byte clock.
+    fn emit(&mut self, pkt: &[u8; TS_PACKET_LEN]) -> CoreResult<()> {
+        self.output.write_all(pkt).map_err(CoreError::Io)?;
+        if let Some(cbr) = &mut self.cbr {
+            cbr.bytes_out += TS_PACKET_LEN as u64;
+        }
+        Ok(())
+    }
+
+    /// Emit a null packet (PID 0x1FFF) — CBR stream-time filler.
+    fn emit_null(&mut self) -> CoreResult<()> {
+        let mut pkt = [0xFFu8; TS_PACKET_LEN];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = (NULL_PID >> 8) as u8 & 0b0001_1111;
+        pkt[2] = NULL_PID as u8;
+        // Payload-only; the continuity counter is undefined on the
+        // null PID (§2.4.3.3).
+        pkt[3] = 0b0001_0000;
+        self.emit(&pkt)
+    }
+
+    /// CBR: current arrival-clock value (27 MHz), once anchored.
+    fn cbr_now(&self) -> Option<i64> {
+        let cbr = self.cbr.as_ref()?;
+        cbr.time_at(cbr.bytes_out)
+    }
+
+    /// CBR: the PCR value (base, extension) an adaptation field
+    /// written at the current byte position should carry — the byte
+    /// clock read at the PCR field's own byte offset (§2.4.2.2: the
+    /// encoded time refers to the byte holding the last PCR_base
+    /// bit, 10 bytes into the packet).
+    fn cbr_pcr_fields(&self) -> Option<(u64, u16)> {
+        let cbr = self.cbr.as_ref()?;
+        let t = cbr.time_at(cbr.bytes_out + 10)?;
+        let wrapped = t.rem_euclid(PCR_MODULUS_27MHZ);
+        Some(((wrapped / 300) as u64, (wrapped % 300) as u16))
+    }
+
+    /// CBR: keep the §2.7.2 inter-PCR bound on the byte clock,
+    /// emitting a PCR-only packet on `prog_idx`'s PCR_PID when the
+    /// last PCR is more than [`CBR_PCR_INTERVAL_27MHZ`] of stream
+    /// time behind.
+    fn cbr_maybe_pcr(&mut self, prog_idx: usize) -> CoreResult<()> {
+        let Some(cbr) = &self.cbr else {
+            return Ok(());
+        };
+        if cbr.anchor.is_none() {
+            return Ok(());
+        }
+        let due = match cbr.last_pcr_bytes[prog_idx] {
+            None => true,
+            Some(last) => {
+                let elapsed = (cbr.bytes_out - last) as i64 * 8 * 27_000_000 / cbr.rate_bps as i64;
+                elapsed >= CBR_PCR_INTERVAL_27MHZ
+            }
+        };
+        if due {
+            self.write_pcr_only_packet_cbr(prog_idx)?;
+        }
+        Ok(())
+    }
+
+    /// CBR: space out a packet on `pid` whose §2.4.2.3 transport
+    /// buffer drains at `rx_bps` — inserting null packets until the
+    /// 512-byte TB has room for one more whole packet.
+    fn cbr_pace_tb(&mut self, pid: u16, rx_bps: f64) -> CoreResult<()> {
+        loop {
+            let Some(cbr) = &mut self.cbr else {
+                return Ok(());
+            };
+            if cbr.anchor.is_none() {
+                return Ok(());
+            }
+            let spb = cbr.seconds_per_byte();
+            let entry = cbr.tb.entry(pid).or_insert((0.0, cbr.bytes_out, rx_bps));
+            // Decay by the stream time elapsed since the last update.
+            let dt = (cbr.bytes_out - entry.1) as f64 * spb;
+            entry.0 = (entry.0 - rx_bps / 8.0 * dt).max(0.0);
+            entry.1 = cbr.bytes_out;
+            if entry.0 + TS_PACKET_LEN as f64 <= TB_SIZE_BYTES {
+                entry.0 += TS_PACKET_LEN as f64;
+                // The packet the caller is about to emit will advance
+                // `bytes_out`; account it now so the next decay spans
+                // from this packet's start.
+                return Ok(());
+            }
+            self.emit_null()?;
+        }
     }
 
     /// Override the PSI re-emission interval (90 kHz ticks). `None`
@@ -615,6 +801,8 @@ impl MpegTsMuxer {
         let mut cursor = 0usize;
         let mut first = true;
         while first || cursor < section.len() {
+            // CBR: keep TBsys inside its 512 bytes (§2.4.2.3 Rxsys).
+            self.cbr_pace_tb(pid, SYS_TB_RX_BPS)?;
             let mut pkt = [0xFFu8; TS_PACKET_LEN];
             pkt[0] = TS_SYNC_BYTE;
             let pusi = if first { 0b0100_0000 } else { 0 };
@@ -639,7 +827,7 @@ impl MpegTsMuxer {
             cursor += take;
             // Bytes past `payload_start + take` stay 0xFF (pre-filled),
             // which is exactly the PSI stuffing terminator.
-            self.output.write_all(&pkt).map_err(CoreError::Io)?;
+            self.emit(&pkt)?;
             first = false;
         }
         Ok(())
@@ -808,13 +996,38 @@ impl MpegTsMuxer {
     /// `PCR_flag` set, the 6-byte PCR, then 0xFF stuffing. Per §2.4.3.4
     /// a packet may legally carry an adaptation field and no payload.
     fn write_pcr_only_packet(&mut self, prog_idx: usize, pts: i64) -> CoreResult<()> {
+        self.emit_pcr_only(prog_idx, (pts.max(0) as u64) & 0x1_FFFF_FFFF, 0)?;
+        self.programs[prog_idx].last_pcr_pts = Some(pts);
+        Ok(())
+    }
+
+    /// CBR variant: PCR fields read from the byte clock; also records
+    /// the byte position for the byte-clock cadence.
+    fn write_pcr_only_packet_cbr(&mut self, prog_idx: usize) -> CoreResult<()> {
+        let Some((base, ext)) = self.cbr_pcr_fields() else {
+            return Ok(());
+        };
+        let position = self.cbr.as_ref().map(|c| c.bytes_out);
+        self.emit_pcr_only(prog_idx, base, ext)?;
+        if let (Some(cbr), Some(pos)) = (&mut self.cbr, position) {
+            cbr.last_pcr_bytes[prog_idx] = Some(pos);
+        }
+        Ok(())
+    }
+
+    /// Shared PCR-only packet emitter for both clock domains.
+    fn emit_pcr_only(&mut self, prog_idx: usize, base: u64, ext: u16) -> CoreResult<()> {
         let pcr_pid = self.programs[prog_idx].pcr_pid;
         let pcr_track = match self.tracks.iter().position(|t| t.pid == pcr_pid) {
             Some(i) => i,
             None => return Ok(()),
         };
-        let cc = self.tracks[pcr_track].cc;
-        self.tracks[pcr_track].cc = (cc + 1) & 0x0F;
+        // §2.4.3.3: the continuity counter shall NOT be incremented on
+        // a packet whose adaptation_field_control is '10' (no
+        // payload); it carries the value of the PID's last payload
+        // packet. `track.cc` holds the NEXT payload value, so the
+        // carried value is one behind it.
+        let cc = self.tracks[pcr_track].cc.wrapping_sub(1) & 0x0F;
 
         let mut pkt = [0xFFu8; TS_PACKET_LEN];
         pkt[0] = TS_SYNC_BYTE;
@@ -826,13 +1039,11 @@ impl MpegTsMuxer {
         // AF spanning the whole 184-byte body (§2.4.3.5 requires
         // adaptation_field_length == 183 when the AF control is '10'):
         // PCR + 0xFF stuffing.
-        let af = crate::AdaptationFieldSpec::with_pcr(pts.max(0) as u64, 0)
+        let af = crate::AdaptationFieldSpec::with_pcr(base, ext)
             .encode(Some(TS_PACKET_LEN - 4))
             .map_err(|e| CoreError::invalid(format!("mpegts muxer: {e}")))?;
         pkt[4..4 + af.len()].copy_from_slice(&af);
-        self.output.write_all(&pkt).map_err(CoreError::Io)?;
-        self.programs[prog_idx].last_pcr_pts = Some(pts);
-        Ok(())
+        self.emit(&pkt)
     }
 
     /// Inject PCR-only packets ahead of a PES so the gap between
@@ -858,9 +1069,40 @@ impl MpegTsMuxer {
         let track = self.tracks[track_idx].clone();
         let prog_idx = track.program;
         let pcr_pid = self.programs[prog_idx].pcr_pid;
+        // CBR: anchor the byte clock on the first timestamped frame,
+        // then burn stream time with null packets until this frame is
+        // due — its first byte should arrive CBR_TARGET_LEAD ahead of
+        // its decode time, and must not arrive after it.
+        let cbr_active = if self.cbr.is_some() {
+            if let Some(d90) = packet.dts.or(packet.pts) {
+                let d27 = d90.saturating_mul(300);
+                let cbr = self.cbr.as_mut().expect("checked");
+                if cbr.anchor.is_none() {
+                    cbr.anchor = Some((cbr.bytes_out, d27 - CBR_TARGET_LEAD_27MHZ));
+                }
+                while self.cbr_now().expect("anchored") < d27 - CBR_TARGET_LEAD_27MHZ {
+                    self.cbr_maybe_pcr(prog_idx)?;
+                    self.emit_null()?;
+                }
+                let now = self.cbr_now().expect("anchored");
+                if now > d27 {
+                    return Err(CoreError::invalid(format!(
+                        "mpegts muxer: mux rate too low — arrival clock {now} is past \
+                         decode time {d27} (27 MHz)"
+                    )));
+                }
+                self.cbr_maybe_pcr(prog_idx)?;
+                true
+            } else {
+                self.cbr.as_ref().is_some_and(|c| c.anchor.is_some())
+            }
+        } else {
+            false
+        };
         // Bound the inter-PCR interval (§2.7.2). Any track's PTS can
         // advance the program's notion of time; the PCR is emitted on the
-        // program's PCR_PID regardless of which track triggered it.
+        // program's PCR_PID regardless of which track triggered it. In
+        // CBR mode the byte-clock cadence above already covers it.
         let pcr_on_this_pes = if track.pid == pcr_pid {
             // The PCR PID's own PES carries an inline PCR on its first
             // TS packet — record it so the periodic logic doesn't
@@ -868,7 +1110,9 @@ impl MpegTsMuxer {
             packet.pts
         } else {
             if let Some(p) = packet.pts {
-                self.maybe_emit_periodic_pcr(prog_idx, p)?;
+                if !cbr_active {
+                    self.maybe_emit_periodic_pcr(prog_idx, p)?;
+                }
             }
             None
         };
@@ -958,12 +1202,31 @@ impl MpegTsMuxer {
                     seamless_splice: Some((s.splice_type, s.dts_next_au)),
                     ..Default::default()
                 });
+        let cbr_on = self.cbr.as_ref().is_some_and(|c| c.anchor.is_some());
+        // CBR TB pacing applies to non-video PIDs (§2.4.2.3 audio
+        // Rx = 2 Mbit/s); video TBs drain at 1.2 × Rmax, above any
+        // sensible mux rate.
+        let tb_rx = if self.tracks[track_idx].is_video {
+            None
+        } else {
+            Some(AUDIO_TB_RX_BPS)
+        };
         let mut cursor = 0usize;
         let mut first = true;
         // `Some(n)` once countdown annotation has started: this packet
         // and `n - 1` more finish the PES (countdown value `n - 1`).
         let mut splice_run: Option<usize> = None;
         while cursor < pes.len() {
+            if let Some(rx) = tb_rx {
+                self.cbr_pace_tb(pid, rx)?;
+            }
+            // CBR: an inline PCR is stamped from the byte clock at the
+            // position the packet will actually occupy (after pacing).
+            let pcr_here = match first_packet_pcr.filter(|_| first) {
+                Some(fixed) if cbr_on => Some(self.cbr_pcr_fields().unwrap_or(fixed)),
+                other => other,
+            };
+            let pcr_packet_pos = self.cbr.as_ref().map(|c| c.bytes_out);
             let mut pkt = [0xFFu8; TS_PACKET_LEN];
             pkt[0] = TS_SYNC_BYTE;
             let pusi = if first { 0b0100_0000 } else { 0 };
@@ -977,7 +1240,7 @@ impl MpegTsMuxer {
             // (§2.4.3.5 — the only stuffing method for PES packets).
             let mut spec = crate::AdaptationFieldSpec {
                 random_access_indicator: first && random_access,
-                pcr: first_packet_pcr.filter(|_| first),
+                pcr: pcr_here,
                 ..Default::default()
             };
             if splice.is_some() {
@@ -1052,7 +1315,13 @@ impl MpegTsMuxer {
                 pkt[4..4 + take].copy_from_slice(&pes[cursor..cursor + take]);
                 cursor += take;
             }
-            self.output.write_all(&pkt).map_err(CoreError::Io)?;
+            self.emit(&pkt)?;
+            if pcr_here.is_some() && cbr_on {
+                let prog = self.tracks[track_idx].program;
+                if let (Some(cbr), Some(pos)) = (&mut self.cbr, pcr_packet_pos) {
+                    cbr.last_pcr_bytes[prog] = Some(pos);
+                }
+            }
             first = false;
         }
         // The splicing point is now behind us; arm the §2.4.3.5
@@ -2603,6 +2872,158 @@ mod tests {
         assert_eq!(annotated.last().unwrap().1, 0);
         assert_eq!(annotated.last().unwrap().0, es_index - 1);
         assert!(crate::validate::validate_ts(&bytes).is_conformant());
+    }
+
+    /// A standalone PCR-only packet must not advance the continuity
+    /// counter (§2.4.3.3: CC does not increment when the AF control is
+    /// `'10'`), so the payload CC chain around it stays unbroken.
+    #[test]
+    fn pcr_only_packets_preserve_cc_chain() {
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            // Audio-only PTS progression forces standalone PCR
+            // injection on the (video) PCR PID between audio PES.
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![1; 32]).with_pts(9_000))
+                .unwrap();
+            for k in 0..40i64 {
+                mx.write_packet(
+                    &Packet::new(1, TimeBase::new(1, 90_000), vec![2; 64])
+                        .with_pts(9_000 + k * 2_000),
+                )
+                .unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        // Standalone PCR packets exist…
+        let pcr_only = bytes
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|c| {
+                let pkt = crate::TsPacket::parse(c).unwrap();
+                pkt.pid == FIRST_ES_PID
+                    && pkt.payload.is_empty()
+                    && pkt
+                        .adaptation_field
+                        .as_ref()
+                        .is_some_and(|af| af.pcr_base.is_some())
+            })
+            .count();
+        assert!(pcr_only >= 5, "want standalone PCRs, got {pcr_only}");
+        // …and the CC chain shows zero §2.4.3.3 errors.
+        let report = crate::validate::validate_ts(&bytes);
+        assert_eq!(report.violations.continuity_errors, 0, "{report:?}");
+        assert!(report.is_conformant(), "{report:?}");
+    }
+
+    /// CBR mode: the byte clock defines the arrival schedule, and the
+    /// muxer's own output must satisfy the §2.4.2 T-STD model —
+    /// checked with the crate's `analyze_tstd` — as well as the
+    /// packet-level validator and an exact demux round-trip.
+    #[test]
+    fn cbr_mux_is_tstd_conformant() {
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let sink = SharedSink::new();
+        let mut expected: Vec<(u32, i64, usize)> = Vec::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.set_mux_rate(Some(4_000_000));
+            mx.write_header().expect("hdr");
+            // 2 s of interleaved 25 fps video (2 KB frames) and audio
+            // (200 B frames every 24 ms), written in PTS order.
+            let mut events: Vec<(u32, i64, usize)> = Vec::new();
+            for k in 0..50i64 {
+                events.push((0, 90_000 + k * 3_600, 2_048));
+            }
+            for k in 0..83i64 {
+                events.push((1, 90_000 + k * 2_160, 200));
+            }
+            events.sort_by_key(|&(_, pts, _)| pts);
+            for &(idx, pts, len) in &events {
+                let mut p =
+                    Packet::new(idx, TimeBase::new(1, 90_000), vec![idx as u8; len]).with_pts(pts);
+                if idx == 0 {
+                    p.flags.keyframe = true;
+                }
+                mx.write_packet(&p).unwrap();
+                expected.push((idx, pts, len));
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        assert_eq!(bytes.len() % TS_PACKET_LEN, 0);
+        // Null filler must be present — that's what shapes the rate.
+        let nulls = bytes
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|c| {
+                let pid = (((c[1] & 0x1F) as u16) << 8) | c[2] as u16;
+                pid == 0x1FFF
+            })
+            .count();
+        assert!(nulls > 100, "CBR output should carry null filler: {nulls}");
+
+        // Packet-level conformance.
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+
+        // T-STD conformance: video @ Rmax 4 Mbit/s, audio at the
+        // spec-fixed figures, PSI through TBsys/Bsys.
+        let config = crate::tstd::TStdConfig::single_program(
+            FIRST_ES_PID,
+            DEFAULT_PMT_PID,
+            vec![
+                (
+                    FIRST_ES_PID,
+                    crate::tstd::TStdStreamModel::video_low_main_level(4_000_000, 131_072, 262_144),
+                ),
+                (FIRST_ES_PID + 1, crate::tstd::TStdStreamModel::audio()),
+            ],
+        );
+        let tstd = crate::tstd::analyze_tstd(&bytes, &config).expect("tstd");
+        assert!(tstd.is_conformant(), "{:?}", tstd.violations);
+        assert!(tstd.modelled_seconds > 1.5);
+        // Every chain saw its access units.
+        let video_stats = tstd.chains.iter().find(|c| c.pid == FIRST_ES_PID).unwrap();
+        assert_eq!(video_stats.access_units, 50);
+        assert!(video_stats.max_delay_seconds < 0.5);
+
+        // Demux round-trip: exact PTS + payload sizes.
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut got: Vec<(i64, usize)> = Vec::new();
+        while let Ok(p) = dmx.next_packet() {
+            got.push((p.pts.unwrap(), p.data.len()));
+        }
+        let mut want: Vec<(i64, usize)> = expected.iter().map(|&(_, p, l)| (p, l)).collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
+    }
+
+    /// CBR mode errors out when the configured rate cannot deliver a
+    /// frame before its decode time.
+    #[test]
+    fn cbr_rejects_insufficient_rate() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+        mx.set_mux_rate(Some(100_000));
+        mx.write_header().unwrap();
+        // 20 KB at 100 kbit/s takes 1.6 s of wire time; the next frame
+        // 40 ms later is unreachable.
+        mx.write_packet(
+            &Packet::new(0, TimeBase::new(1, 90_000), vec![0; 20_000]).with_pts(90_000),
+        )
+        .unwrap();
+        let err = mx.write_packet(
+            &Packet::new(0, TimeBase::new(1, 90_000), vec![0; 2_000]).with_pts(93_600),
+        );
+        assert!(err.is_err(), "{err:?}");
     }
 
     /// One packet's splice view: `(splice_countdown, seamless pair)`.

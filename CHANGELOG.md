@@ -9,7 +9,38 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Standalone PCR packets no longer break the continuity chain.**
+  §2.4.3.3 forbids incrementing the continuity counter on a packet
+  whose `adaptation_field_control` is `'10'` (no payload); the muxer
+  was both consuming and advancing the PID's counter for injected
+  PCR-only packets, making the next payload packet on the PCR PID
+  look like a dropped packet to a §2.4.3.3-enforcing receiver. They
+  now carry the last payload packet's counter value untouched;
+  pinned by a validator check over a mux run that forces periodic
+  standalone PCR injection.
+
 ### Added
+
+- **CBR pacing on the mux side (§2.4.2 delivery schedule).**
+  `MpegTsMuxer::set_mux_rate(Some(bit_rate))` turns the muxer into a
+  constant-bit-rate packetizer whose byte position defines the
+  §2.4.2.2 arrival clock: every PCR (inline on PES starts and
+  standalone) is stamped from the byte clock at the PCR field's own
+  byte offset, so the transport rate a receiver reconstructs from
+  consecutive PCRs equals the configured rate exactly; null packets
+  (PID 0x1FFF) burn stream time so each frame's first byte arrives
+  0.25 s — never a full second — ahead of its decode time; PCR-only
+  packets keep the §2.7.2 bound across null runs (~40 ms cadence);
+  and audio / PSI packets are spaced with nulls whenever emitting one
+  back-to-back would push that PID's §2.4.2.3 512-byte transport
+  buffer past its size at the spec drain rates (2 Mbit/s audio,
+  1 Mbit/s system). `write_packet` errors when the byte clock has
+  already passed a frame's decode time (rate too low). The CBR
+  output is pinned conformant against the crate's own `analyze_tstd`
+  model (video + audio + PSI chains, zero violations), the
+  packet-level `validate_ts`, and an exact demux round-trip.
 
 - **T-STD buffer model (§2.4.2).** New `tstd` module:
   `analyze_tstd(&[u8], &TStdConfig) -> TStdReport` replays a whole
