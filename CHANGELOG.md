@@ -53,11 +53,24 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   and audio / PSI packets are spaced with nulls whenever emitting one
   back-to-back would push that PID's §2.4.2.3 512-byte transport
   buffer past its size at the spec drain rates (2 Mbit/s audio,
-  1 Mbit/s system). `write_packet` errors when the byte clock has
-  already passed a frame's decode time (rate too low). The CBR
-  output is pinned conformant against the crate's own `analyze_tstd`
-  model (video + audio + PSI chains, zero violations), the
-  packet-level `validate_ts`, and an exact demux round-trip.
+  1 Mbit/s system). Delivery leads are per class: video rides the
+  full 0.25 s, while non-video frames are *held* in a per-track
+  queue and released 40 ms before their decode time — the §2.4.2.3
+  audio main buffer is only 3584 bytes, so an audio stream riding
+  the video lead would hoard several times `BSn` (observed in a
+  black-box remux before the fix); held frames flush ahead of any
+  packet that would pass their release point and drain fully at the
+  trailer. `write_packet` errors when the byte clock has already
+  passed a frame's decode time (rate too low). The CBR output is
+  pinned conformant against the crate's own `analyze_tstd` model
+  (video + audio + PSI chains, zero violations, audio Bn peak under
+  1,5 KB and audio delay under 0.1 s), the packet-level
+  `validate_ts`, and an exact demux round-trip. Black-box
+  cross-check: a validator-muxed 3 s H.264 + AC-3 transport stream
+  demuxed by this crate and remuxed CBR at 4 Mbit/s with a
+  mid-stream seamless splice reads back through the validator with
+  the same 75 video + 87 audio frame counts, zero decode errors,
+  and the reconstructed rate at the configured value.
 
 - **T-STD buffer model (§2.4.2).** New `tstd` module:
   `analyze_tstd(&[u8], &TStdConfig) -> TStdReport` replays a whole

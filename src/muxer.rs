@@ -89,6 +89,13 @@ const NULL_PID: u16 = 0x1FFF;
 /// comfortably inside the §2.4.2.6 one-second bound while leaving the
 /// T-STD chains time to drain.
 const CBR_TARGET_LEAD_27MHZ: i64 = 27_000_000 / 4;
+/// CBR mode: target delivery lead for audio (non-video) frames.
+/// §2.4.2.3 gives audio a 3584-byte main buffer, so audio cannot ride
+/// the video lead: at 40 ms even a 640 kbit/s stream keeps its
+/// in-flight bytes (~3,2 KB) inside `BSn`. Non-video frames are held
+/// in a per-track queue and released this far ahead of their decode
+/// time.
+const CBR_AUDIO_LEAD_27MHZ: i64 = 27_000_000 * 4 / 100;
 /// CBR mode: emit a PCR at least this often on the byte clock
 /// (§2.7.2 bounds the interval at 0,1 s; aim at 40 ms).
 const CBR_PCR_INTERVAL_27MHZ: i64 = 27_000_000 / 25;
@@ -337,6 +344,13 @@ struct CbrState {
     /// Per-PID transport-buffer pacer: `(fullness_bytes,
     /// bytes_out_at_last_update, rx_bytes_per_second)`.
     tb: HashMap<u16, (f64, u64, f64)>,
+    /// Held non-video frames, one queue per track (index-aligned with
+    /// `MpegTsMuxer::tracks`) — released [`CBR_AUDIO_LEAD_27MHZ`]
+    /// ahead of their decode time so the small §2.4.2.3 audio main
+    /// buffer never hoards a video-sized lead.
+    held: Vec<std::collections::VecDeque<Packet>>,
+    /// Re-entrancy guard: a flush-initiated write must not flush.
+    flushing: bool,
 }
 
 impl CbrState {
@@ -600,7 +614,49 @@ impl MpegTsMuxer {
             bytes_out: 0,
             last_pcr_bytes: vec![None; self.programs.len()],
             tb: HashMap::new(),
+            held: vec![std::collections::VecDeque::new(); self.tracks.len()],
+            flushing: false,
         });
+    }
+
+    /// CBR: write every held non-video frame whose release time
+    /// (`decode − CBR_AUDIO_LEAD`) falls at or before `horizon_27`,
+    /// in release order.
+    fn cbr_flush_due(&mut self, horizon_27: i64) -> CoreResult<()> {
+        loop {
+            let Some(cbr) = &mut self.cbr else {
+                return Ok(());
+            };
+            if cbr.flushing {
+                return Ok(());
+            }
+            // Earliest-due held frame across tracks.
+            let mut best: Option<(usize, i64)> = None;
+            for (ti, q) in cbr.held.iter().enumerate() {
+                if let Some(p) = q.front() {
+                    let d27 = p.dts.or(p.pts).unwrap_or(0).saturating_mul(300);
+                    let due = d27 - CBR_AUDIO_LEAD_27MHZ;
+                    if best.map_or(true, |(_, b)| due < b) {
+                        best = Some((ti, due));
+                    }
+                }
+            }
+            let Some((ti, due)) = best else {
+                return Ok(());
+            };
+            if due > horizon_27 {
+                return Ok(());
+            }
+            let pkt = self.cbr.as_mut().expect("checked").held[ti]
+                .pop_front()
+                .expect("peeked");
+            self.cbr.as_mut().expect("checked").flushing = true;
+            let result = self.write_pes_packet(ti, &pkt);
+            if let Some(cbr) = &mut self.cbr {
+                cbr.flushing = false;
+            }
+            result?;
+        }
     }
 
     /// Emit one 188-byte packet, advancing the CBR byte clock.
@@ -1076,11 +1132,27 @@ impl MpegTsMuxer {
         let cbr_active = if self.cbr.is_some() {
             if let Some(d90) = packet.dts.or(packet.pts) {
                 let d27 = d90.saturating_mul(300);
+                // Per-class delivery lead: video rides the full
+                // 0.25 s; audio's 3584-byte Bn only affords ~40 ms.
+                let lead = if track.is_video {
+                    CBR_TARGET_LEAD_27MHZ
+                } else {
+                    CBR_AUDIO_LEAD_27MHZ
+                };
                 let cbr = self.cbr.as_mut().expect("checked");
                 if cbr.anchor.is_none() {
-                    cbr.anchor = Some((cbr.bytes_out, d27 - CBR_TARGET_LEAD_27MHZ));
+                    cbr.anchor = Some((cbr.bytes_out, d27 - lead));
                 }
-                while self.cbr_now().expect("anchored") < d27 - CBR_TARGET_LEAD_27MHZ {
+                loop {
+                    let now = self.cbr_now().expect("anchored");
+                    if now >= d27 - lead {
+                        break;
+                    }
+                    // Held audio due before this frame goes out first.
+                    self.cbr_flush_due(now)?;
+                    if self.cbr_now().expect("anchored") >= d27 - lead {
+                        break;
+                    }
                     self.cbr_maybe_pcr(prog_idx)?;
                     self.emit_null()?;
                 }
@@ -1091,6 +1163,11 @@ impl MpegTsMuxer {
                          decode time {d27} (27 MHz)"
                     )));
                 }
+                // Held audio that falls due while this PES occupies
+                // the wire is released ahead of it.
+                let rate = self.cbr.as_ref().expect("checked").rate_bps as i64;
+                let wire = (packet.data.len() as i64 + 256) * 8 * 27_000_000 / rate;
+                self.cbr_flush_due(now + wire)?;
                 self.cbr_maybe_pcr(prog_idx)?;
                 true
             } else {
@@ -1366,10 +1443,38 @@ impl Muxer for MpegTsMuxer {
         if let Some(p) = packet.pts {
             self.maybe_repeat_psi(p)?;
         }
+        // CBR: hold non-video frames until CBR_AUDIO_LEAD before
+        // their decode time — the §2.4.2.3 audio main buffer is far
+        // too small for the video delivery lead.
+        if let Some(cbr) = &self.cbr {
+            if cbr.anchor.is_some() && !self.tracks[track_idx].is_video && packet.pts.is_some() {
+                self.cbr.as_mut().expect("checked").held[track_idx].push_back(packet.clone());
+                let now = self.cbr_now().expect("anchored");
+                return self.cbr_flush_due(now);
+            }
+        }
         self.write_pes_packet(track_idx, packet)
     }
 
     fn write_trailer(&mut self) -> CoreResult<()> {
+        // CBR: release every still-held frame in due order (each
+        // write burns null packets up to its own release point).
+        while let Some(ti) = self.cbr.as_ref().and_then(|cbr| {
+            cbr.held
+                .iter()
+                .enumerate()
+                .filter_map(|(ti, q)| {
+                    q.front()
+                        .map(|p| (ti, p.dts.or(p.pts).unwrap_or(0).saturating_mul(300)))
+                })
+                .min_by_key(|&(_, d)| d)
+                .map(|(ti, _)| ti)
+        }) {
+            let pkt = self.cbr.as_mut().expect("checked").held[ti]
+                .pop_front()
+                .expect("peeked");
+            self.write_pes_packet(ti, &pkt)?;
+        }
         // Re-emit the program / SI tables once so a late-joining player
         // still finds them after seeking near the end.
         self.write_pat()?;
@@ -2990,6 +3095,24 @@ mod tests {
         let video_stats = tstd.chains.iter().find(|c| c.pid == FIRST_ES_PID).unwrap();
         assert_eq!(video_stats.access_units, 50);
         assert!(video_stats.max_delay_seconds < 0.5);
+        // Audio rides the short 40 ms lead, keeping its 3584-byte Bn
+        // nearly empty.
+        let audio_stats = tstd
+            .chains
+            .iter()
+            .find(|c| c.pid == FIRST_ES_PID + 1)
+            .unwrap();
+        assert_eq!(audio_stats.access_units, 83);
+        assert!(
+            audio_stats.max_delay_seconds < 0.1,
+            "audio delay {}",
+            audio_stats.max_delay_seconds
+        );
+        assert!(
+            audio_stats.peak_main_bytes < 1_500,
+            "audio Bn peak {}",
+            audio_stats.peak_main_bytes
+        );
 
         // Demux round-trip: exact PTS + payload sizes.
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
