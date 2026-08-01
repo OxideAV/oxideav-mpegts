@@ -890,7 +890,21 @@ impl MpegTsMuxer {
         let random_access = packet.flags.keyframe
             && (track.pid != self.programs[prog_idx].pcr_pid || pcr.is_some());
         let splice = self.tracks[track_idx].pending_splice.take();
-        self.write_pes_bytes_as_ts(track.pid, track_idx, &pes, pcr, random_access, splice)
+        let last = pes.len() - 1;
+        for (i, chunk) in pes.iter().enumerate() {
+            // The PCR + random-access indicator belong to the frame's
+            // first PES envelope; an armed splicing point lands after
+            // the frame's LAST byte, i.e. the last envelope.
+            self.write_pes_bytes_as_ts(
+                track.pid,
+                track_idx,
+                chunk,
+                pcr.filter(|_| i == 0),
+                random_access && i == 0,
+                splice.filter(|_| i == last),
+            )?;
+        }
+        Ok(())
     }
 
     /// Number of TS packets a `remaining`-byte run fragments into when
@@ -1099,27 +1113,58 @@ impl Muxer for MpegTsMuxer {
     }
 }
 
-/// Build one PES packet through the shared write-side header builder
-/// ([`crate::pes::PesHeaderSpec`]): fixed header, optional PTS / DTS,
-/// then the payload. Video stream_ids (`0xE0..=0xEF`) get the
-/// unbounded `PES_packet_length = 0` form (what BD discs use); other
-/// IDs carry the real length per §2.4.3.7. Timestamps ride the 33-bit
-/// ring, so extended values are reduced modulo `2^33` before
-/// encoding.
-fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<u8>> {
+/// Build the PES packet(s) for one [`Packet`] through the shared
+/// write-side header builder ([`crate::pes::PesHeaderSpec`]): fixed
+/// header, optional PTS / DTS, then the payload. Video stream_ids
+/// (`0xE0..=0xEF`) get the unbounded `PES_packet_length = 0` form
+/// (what BD discs use) and always fit one PES packet; other IDs carry
+/// the real length per §2.4.3.7, and since `PES_packet_length` is a
+/// 16-bit count of the bytes following it, a frame whose payload
+/// exceeds that budget splits across several PES packets — the first
+/// carries the timestamps, continuations carry none (a PES packet
+/// need not hold a whole access unit; alignment is only promised by
+/// the `data_alignment_indicator`, which the muxer leaves clear).
+/// Timestamps ride the 33-bit ring, so extended values are reduced
+/// modulo `2^33` before encoding.
+fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<Vec<u8>>> {
     let ring = |t: i64| (t as u64) & 0x1_FFFF_FFFF;
+    let map_err = |e: crate::TsError| CoreError::invalid(format!("mpegts muxer: {e}"));
     // Compare on the ring: two timestamps that coincide there must
     // collapse to the PTS-only form (§2.7.5 forbids DTS == PTS).
     let has_dts = packet.dts.is_some() && packet.dts.map(ring) != packet.pts.map(ring);
-    let spec = crate::pes::PesHeaderSpec {
+    let first_spec = crate::pes::PesHeaderSpec {
         stream_id,
         pts_90k: packet.pts.map(ring),
         dts_90k: if has_dts { packet.dts.map(ring) } else { None },
         unbounded_length: (0xE0..=0xEF).contains(&stream_id),
         ..Default::default()
     };
-    spec.encode(&packet.data)
-        .map_err(|e| CoreError::invalid(format!("mpegts muxer: {e}")))
+    if first_spec.unbounded_length {
+        return Ok(vec![first_spec.encode(&packet.data).map_err(map_err)?]);
+    }
+    // Bounded form: `PES_packet_length` counts the 3 post-length header
+    // bytes, the optional PTS/DTS area, and the payload.
+    let opt_len = match (first_spec.pts_90k, first_spec.dts_90k) {
+        (Some(_), Some(_)) => 10,
+        (Some(_), None) => 5,
+        _ => 0,
+    };
+    let first_max = u16::MAX as usize - 3 - opt_len;
+    if packet.data.len() <= first_max {
+        return Ok(vec![first_spec.encode(&packet.data).map_err(map_err)?]);
+    }
+    let mut out = vec![first_spec
+        .encode(&packet.data[..first_max])
+        .map_err(map_err)?];
+    let cont_spec = crate::pes::PesHeaderSpec {
+        stream_id,
+        ..Default::default()
+    };
+    let cont_max = u16::MAX as usize - 3;
+    for chunk in packet.data[first_max..].chunks(cont_max) {
+        out.push(cont_spec.encode(chunk).map_err(map_err)?);
+    }
+    Ok(out)
 }
 
 /// Normalise an arbitrary language tag into the 3-byte ISO 639-2 code
@@ -2422,6 +2467,142 @@ mod tests {
         let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
         let r = MpegTsMuxer::new(output, &[s]);
         assert!(r.is_err());
+    }
+
+    /// A bounded-length (non-video) frame larger than the 16-bit
+    /// `PES_packet_length` budget must split across several PES
+    /// packets — first with the timestamps, continuations without —
+    /// and demux back as payloads that concatenate to the original.
+    #[test]
+    fn oversize_bounded_frame_splits_across_pes_packets() {
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let streams = vec![stream_info(0, "pcm_s16be", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            mx.write_packet(
+                &Packet::new(0, TimeBase::new(1, 90_000), payload.clone()).with_pts(30_000),
+            )
+            .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+
+        // Every PES on the wire must respect the 16-bit length bound:
+        // count the PUSI starts on the ES PID.
+        let pusi_count = bytes
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|c| {
+                let pkt = crate::TsPacket::parse(c).unwrap();
+                pkt.pid == FIRST_ES_PID && pkt.payload_unit_start
+            })
+            .count();
+        // 200 000 bytes over (65 535 − 3 − 5) + 2 × (65 535 − 3) + tail.
+        assert_eq!(pusi_count, 4);
+
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut parts = Vec::new();
+        while let Ok(p) = dmx.next_packet() {
+            parts.push(p);
+        }
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0].pts, Some(30_000));
+        assert!(parts[1..].iter().all(|p| p.pts.is_none()));
+        let concat: Vec<u8> = parts.iter().flat_map(|p| p.data.clone()).collect();
+        assert_eq!(concat, payload);
+    }
+
+    /// A payload that exactly fills one bounded PES stays a single
+    /// envelope.
+    #[test]
+    fn bounded_frame_at_length_budget_stays_single_pes() {
+        // 65 535 − 3 (post-length header) − 5 (PTS) payload bytes.
+        let payload = vec![0x5A; 65_527];
+        let streams = vec![stream_info(0, "ac3", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            mx.write_packet(
+                &Packet::new(0, TimeBase::new(1, 90_000), payload.clone()).with_pts(9_000),
+            )
+            .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let pusi_count = bytes
+            .chunks_exact(TS_PACKET_LEN)
+            .filter(|c| {
+                let pkt = crate::TsPacket::parse(c).unwrap();
+                pkt.pid == FIRST_ES_PID && pkt.payload_unit_start
+            })
+            .count();
+        assert_eq!(pusi_count, 1);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let p = dmx.next_packet().expect("packet");
+        assert_eq!(p.data, payload);
+        assert_eq!(p.pts, Some(9_000));
+    }
+
+    /// A splice armed on a frame that splits across PES envelopes must
+    /// annotate only the LAST envelope — the splicing point sits after
+    /// the frame's final byte.
+    #[test]
+    fn splice_on_split_frame_annotates_last_envelope() {
+        let payload = vec![0x77u8; 100_000];
+        let streams = vec![stream_info(0, "pcm_s16be", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            mx.signal_splice_after(0, SpliceSpec::default()).unwrap();
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), payload).with_pts(3_000))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+
+        // Walk the ES PID: record the index of the last PUSI packet
+        // and every countdown annotation.
+        let mut last_pusi_at = None;
+        let mut annotated = Vec::new();
+        let mut es_index = 0usize;
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pkt = crate::TsPacket::parse(chunk).unwrap();
+            if pkt.pid != FIRST_ES_PID {
+                continue;
+            }
+            if pkt.payload_unit_start {
+                last_pusi_at = Some(es_index);
+            }
+            if let Some(c) = pkt
+                .adaptation_field
+                .as_ref()
+                .and_then(|af| af.splice_countdown)
+            {
+                annotated.push((es_index, c));
+            }
+            es_index += 1;
+        }
+        let last_pusi_at = last_pusi_at.expect("PES starts");
+        assert!(!annotated.is_empty());
+        // Every annotation sits at or after the last PES start, and
+        // the run ends at zero on the final payload packet.
+        assert!(annotated.iter().all(|&(i, _)| i >= last_pusi_at));
+        assert_eq!(annotated.last().unwrap().1, 0);
+        assert_eq!(annotated.last().unwrap().0, es_index - 1);
+        assert!(crate::validate::validate_ts(&bytes).is_conformant());
     }
 
     /// One packet's splice view: `(splice_countdown, seamless pair)`.

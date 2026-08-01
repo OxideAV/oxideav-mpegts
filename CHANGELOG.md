@@ -11,6 +11,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **PES splitting on the mux path (§2.4.3.7).** A bounded-length
+  (non-video) frame whose payload exceeds the 16-bit
+  `PES_packet_length` budget — the field counts the 3 post-length
+  header bytes, the optional PTS/DTS area, and the payload — now
+  splits across several PES envelopes instead of erroring: the first
+  carries the timestamps, continuations carry none (a PES packet need
+  not hold a whole access unit; alignment is only promised by the
+  `data_alignment_indicator`, which stays clear). Each envelope
+  fragments into TS packets with its own PUSI, the frame's PCR /
+  `random_access_indicator` ride the first envelope, and an armed
+  splicing point annotates only the last — the splicing point sits
+  after the frame's final byte. Video stream_ids keep the unbounded
+  `PES_packet_length = 0` single-envelope form. Demux round-trip:
+  the split envelopes surface as consecutive packets whose payloads
+  concatenate to the original frame, the first with the PTS.
+
 - **Splice-point mux API (§2.4.3.4 / §2.4.3.5 / Annex K).**
   `MpegTsMuxer::signal_splice_after(stream_index, SpliceSpec)` arms a
   splicing point immediately after the next written `Packet`'s PES
