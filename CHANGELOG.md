@@ -23,6 +23,27 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Time-base discontinuity signalling on the mux side (§2.4.3.5 /
+  §2.7.6).** `MpegTsMuxer::signal_time_base_discontinuity(program)`
+  marks frames written afterwards as belonging to a new system time
+  base: the next PCR on the program's PCR_PID — inline or standalone
+  — carries `discontinuity_indicator = 1` (the §2.4.3.5 rule that
+  the indicator rides the first packet containing a PCR of the new
+  base), the §2.7.2 PCR bookkeeping restarts, and in CBR mode the
+  byte clock re-anchors on the next timestamped frame after flushing
+  any still-held old-base audio. Pinned: the indicator appears
+  exactly once on a PCR-carrying packet right after the old-base
+  PES run, `validate_ts` stays conformant across the break (its
+  interval check resets on the signalled discontinuity), and a CBR
+  mux across a backward base jump stays zero-violation under
+  `analyze_tstd` (whose arrival clock applies the §2.4.2.2
+  previous-rate rule at the break).
+
+- **The T-STD model rides the hostile-input sweep.** `analyze_tstd`
+  joins the deterministic mutation / noise / truncation sweeps: any
+  input must produce an error or a finite, violation-capped report —
+  never a panic or unbounded work.
+
 - **Splice-signalling coherence checks in `validate_ts` (§2.4.3.5).**
   Three new `ViolationCounts` rules, tracked per PID across the
   stream: `splice_countdown_inconsistent` — an annotated

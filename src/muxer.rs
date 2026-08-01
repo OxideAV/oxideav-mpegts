@@ -403,6 +403,11 @@ struct ProgramState {
     /// 90 kHz PCR-base value of the last PCR emitted on this program's
     /// PCR_PID, or `None` before the first PCR (§2.7.2 interval bound).
     last_pcr_pts: Option<i64>,
+    /// A time-base discontinuity is armed: the next PCR emitted on
+    /// this program's PCR_PID carries `discontinuity_indicator = 1`
+    /// (§2.4.3.5 — the first packet of the PID containing a PCR of
+    /// the new time base).
+    pending_discontinuity: bool,
     /// Optional DVB service metadata for the SDT.
     service: Option<ServiceSpec>,
     /// Present/following events for this program's EIT.
@@ -571,6 +576,7 @@ impl MpegTsMuxer {
                 pmt_cc: 0,
                 track_indices,
                 last_pcr_pts: None,
+                pending_discontinuity: false,
                 service: spec.service.clone(),
                 events: spec.events.clone(),
             });
@@ -818,6 +824,63 @@ impl MpegTsMuxer {
             post_splice_packets: post,
             ..spec
         });
+        Ok(())
+    }
+
+    /// Arm a system time-base discontinuity for `program_number`
+    /// (§2.4.3.5 / §2.7.6): timestamps in packets written after this
+    /// call belong to a **new** time base.
+    ///
+    /// The next PCR emitted on the program's PCR_PID — inline on a
+    /// PES start or standalone — carries `discontinuity_indicator = 1`,
+    /// per the §2.4.3.5 rule that the indicator is set in the first
+    /// packet of the PID containing a PCR of the new time base. The
+    /// program's §2.7.2 PCR bookkeeping restarts, and in CBR mode the
+    /// byte clock re-anchors on the next timestamped frame (any
+    /// still-held non-video frames of the old base are flushed
+    /// first). Per §2.7.6, callers must code a PTS on the first
+    /// access unit of each stream after the change — this muxer
+    /// timestamps every frame, so writing frames with the new-base
+    /// PTS satisfies it.
+    ///
+    /// Errors with `Error::Invalid` for an unknown `program_number`.
+    pub fn signal_time_base_discontinuity(&mut self, program_number: u16) -> CoreResult<()> {
+        let prog_idx = self
+            .programs
+            .iter()
+            .position(|p| p.program_number == program_number)
+            .ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "mpegts muxer: discontinuity for unknown program {program_number}"
+                ))
+            })?;
+        // Old-base frames still held by the CBR pacer go out on the
+        // old clock before the break.
+        while let Some(ti) = self.cbr.as_ref().and_then(|cbr| {
+            cbr.held
+                .iter()
+                .enumerate()
+                .filter_map(|(ti, q)| {
+                    q.front()
+                        .map(|p| (ti, p.dts.or(p.pts).unwrap_or(0).saturating_mul(300)))
+                })
+                .min_by_key(|&(_, d)| d)
+                .map(|(ti, _)| ti)
+        }) {
+            let pkt = self.cbr.as_mut().expect("checked").held[ti]
+                .pop_front()
+                .expect("peeked");
+            self.write_pes_packet(ti, &pkt)?;
+        }
+        self.programs[prog_idx].pending_discontinuity = true;
+        self.programs[prog_idx].last_pcr_pts = None;
+        if let Some(cbr) = &mut self.cbr {
+            // Re-anchor on the first new-base frame; PCR emission
+            // pauses until then (the §2.7.2 interval restarts with
+            // the new base).
+            cbr.anchor = None;
+            cbr.last_pcr_bytes[prog_idx] = None;
+        }
         Ok(())
     }
 
@@ -1085,6 +1148,9 @@ impl MpegTsMuxer {
     /// Shared PCR-only packet emitter for both clock domains.
     fn emit_pcr_only(&mut self, prog_idx: usize, base: u64, ext: u16) -> CoreResult<()> {
         let pcr_pid = self.programs[prog_idx].pcr_pid;
+        // An armed time-base discontinuity rides the first new-base
+        // PCR (§2.4.3.5).
+        let discontinuity = std::mem::take(&mut self.programs[prog_idx].pending_discontinuity);
         let pcr_track = match self.tracks.iter().position(|t| t.pid == pcr_pid) {
             Some(i) => i,
             None => return Ok(()),
@@ -1106,9 +1172,13 @@ impl MpegTsMuxer {
         // AF spanning the whole 184-byte body (§2.4.3.5 requires
         // adaptation_field_length == 183 when the AF control is '10'):
         // PCR + 0xFF stuffing.
-        let af = crate::AdaptationFieldSpec::with_pcr(base, ext)
-            .encode(Some(TS_PACKET_LEN - 4))
-            .map_err(|e| CoreError::invalid(format!("mpegts muxer: {e}")))?;
+        let af = crate::AdaptationFieldSpec {
+            discontinuity_indicator: discontinuity,
+            pcr: Some((base, ext)),
+            ..Default::default()
+        }
+        .encode(Some(TS_PACKET_LEN - 4))
+        .map_err(|e| CoreError::invalid(format!("mpegts muxer: {e}")))?;
         pkt[4..4 + af.len()].copy_from_slice(&af);
         self.emit(&pkt)
     }
@@ -1329,6 +1399,12 @@ impl MpegTsMuxer {
             let mut spec = crate::AdaptationFieldSpec {
                 random_access_indicator: first && random_access,
                 pcr: pcr_here,
+                // An armed time-base discontinuity rides the first
+                // new-base PCR (§2.4.3.5).
+                discontinuity_indicator: pcr_here.is_some()
+                    && std::mem::take(
+                        &mut self.programs[self.tracks[track_idx].program].pending_discontinuity,
+                    ),
                 ..Default::default()
             };
             if splice.is_some() {
@@ -3158,6 +3234,111 @@ mod tests {
             &Packet::new(0, TimeBase::new(1, 90_000), vec![0; 2_000]).with_pts(93_600),
         );
         assert!(err.is_err(), "{err:?}");
+    }
+
+    /// An armed time-base discontinuity must ride the first new-base
+    /// PCR on the PCR PID (§2.4.3.5) — exactly once — and the stream
+    /// must stay conformant across the break.
+    #[test]
+    fn time_base_discontinuity_rides_first_new_base_pcr() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            for k in 0..4i64 {
+                mx.write_packet(
+                    &Packet::new(0, TimeBase::new(1, 90_000), vec![1; 64])
+                        .with_pts(90_000 + k * 3_600),
+                )
+                .unwrap();
+            }
+            // New time base, restarting near zero.
+            mx.signal_time_base_discontinuity(1).unwrap();
+            for k in 0..4i64 {
+                mx.write_packet(
+                    &Packet::new(0, TimeBase::new(1, 90_000), vec![2; 64])
+                        .with_pts(900 + k * 3_600),
+                )
+                .unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        // Exactly one discontinuity-flagged packet, carrying a PCR,
+        // after the four old-base PES.
+        let mut flagged = Vec::new();
+        let mut pes_starts_before_flag = 0usize;
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pkt = crate::TsPacket::parse(chunk).unwrap();
+            if pkt.pid != FIRST_ES_PID {
+                continue;
+            }
+            if let Some(af) = &pkt.adaptation_field {
+                if af.discontinuity_indicator {
+                    flagged.push(af.pcr_base.is_some());
+                }
+            }
+            if flagged.is_empty() && pkt.payload_unit_start {
+                pes_starts_before_flag += 1;
+            }
+        }
+        assert_eq!(flagged, vec![true], "one flagged packet, with PCR");
+        assert_eq!(pes_starts_before_flag, 4, "flag follows the old-base PES");
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+
+        // Unknown program is rejected.
+        let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+        assert!(mx.signal_time_base_discontinuity(7).is_err());
+    }
+
+    /// CBR mode across a time-base discontinuity: the byte clock
+    /// re-anchors on the new base and the output stays T-STD
+    /// conformant (the model carries the old rate across the break
+    /// per §2.4.2.2).
+    #[test]
+    fn cbr_survives_time_base_discontinuity() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.set_mux_rate(Some(2_000_000));
+            mx.write_header().unwrap();
+            for k in 0..15i64 {
+                mx.write_packet(
+                    &Packet::new(0, TimeBase::new(1, 90_000), vec![1; 1_024])
+                        .with_pts(90_000 + k * 3_600),
+                )
+                .unwrap();
+            }
+            mx.signal_time_base_discontinuity(1).unwrap();
+            for k in 0..15i64 {
+                mx.write_packet(
+                    &Packet::new(0, TimeBase::new(1, 90_000), vec![2; 1_024])
+                        .with_pts(900 + k * 3_600),
+                )
+                .unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+        let config = crate::tstd::TStdConfig::single_program(
+            FIRST_ES_PID,
+            DEFAULT_PMT_PID,
+            vec![(
+                FIRST_ES_PID,
+                crate::tstd::TStdStreamModel::video_low_main_level(2_000_000, 131_072, 262_144),
+            )],
+        );
+        let tstd = crate::tstd::analyze_tstd(&bytes, &config).expect("tstd");
+        assert!(tstd.is_conformant(), "{:?}", tstd.violations);
+        assert_eq!(tstd.chains[0].access_units, 30);
     }
 
     /// One packet's splice view: `(splice_countdown, seamless pair)`.

@@ -118,6 +118,26 @@ fn exercise(bytes: &[u8]) {
         }
     }
     let _ = pes_asm.flush();
+
+    // T-STD model replay: mutated PCRs / PES headers / lengths must
+    // produce an error or a finite report — never a panic and never
+    // unbounded work (violations are capped per rule + PID; the fluid
+    // chains advance monotonically).
+    let tstd_config = crate::tstd::TStdConfig::single_program(
+        0x0101,
+        0x0100,
+        vec![
+            (
+                0x0101,
+                crate::tstd::TStdStreamModel::video_low_main_level(4_000_000, 65_536, 131_072),
+            ),
+            (0x0102, crate::tstd::TStdStreamModel::audio()),
+        ],
+    );
+    if let Ok(report) = crate::tstd::analyze_tstd(bytes, &tstd_config) {
+        assert!(report.modelled_seconds.is_finite());
+        assert!(report.violations.len() <= 32);
+    }
 }
 
 #[test]
