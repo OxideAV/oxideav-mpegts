@@ -88,8 +88,21 @@
 //!   the read layer.
 //! - Conformance validation ([`validate::validate_ts`]) — a bounded
 //!   two-pass report of §2.4.3.3 / §2.4.3.5 / §2.7.2 / §2.4.4
-//!   violations with per-PID and per-PCR-PID statistics and a
+//!   violations (including §2.4.3.5 splice-signalling coherence:
+//!   countdown progression, seamless-run continuity, audio
+//!   `splice_type`) with per-PID and per-PCR-PID statistics and a
 //!   §2.4.2.2 transport-rate estimate.
+//! - The T-STD buffer model ([`tstd::analyze_tstd`], §2.4.2) — the
+//!   PCR-derived arrival clock (equations 2-1..2-5) replayed through
+//!   the `TBn → Bn` / `TBn → MBn → EBn` / `TBsys → Bsys` chains with
+//!   every §2.4.2.6 overflow / underflow / emptying / delay condition
+//!   checked and per-chain peak-occupancy statistics.
+//! - Splice-point signalling on the mux side
+//!   ([`muxer::MpegTsMuxer::signal_splice_after`], §2.4.3.5 /
+//!   Annex K) and CBR pacing on the §2.4.2 delivery schedule
+//!   ([`muxer::MpegTsMuxer::set_mux_rate`]) — byte-clock PCRs,
+//!   null-packet fill, per-class delivery leads, transport-buffer
+//!   spacing.
 //!
 //! The crate ships **no decoders** — every payload byte stays as a
 //! `&[u8]` slice. A downstream pipeline (e.g. `oxideav-cli`'s

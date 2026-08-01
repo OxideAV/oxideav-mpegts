@@ -38,16 +38,27 @@
 //!   without parsing the elementary stream. On the PCR PID the
 //!   indicator is only emitted when that packet also carries a PCR,
 //!   per the §2.4.3.5 constraint.
+//! * [`MpegTsMuxer::signal_splice_after`] arms a §2.4.3.5 splicing
+//!   point after the next written frame: its PES envelope's payload
+//!   packets carry `splice_countdown` down to zero on the last one,
+//!   optionally with the seamless `splice_type` / `DTS_next_AU`
+//!   extension and the negative post-splice countdown.
+//! * A frame whose payload exceeds the 16-bit `PES_packet_length`
+//!   budget on a bounded (non-video) stream_id splits across several
+//!   PES envelopes (§2.4.3.7) — timestamps on the first, none on the
+//!   continuations.
+//! * [`MpegTsMuxer::set_mux_rate`] enables CBR pacing on the §2.4.2
+//!   T-STD delivery schedule: byte-clock PCRs, null-packet stream-time
+//!   fill, per-class delivery leads (0.25 s video / 40 ms audio
+//!   hold-back), and §2.4.2.3 transport-buffer spacing for audio and
+//!   PSI packets.
 //!
 //! Out of scope:
 //!
 //! * MPEG-DASH-style time slicing, PES-CRC, or scrambling.
-//! * Adaptation-field discontinuity / private-data / splice flags on
-//!   the write path (the [`crate::AdaptationFieldSpec`] builder covers
-//!   them for callers assembling their own packets). The PCR PID gets
-//!   PCR at every PES start plus periodic standalone PCR packets;
-//!   non-PCR-PID tracks get an adaptation field for keyframe
-//!   random-access marking and the tail-packet stuffing pass.
+//! * Adaptation-field discontinuity / private-data flags on the write
+//!   path (the [`crate::AdaptationFieldSpec`] builder covers them for
+//!   callers assembling their own packets).
 //!
 //! CodecId → MPEG-TS `stream_type` (Table 2-29 + HDMV extension
 //! 0x80..0xFF). The reverse mapping is performed at `open`; unknown
@@ -596,7 +607,7 @@ impl MpegTsMuxer {
     /// every PCR is stamped from the byte clock (so the §2.4.2.2
     /// transport rate the receiver reconstructs equals `rate_bps`
     /// exactly); null packets (PID 0x1FFF) burn stream time so a
-    /// frame's first byte arrives [`CBR_TARGET_LEAD_27MHZ`] (0.25 s)
+    /// frame's first byte arrives a fixed delivery lead (0.25 s)
     /// — never a full second — ahead of its decode time; PCR-only
     /// packets keep the §2.7.2 inter-PCR bound across null runs; and
     /// audio / PSI packets are spaced with nulls whenever emitting one
