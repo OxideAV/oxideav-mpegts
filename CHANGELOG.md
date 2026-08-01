@@ -23,6 +23,23 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Splice-signalling coherence checks in `validate_ts` (§2.4.3.5).**
+  Three new `ViolationCounts` rules, tracked per PID across the
+  stream: `splice_countdown_inconsistent` — an annotated
+  `splice_countdown` value that contradicts the count of payload
+  packets (duplicates and payload-less packets excluded) since the
+  previous annotation, with sparse annotation and a fresh positive
+  restart after a passed splicing point both accepted;
+  `seamless_splice_run_broken` — once `seamless_splice` is signalled
+  with a positive countdown, every subsequent `splicing_point_flag`
+  packet through the countdown-zero packet must carry it with
+  identical `splice_type` / `DTS_next_AU`; and
+  `nonzero_splice_type_on_audio` — `splice_type` must be `'0000'`
+  when the PID's PMT `stream_type` classifies it as audio. The
+  muxer's own splice output passes all three (its tests run the
+  validator); hand-built streams pin each violation and its clean
+  counterpart.
+
 - **CBR pacing on the mux side (§2.4.2 delivery schedule).**
   `MpegTsMuxer::set_mux_rate(Some(bit_rate))` turns the muxer into a
   constant-bit-rate packetizer whose byte position defines the

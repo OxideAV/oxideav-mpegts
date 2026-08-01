@@ -83,6 +83,21 @@ pub struct ViolationCounts {
     /// PAT / PMT sections that failed to parse — bad CRC, truncated
     /// or overrunning `section_length`, wrong `table_id`.
     pub bad_psi_sections: u64,
+    /// §2.4.3.5 `splice_countdown` values that contradict the count
+    /// of payload packets since the previous annotated packet on the
+    /// PID (a positive value counts the remaining same-PID payload
+    /// packets to the splicing point; negatives count past it —
+    /// duplicates and payload-less packets excluded).
+    pub splice_countdown_inconsistent: u64,
+    /// §2.4.3.5 seamless-splice run breaks: once `seamless_splice`
+    /// is signalled with a positive countdown it must appear — with
+    /// identical `splice_type` and `DTS_next_AU` — on every
+    /// subsequent packet of the PID whose `splicing_point_flag` is
+    /// set, through the countdown-zero packet.
+    pub seamless_splice_run_broken: u64,
+    /// §2.4.3.5: `splice_type` shall be `'0000'` when the PID's PMT
+    /// `stream_type` classifies it as audio.
+    pub nonzero_splice_type_on_audio: u64,
 }
 
 impl ViolationCounts {
@@ -213,6 +228,7 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
     let mut pmt_assemblers: BTreeMap<u16, PsiSectionAssembler> = BTreeMap::new();
     let mut pmt_pids: BTreeSet<u16> = BTreeSet::new();
     let mut pcr_states: Vec<PcrState> = Vec::new();
+    let mut audio_pids: BTreeSet<u16> = BTreeSet::new();
     let mut pat_packet_indices: Vec<u64> = Vec::new();
 
     let mut idx: u64 = 0;
@@ -257,6 +273,11 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
                                 {
                                     pcr_states.push(PcrState::new(pmt.pcr_pid));
                                 }
+                                for stream in &pmt.streams {
+                                    if crate::StreamType::from_raw(stream.stream_type).is_audio() {
+                                        audio_pids.insert(stream.elementary_pid);
+                                    }
+                                }
                             }
                             Err(_) => report.violations.bad_psi_sections += 1,
                         }
@@ -274,6 +295,17 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
 
     // ---- Pass 2: packet-level checks. ----
     let mut cc_trackers: BTreeMap<u16, ContinuityTracker> = BTreeMap::new();
+    // §2.4.3.5 splice-signalling coherence, per PID: the countdown at
+    // the last annotated packet, the payload packets seen since, and
+    // the locked seamless pair while a positive run is in flight.
+    #[derive(Default)]
+    struct SpliceRun {
+        /// `(countdown_at_last_annotation, payload_packets_since)`.
+        last: Option<(i32, i32)>,
+        /// `(splice_type, DTS_next_AU)` locked by the active run.
+        seamless: Option<(u8, u64)>,
+    }
+    let mut splice_runs: BTreeMap<u16, SpliceRun> = BTreeMap::new();
     let mut offset: u64 = 0;
     for chunk in bytes.chunks_exact(psize) {
         let window = layout.window(chunk);
@@ -324,13 +356,89 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
         // §2.4.3.3 continuity counter.
         let has_payload = (afc & 0b01) != 0;
         let tracker = cc_trackers.entry(pkt.pid).or_default();
-        match tracker.observe(pkt.continuity_counter, has_payload, discontinuity) {
+        let cc_event = tracker.observe(pkt.continuity_counter, has_payload, discontinuity);
+        match cc_event {
             ContinuityEvent::Dropped { .. } => {
                 pid_report.continuity_errors += 1;
                 report.violations.continuity_errors += 1;
             }
             ContinuityEvent::Duplicate => pid_report.duplicates += 1,
             _ => {}
+        }
+
+        // §2.4.3.5 splice-signalling coherence. The countdown counts
+        // same-PID payload packets, duplicates and payload-less
+        // packets excluded.
+        {
+            let run = splice_runs.entry(pkt.pid).or_default();
+            let counts = has_payload && cc_event != ContinuityEvent::Duplicate;
+            if counts {
+                if let Some((_, since)) = &mut run.last {
+                    *since += 1;
+                }
+            }
+            let countdown = pkt
+                .adaptation_field
+                .as_ref()
+                .and_then(|af| af.splice_countdown)
+                .map(i32::from);
+            let seamless_pair = pkt
+                .adaptation_field
+                .as_ref()
+                .and_then(|af| af.adaptation_field_extension.as_ref())
+                .and_then(|ext| match (ext.splice_type, ext.dts_next_au) {
+                    (Some(t), Some(d)) => Some((t, d)),
+                    _ => None,
+                });
+            let expected = run.last.map(|(c, since)| c - since);
+            if let Some(c) = countdown {
+                match expected {
+                    // A fresh positive countdown may start once the
+                    // previous run's splicing point has passed.
+                    Some(e) if e < 0 && c > 0 => {}
+                    Some(e) if c != e => {
+                        report.violations.splice_countdown_inconsistent += 1;
+                    }
+                    _ => {}
+                }
+                // Seamless-run continuation (§2.4.3.5: once set with a
+                // positive countdown, set — with identical values —
+                // until the countdown-zero packet inclusive).
+                match (&run.seamless, seamless_pair) {
+                    (Some(locked), Some(pair)) if *locked != pair => {
+                        report.violations.seamless_splice_run_broken += 1;
+                    }
+                    (Some(_), None) => {
+                        report.violations.seamless_splice_run_broken += 1;
+                    }
+                    (None, Some(pair)) if c > 0 => run.seamless = Some(pair),
+                    _ => {}
+                }
+                if let Some((splice_type, _)) = seamless_pair {
+                    if splice_type != 0 && audio_pids.contains(&pkt.pid) {
+                        report.violations.nonzero_splice_type_on_audio += 1;
+                    }
+                }
+                if c <= 0 {
+                    // The splicing point is reached (or behind us) —
+                    // the seamless obligation ends here.
+                    run.seamless = None;
+                }
+                run.last = Some((c, 0));
+            } else if let Some(e) = expected {
+                if e < -128 {
+                    // Stale: no annotation for longer than the field
+                    // could describe.
+                    run.last = None;
+                    run.seamless = None;
+                } else if e == 0 && counts && run.seamless.is_some() {
+                    // The packet where the countdown reaches zero must
+                    // still carry the seamless fields — reaching it
+                    // unannotated breaks the run.
+                    report.violations.seamless_splice_run_broken += 1;
+                    run.seamless = None;
+                }
+            }
         }
 
         if let Some(af) = &pkt.adaptation_field {
@@ -504,6 +612,145 @@ mod tests {
             ));
         }
         out
+    }
+
+    /// One payload packet on `pid` with optional splice fields, AF
+    /// stuffed so the payload fills the packet.
+    fn splice_pkt(
+        pid: u16,
+        cc: u8,
+        countdown: Option<i8>,
+        seamless: Option<(u8, u64)>,
+        payload_len: usize,
+    ) -> [u8; TS_PACKET_LEN] {
+        let spec = AdaptationFieldSpec {
+            splice_countdown: countdown,
+            extension: seamless.map(|(t, d)| crate::AdaptationFieldExtensionSpec {
+                seamless_splice: Some((t, d)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let af = spec.encode(Some(TS_PACKET_LEN - 4 - payload_len)).unwrap();
+        ts_packet(
+            pid,
+            false,
+            cc,
+            0b11,
+            Some(&af),
+            &vec![0xAB; payload_len],
+            false,
+        )
+    }
+
+    /// §2.4.3.5 splice_countdown progression: exact counts (with
+    /// sparse annotation) pass; a value contradicting the payload
+    /// packet count is flagged.
+    #[test]
+    fn splice_countdown_progression_checked() {
+        let pid = 0x0102;
+        // Consistent: 3, (unannotated), 1, 0, -1.
+        let mut bytes = clean_stream(2);
+        for (i, (c, s)) in [
+            (Some(3i8), None),
+            (None, None),
+            (Some(1), None),
+            (Some(0), None),
+            (Some(-1), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bytes.extend_from_slice(&splice_pkt(pid, i as u8, c, s, 32));
+        }
+        let report = validate_ts(&bytes);
+        assert_eq!(report.violations.splice_countdown_inconsistent, 0);
+        assert!(report.is_conformant(), "{:?}", report.violations);
+
+        // Inconsistent: 2 then 0 with only one payload packet between.
+        let mut bytes = clean_stream(2);
+        bytes.extend_from_slice(&splice_pkt(pid, 0, Some(2), None, 32));
+        bytes.extend_from_slice(&splice_pkt(pid, 1, Some(0), None, 32));
+        let report = validate_ts(&bytes);
+        assert_eq!(report.violations.splice_countdown_inconsistent, 1);
+        assert!(!report.is_conformant());
+    }
+
+    /// §2.4.3.5 seamless-splice continuation: dropping the fields (or
+    /// changing their values) mid-run is flagged; a clean run is not.
+    #[test]
+    fn seamless_splice_run_continuity_checked() {
+        let pid = 0x0102;
+        let pair = Some((0x3u8, 48_000u64));
+        // Clean run: 2, 1, 0 all carrying the same pair.
+        let mut bytes = clean_stream(2);
+        for (i, c) in [2i8, 1, 0].into_iter().enumerate() {
+            bytes.extend_from_slice(&splice_pkt(pid, i as u8, Some(c), pair, 32));
+        }
+        let report = validate_ts(&bytes);
+        assert_eq!(report.violations.seamless_splice_run_broken, 0);
+        assert!(report.is_conformant(), "{:?}", report.violations);
+
+        // Broken run: the fields vanish on the countdown-1 packet.
+        let mut bytes = clean_stream(2);
+        bytes.extend_from_slice(&splice_pkt(pid, 0, Some(2), pair, 32));
+        bytes.extend_from_slice(&splice_pkt(pid, 1, Some(1), None, 32));
+        let report = validate_ts(&bytes);
+        assert_eq!(report.violations.seamless_splice_run_broken, 1);
+
+        // Broken run: DTS_next_AU changes mid-run.
+        let mut bytes = clean_stream(2);
+        bytes.extend_from_slice(&splice_pkt(pid, 0, Some(2), pair, 32));
+        bytes.extend_from_slice(&splice_pkt(pid, 1, Some(1), Some((0x3, 50_000)), 32));
+        let report = validate_ts(&bytes);
+        assert_eq!(report.violations.seamless_splice_run_broken, 1);
+    }
+
+    /// §2.4.3.5: a non-zero splice_type on a PMT-typed audio PID is
+    /// flagged.
+    #[test]
+    fn nonzero_splice_type_on_audio_checked() {
+        let mut out = Vec::new();
+        let pat = build::build_pat(1, 0, &[(1, 0x0100)]);
+        out.extend_from_slice(&ts_packet(0x0000, true, 0, 0b01, None, &pat, true));
+        let pmt = build::build_pmt(
+            1,
+            0,
+            0x0102,
+            &[],
+            &[build::PmtStreamEntry {
+                stream_type: 0x03, // MPEG-1 audio
+                elementary_pid: 0x0102,
+                es_info: Vec::new(),
+            }],
+        );
+        out.extend_from_slice(&ts_packet(0x0100, true, 0, 0b01, None, &pmt, true));
+        out.extend_from_slice(&splice_pkt(0x0102, 0, Some(1), Some((0x2, 900)), 32));
+        out.extend_from_slice(&splice_pkt(0x0102, 1, Some(0), Some((0x2, 900)), 32));
+        let report = validate_ts(&out);
+        assert_eq!(report.violations.nonzero_splice_type_on_audio, 2);
+        assert!(!report.is_conformant());
+
+        // splice_type 0 on the same audio PID is fine.
+        let mut out = Vec::new();
+        let pat = build::build_pat(1, 0, &[(1, 0x0100)]);
+        out.extend_from_slice(&ts_packet(0x0000, true, 0, 0b01, None, &pat, true));
+        let pmt = build::build_pmt(
+            1,
+            0,
+            0x0102,
+            &[],
+            &[build::PmtStreamEntry {
+                stream_type: 0x03,
+                elementary_pid: 0x0102,
+                es_info: Vec::new(),
+            }],
+        );
+        out.extend_from_slice(&ts_packet(0x0100, true, 0, 0b01, None, &pmt, true));
+        out.extend_from_slice(&splice_pkt(0x0102, 0, Some(1), Some((0x0, 900)), 32));
+        out.extend_from_slice(&splice_pkt(0x0102, 1, Some(0), Some((0x0, 900)), 32));
+        let report = validate_ts(&out);
+        assert_eq!(report.violations.nonzero_splice_type_on_audio, 0);
     }
 
     #[test]
