@@ -2749,7 +2749,9 @@ fn decode_extended_event(data: &[u8]) -> Option<DescriptorBody<'_>> {
     // after the prefix; the text_length byte and its run follow it.
     let items_start = 5usize;
     let items_end = items_start.checked_add(length_of_items)?;
-    if items_end > data.len() {
+    // §6.2.15: the mandatory `text_length` byte follows the item
+    // block, so the block must end strictly inside the payload.
+    if items_end >= data.len() {
         return None;
     }
     let items_block = &data[items_start..items_end];
@@ -4637,6 +4639,17 @@ mod tests {
         body.push(0); // text_length
         let block = tlv(0x4E, &body);
         let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert!(matches!(d.body, DescriptorBody::Raw));
+    }
+
+    #[test]
+    fn extended_event_descriptor_missing_text_length_falls_back_to_raw() {
+        // Fuzz regression: the item block ends exactly at the payload
+        // end, leaving no room for the mandatory §6.2.15 text_length
+        // byte — must decode as Raw, not index out of bounds.
+        let block = tlv(0x4E, &[0x00, b'e', b'n', b'g', 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x4E);
         assert!(matches!(d.body, DescriptorBody::Raw));
     }
 

@@ -198,6 +198,24 @@ indicator.
 enforcement (max one repeat per CC) is built in: a second identical
 CC reads as a drop, not a second duplicate.
 
+## Fuzzing
+
+`fuzz/` carries a cargo-fuzz harness with four structure-aware
+targets, exercised daily by the `Fuzz` workflow (30-minute shared
+budget) and runnable locally with `cargo fuzz run <target>`:
+
+| Target             | Contract                                                                 |
+|--------------------|--------------------------------------------------------------------------|
+| `demux`            | Arbitrary hostile bytes through the whole demux surface — `validate_ts`, the raw packet walk (per-PID PSI assembly across fragmented sections into every PSI/DVB-SI table parser with full descriptor walks, PES reassembly + Table 2-17 header decode, PCR / continuity / PTS-unwrap trackers), the §2.4.2 T-STD replay, and the typed demuxer battery (open, bounded drain, RAP index, all three seek paths). Panic-free: any byte sequence must parse-or-error with bounded work and allocation. |
+| `parse_units`      | Hostile bytes straight into the standalone unit parsers (all table parsers, descriptor walks, `PesPacket::parse`, the section assembler, `decode_utc_time`) plus encode∘parse fixed points: recipe-driven `PesHeaderSpec` / `AdaptationFieldSpec` encodes must parse back to the same wire fields, and the PAT/PMT builders must parse cleanly. |
+| `mux_roundtrip`    | Valid-by-construction multi-program plans — programs × streams × frames × DVB SDT/EIT/NIT × §2.4.3.5/Annex-K splice runs × §2.7.6 time-base discontinuities × §2.4.2 CBR pacing × PSI repetition × §2.7.5 DTS × 33-bit-wrap timelines — must mux, come out `validate_ts`-conformant, satisfy the T-STD model in CBR mode, and re-demux to the exact per-stream (PTS, DTS, payload, keyframe) sequence per program. |
+| `structured_mutate`| A writer-shaped fixture from the same plan space under fuzz-directed sync-byte kills, TS-header / PSI-section-header / CRC-region flips, packet drops and duplicates, truncation, and 192/204-byte physical reframing, fed back through the full hostile battery. |
+
+The committed corpus holds named seeds plus regression inputs for
+every finding the harness has caught; `fuzz/corpus/<target>/
+regression_*` inputs are also pinned as in-tree unit tests where the
+fix lives.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).

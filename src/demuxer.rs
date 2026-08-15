@@ -1171,6 +1171,7 @@ impl MpegTsDemuxer {
         if pes.random_access {
             pkt = pkt.with_keyframe(true);
         }
+        let mut pts_ext: Option<u64> = None;
         if let Some(raw) = pes.pts_90k {
             let ext = if let Some(t) = self.pts_trackers.get_mut(&pid) {
                 t.observe(raw);
@@ -1178,6 +1179,7 @@ impl MpegTsDemuxer {
             } else {
                 raw
             };
+            pts_ext = Some(ext);
             pkt = pkt.with_pts(ext as i64);
             let info = &mut self.streams[stream_idx as usize];
             if info.start_time.is_none() {
@@ -1186,6 +1188,18 @@ impl MpegTsDemuxer {
         }
         if let Some(raw) = pes.dts_90k {
             let ext = if let Some(t) = self.dts_trackers.get_mut(&pid) {
+                // §2.4.3.7: DTS and PTS share one time base. A stream
+                // whose first coded DTS only appears after a 2^33 wrap
+                // must not anchor an independent epoch at the raw ring
+                // value — seed the tracker with this PES's extended
+                // PTS so both fields stay on the same 64-bit axis
+                // (found by the mux_roundtrip fuzz target on a
+                // wrap-crossing timeline).
+                if t.extended().is_none() {
+                    if let Some(hint) = pts_ext {
+                        t.seed(hint);
+                    }
+                }
                 t.observe(raw);
                 t.extended().unwrap_or(raw)
             } else {

@@ -942,8 +942,12 @@ impl StuffingTable {
                 "PSI table_id does not match expected value",
             ));
         }
-        let section_syntax_indicator = (section[1] & 0b1000_0000) != 0;
+        // Bounds first: `parse_short_section_body` rejects anything
+        // shorter than the 3-byte table_id + section_length header
+        // (EN 300 468 §5.2.8 Table 11), so `section[1]` is only read
+        // once it is known to exist.
         let body = parse_short_section_body(section)?;
+        let section_syntax_indicator = (section[1] & 0b1000_0000) != 0;
         Ok(Self {
             section_syntax_indicator,
             data_bytes: body.to_vec(),
@@ -2045,7 +2049,17 @@ fn parse_section_header(
     let section_length = ((((b1 & 0b0000_1111) as usize) << 8) | (b2 as usize)) & 0x0FFF;
 
     // section_length counts bytes after itself — i.e. from `section[3]`
-    // through the CRC. So total section size = 3 + section_length.
+    // through the CRC. A long-form section always carries the 5 fixed
+    // bytes `table_id_extension` .. `last_section_number` plus the
+    // CRC_32 trailer inside that count (§2.4.4.5..§2.4.4.11 /
+    // EN 300 468 §5.2), so any claim below 9 cannot frame a section.
+    if section_length < SECTION_HEADER_LEN - 3 + SECTION_CRC_LEN {
+        return Err(TsError::Truncated {
+            what: "PSI section_length (long form spans fixed header + CRC)",
+            have: section_length,
+            need: SECTION_HEADER_LEN - 3 + SECTION_CRC_LEN,
+        });
+    }
     let total = 3 + section_length;
     if total > section.len() {
         return Err(TsError::SectionLengthOverrun {
@@ -2249,6 +2263,26 @@ mod tests {
         // The classic check value for CRC-32/MPEG-2 over "123456789"
         // is 0x0376E6E7 (see CRC-Catalogue / Greg Cook).
         assert_eq!(crc, 0x0376_E6E7);
+    }
+
+    #[test]
+    fn undersized_section_length_claim_errors_not_panics() {
+        // Fuzz regression: a long-form section whose `section_length`
+        // claims fewer bytes than the fixed `table_id_extension` ..
+        // `last_section_number` header plus the CRC_32 it must span
+        // (§2.4.4.5..§2.4.4.11) previously underflowed the CRC-offset
+        // arithmetic. Claims 0..9 must all error as truncated.
+        for claim in 0u8..9 {
+            let mut section = vec![PAT_TABLE_ID, 0b1011_0000, claim];
+            section.extend_from_slice(&[0u8; 16]); // ample backing bytes
+            assert!(
+                matches!(
+                    ProgramAssociationTable::parse(&section),
+                    Err(TsError::Truncated { .. })
+                ),
+                "claim {claim}"
+            );
+        }
     }
 
     #[test]
@@ -3774,6 +3808,22 @@ mod tests {
         assert!(matches!(
             StuffingTable::parse(&section),
             Err(TsError::SectionLengthOverrun { .. })
+        ));
+    }
+
+    #[test]
+    fn st_headerless_slice_errors_not_panics() {
+        // Fuzz regression: a slice holding only the table_id byte —
+        // shorter than the 3-byte table_id + section_length header of
+        // EN 300 468 §5.2.8 Table 11 — must error as truncated, not
+        // index out of bounds.
+        assert!(matches!(
+            StuffingTable::parse(&[ST_TABLE_ID]),
+            Err(TsError::Truncated { .. })
+        ));
+        assert!(matches!(
+            StuffingTable::parse(&[ST_TABLE_ID, 0b0011_0000]),
+            Err(TsError::Truncated { .. })
         ));
     }
 

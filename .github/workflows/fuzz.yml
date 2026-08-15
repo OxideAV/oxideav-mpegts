@@ -1,0 +1,32 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. MPEG-TS
+# (ISO/IEC 13818-1) walks are attacker-controlled at every level: the
+# 188/192/204-byte packet grid, adaptation-field lengths + §2.4.3.5
+# pairings, 12-bit section_length claims reassembled across packets
+# (§2.4.4), §2.6 / EN 300 468 §6 descriptor TLV loops, the Table 2-17
+# PES optional-header ladder, the 33-bit PTS/DTS ring (§2.4.3.7), and
+# the PCR arithmetic behind duration probes, seek bisection, and the
+# §2.4.2 T-STD arrival clock. Four targets share the 30-minute
+# budget: `demux` (arbitrary bytes through the validator + packet
+# walk + table parsers + demuxer battery, panic-free), `parse_units`
+# (standalone section / descriptor / PES parsers + encode∘parse fixed
+# points), `mux_roundtrip` (valid-by-construction multi-program plans
+# must mux, validate conformant, satisfy the T-STD in CBR mode, and
+# re-demux to the exact per-stream timestamp / payload / keyframe
+# sequence), and `structured_mutate` (writer-shaped fixtures with
+# fuzz-directed sync-byte kills, section-header / CRC flips, packet
+# drops / duplicates, truncation, and 192/204 reframing must never
+# panic the battery).
+
+on:
+  schedule:
+    - cron: "37 4 * * *"   # daily 04:37 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

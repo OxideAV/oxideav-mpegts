@@ -11,6 +11,133 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Fixed
 
+- **Multi-program CBR muxes keep every program's PCR cadence alive.**
+  The byte clock is shared, so a program whose frames run out early
+  still ages in stream time — but standalone PCR maintenance only ran
+  for the program owning the frame being written, so an idle
+  program's PCR_PID fell silent (a >0,1 s unsignalled inter-PCR gap
+  the crate's own validator flags per §2.7.2). The CBR null-burn and
+  pre-write checks now maintain the §2.7.2 bound for ALL programs.
+  Found by the `mux_roundtrip` fuzz target; pinned by
+  `cbr_multi_program_keeps_idle_programs_pcr_cadence`.
+
+- **Standalone periodic PCRs now carry the same `PTS − ~10 ms` stamp
+  as inline PES PCRs.** The two sources interleave on one PCR_PID:
+  a non-PCR-PID sibling stream writing first at time `P` emitted a
+  bootstrap standalone PCR stamped `P`, then the PCR PID's own PES at
+  the same instant carried `P − 900` — a backward time-base step
+  §2.4.3.5 only permits under a signalled discontinuity, which the
+  §2.7.2 modular interval check reads as a ~26,5 h gap. Both paths
+  now stamp `(PTS − 900).max(0)` and record the same base value.
+  Found by the `mux_roundtrip` fuzz target.
+
+- **CBR PSI is bounded against the pooled §2.4.2.3 `Bsys`, not just
+  the transport buffer.** The system branch's main buffer is 1536
+  bytes drained at equation 2-7's slow `Rsys` (`max(80 kbit/s,
+  rate/500)`), so an aggressive PSI repetition interval could outrun
+  the drain even with TBsys-spaced packets. The pacer now carries a
+  pooled `Bsys` account: system-PID PSI packets null-pace against it,
+  and a mid-stream repetition is deferred (retried on the next write)
+  unless the whole PAT+PMT burst fits without null-burning — so
+  frames are never delayed behind a PSI refresh. Found by the
+  `mux_roundtrip` fuzz target as a `Bsys` overflow under
+  `analyze_tstd`.
+
+- **Inline PES PCRs ring modulo 2^33 like the timestamps they
+  accompany.** A caller writing an extended timeline past the 33-bit
+  wrap had its PES timestamps ringed on the wire (§2.4.3.7) but the
+  accompanying PCR stamp errored with "PCR base exceeds 33 bits"
+  instead of ringing; the §2.7.2 bookkeeping stays on the extended
+  caller timeline so the interval check survives the wrap. Found by
+  the `mux_roundtrip` fuzz target on a wrap-crossing plan.
+
+- **A first coded DTS appearing only after a 2^33 wrap stays on the
+  PTS's extended timeline.** §2.4.3.7 gives DTS and PTS one shared
+  time base, but the demuxer's per-PID DTS tracker anchored an
+  independent epoch at the first raw value it saw — so a stream that
+  wrapped before ever coding a DTS reported the post-wrap DTS ~26,5 h
+  behind its PTS. The DTS tracker now seeds its wrap epoch from the
+  same PES's extended PTS. Found by the `mux_roundtrip` fuzz target;
+  pinned by `post_wrap_first_dts_stays_on_extended_timeline`.
+
+- **Sparse-cadence programs backfill their §2.7.2 PCR chain instead
+  of overshooting it.** The periodic standalone-PCR trigger fired
+  only once a write's own stamp had already drifted past the bound,
+  so a program whose active cadence was coarser than the trigger
+  (e.g. a 7 700-tick audio step after its video ended) put a
+  9 031-tick (>0,1 s) gap on the wire. The chain is now stepped
+  forward with standalone PCRs just inside the bound until the
+  upcoming stamp is reachable — for sibling-triggered emissions and
+  for the PCR PID's own inline stamp alike. Found by the
+  `mux_roundtrip` fuzz target.
+
+- **`StuffingTable::parse` no longer indexes past a headerless
+  slice.** A section shorter than the 3-byte `table_id` +
+  `section_length` header of EN 300 468 §5.2.8 Table 11 (e.g. a
+  1-byte `[0x72]` buffer) read `section[1]` before any length check
+  and panicked. The bounds validation now runs first and the input
+  errors as truncated. Found by the `parse_units` fuzz target;
+  pinned by `st_headerless_slice_errors_not_panics`.
+
+- **Undersized `section_length` claims no longer underflow the
+  long-form CRC arithmetic.** A long-form section always spans the
+  five fixed `table_id_extension` .. `last_section_number` bytes plus
+  the CRC_32 inside its `section_length` count
+  (§2.4.4.5–§2.4.4.11 / EN 300 468 §5.2), so any claim below 9
+  cannot frame a section — yet `parse_section_header` accepted it and
+  computed `total - 4` / sliced `body` with a debug-build subtract
+  overflow (release: an out-of-bounds slice). Claims 0..9 now error
+  as truncated. Found by the `parse_units` fuzz target; pinned by
+  `undersized_section_length_claim_errors_not_panics`.
+
+- **`extended_event_descriptor` decode no longer reads past a payload
+  that ends at the item block.** The mandatory `text_length` byte
+  follows the §6.2.15 item loop, but the bound allowed
+  `length_of_items` to end exactly at the payload end and then
+  indexed the missing byte. Such a descriptor now falls back to
+  `DescriptorBody::Raw`. Found by the `parse_units` fuzz target;
+  pinned by `extended_event_descriptor_missing_text_length_falls_back_to_raw`.
+
+- **CBR PSI bursts now respect the pooled §2.4.2.3 system branch.**
+  PID 0 (PAT), PID 1 (CAT), and every `program_map_PID` are
+  transferred through ONE `TBsys`, but the CBR pacer budgeted each
+  PSI PID a separate 512-byte transport buffer — and skipped pacing
+  entirely before the byte clock anchored — so `write_header`'s
+  PAT+PMT burst, an aggressive repetition interval, and the trailer
+  re-emission could stack the pooled buffer to 541 bytes at high mux
+  rates (a §2.4.2.6 TB-overflow the crate's own `analyze_tstd`
+  flags). PSI on the system PIDs now paces against a single shared
+  `TBsys` account, active from the first written byte (TB fullness
+  depends only on byte deltas and the fixed rate — §2.4.2.2's byte
+  position IS the arrival clock); DVB SI PIDs (SDT / NIT / EIT) keep
+  their per-PID bound. Found by the `mux_roundtrip` fuzz target;
+  pinned by `cbr_psi_bursts_respect_pooled_system_tb`.
+
+### Added
+
+- **cargo-fuzz harness (`fuzz/`) + daily Fuzz workflow.** Four
+  structure-aware targets share the fleet 30-minute daily budget:
+  `demux` — arbitrary hostile bytes through the conformance
+  validator, the raw packet walk (PSI assembly across fragmented
+  sections into every PSI/SI table parser with full descriptor
+  walks, PES reassembly + header decode, PCR / continuity / PTS
+  trackers), the §2.4.2 T-STD replay, and the typed demuxer battery
+  (open, bounded drain, RAP index, all three seek paths) — panic-free
+  contract; `parse_units` — hostile bytes straight into the
+  standalone section / descriptor / PES / assembler / UTC-time
+  parsers plus encode∘parse fixed-point asserts for `PesHeaderSpec`,
+  `AdaptationFieldSpec`, and the PAT/PMT builders; `mux_roundtrip` —
+  valid-by-construction multi-program plans (programs × streams ×
+  frames × DVB SDT/EIT/NIT × splice / time-base-discontinuity / CBR
+  / PSI-repetition / DTS / 33-bit-wrap knobs) must mux, validate
+  conformant, satisfy the T-STD in CBR mode, and re-demux to the
+  exact per-stream (PTS, DTS, payload, keyframe) sequence;
+  `structured_mutate` — writer-shaped fixtures under fuzz-directed
+  sync-byte kills, TS-header / section-header / CRC-region flips,
+  packet drops / duplicates, truncation, and 192/204-byte reframing
+  feed the full hostile battery. Committed corpus: named seeds plus
+  the session's crash regressions.
+
 - **Standalone PCR packets no longer break the continuity chain.**
   §2.4.3.3 forbids incrementing the continuity counter on a packet
   whose `adaptation_field_control` is `'10'` (no payload); the muxer
