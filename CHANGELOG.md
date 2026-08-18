@@ -11,6 +11,26 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **The Table 2-39 descriptor set is closed out.** The `descriptor`
+  module decodes the last ten program / program-element descriptors
+  the staged ISO/IEC 13818-1 edition defines — the §2.6.28–§2.6.53
+  ISO/IEC 14496 carriage family: `private_data_indicator` (0x0F,
+  opaque 32-bit value), `MPEG-4_video` (0x1B) and `MPEG-4_audio`
+  (0x1C, with a Table 2-62 `(profile, level)` classifier covering all
+  eight assignment blocks and rejecting the reserved gaps), `IOD`
+  (0x1D — `Scope_of_IOD_label`/`IOD_label` typed, the ISO/IEC 14496-1
+  §8.6.3.1 InitialObjectDescriptor surfaced raw), `SL` (0x1E,
+  `ES_ID` ↔ PID binding), `FMC` (0x1F, 3-byte `(ES_ID,
+  FlexMuxChannel)` records), `External_ES_ID` (0x20), `Muxcode`
+  (0x21) and `FmxBufferSize` (0x22 — their 14496-1 §11.2.4.3 / §11.2
+  internal structures surfaced raw but tag-recognised), and
+  `MultiplexBuffer` (0x23 — 24-bit MBn size + 24-bit TBn→MBn leak
+  rate in 400 bit/s units with a bits-per-second helper, feeding the
+  §2.11.3.9 extended T-STD model). Fixed-size bodies reject
+  wrong-length payloads to `Raw` (FMC additionally requires the
+  3-byte stride). Pinned by decode tests for every tag, the Table
+  2-62 classification sweep, and a wrong-size fallback battery.
+
 - **DCCT + DCCSCT — the A/65 table set is complete.** The `atsc`
   module gains the optional directed-channel-change pair on the base
   PID: `DirectedChannelChangeTable` (§6.7 Table 6.15, `table_id 0xD3`)

@@ -37,9 +37,19 @@
 //! | `0x0C` | multiplex_buffer_utilization_descriptor (§2.6.22) | [`DescriptorBody::MultiplexBufferUtilization`] |
 //! | `0x0D` | copyright_descriptor (§2.6.24)    | [`DescriptorBody::Copyright`]                |
 //! | `0x0E` | maximum_bitrate_descriptor (§2.6.26) | [`DescriptorBody::MaximumBitrate`]        |
+//! | `0x0F` | private_data_indicator_descriptor (§2.6.28) | [`DescriptorBody::PrivateDataIndicator`] |
 //! | `0x10` | smoothing_buffer_descriptor (§2.6.30) | [`DescriptorBody::SmoothingBuffer`]      |
 //! | `0x11` | STD_descriptor (§2.6.32)          | [`DescriptorBody::Std`]                      |
 //! | `0x12` | IBP_descriptor (§2.6.34)          | [`DescriptorBody::Ibp`]                      |
+//! | `0x1B` | MPEG-4_video_descriptor (§2.6.36) | [`DescriptorBody::Mpeg4Video`]               |
+//! | `0x1C` | MPEG-4_audio_descriptor (§2.6.38) | [`DescriptorBody::Mpeg4Audio`]               |
+//! | `0x1D` | IOD_descriptor (§2.6.40)          | [`DescriptorBody::Iod`]                      |
+//! | `0x1E` | SL_descriptor (§2.6.42)           | [`DescriptorBody::Sl`]                       |
+//! | `0x1F` | FMC_descriptor (§2.6.44)          | [`DescriptorBody::Fmc`]                      |
+//! | `0x20` | External_ES_ID_descriptor (§2.6.46) | [`DescriptorBody::ExternalEsId`]           |
+//! | `0x21` | Muxcode_descriptor (§2.6.48)      | [`DescriptorBody::MuxCode`]                  |
+//! | `0x22` | FmxBufferSize_descriptor (§2.6.50) | [`DescriptorBody::FmxBufferSize`]           |
+//! | `0x23` | MultiplexBuffer_descriptor (§2.6.52) | [`DescriptorBody::MultiplexBuffer`]       |
 //! | `0x28` | AVC_video_descriptor (§2.6.64)    | [`DescriptorBody::AvcVideo`]                 |
 //! | `0x38` | HEVC_video_descriptor (Amd. 3 §2.6.95) | [`DescriptorBody::HevcVideo`]           |
 //! | `0x42` | stuffing_descriptor (EN 300 468 §6.2.40) | [`DescriptorBody::Stuffing`]         |
@@ -141,6 +151,37 @@ pub enum DescriptorBody<'a> {
     /// `0x12` IBP_descriptor (§2.6.34) — GOP-structure hints for the
     /// associated video elementary stream (Table 2-61).
     Ibp(IbpDescriptor),
+    /// `0x0F` private_data_indicator_descriptor (§2.6.28) — an opaque
+    /// 32-bit value whose meaning is private by definition (Table 2-58).
+    PrivateDataIndicator(PrivateDataIndicatorDescriptor),
+    /// `0x1B` MPEG-4_video_descriptor (§2.6.36) — profile/level of an
+    /// ISO/IEC 14496-2 visual stream carried directly in PES packets.
+    Mpeg4Video(Mpeg4VideoDescriptor),
+    /// `0x1C` MPEG-4_audio_descriptor (§2.6.38) — Table 2-62
+    /// profile/level of an ISO/IEC 14496-3 audio stream carried
+    /// directly in PES packets.
+    Mpeg4Audio(Mpeg4AudioDescriptor),
+    /// `0x1D` IOD_descriptor (§2.6.40) — PMT program-info envelope for
+    /// an ISO/IEC 14496-1 InitialObjectDescriptor.
+    Iod(IodDescriptor<'a>),
+    /// `0x1E` SL_descriptor (§2.6.42) — maps one SL-packetized
+    /// stream's `ES_ID` onto the carrying `elementary_PID`.
+    Sl(SlDescriptor),
+    /// `0x1F` FMC_descriptor (§2.6.44) — per-FlexMux-stream
+    /// `(ES_ID, FlexMuxChannel)` association table.
+    Fmc(FmcDescriptor),
+    /// `0x20` External_ES_ID_descriptor (§2.6.46) — assigns an
+    /// ISO/IEC 14496-1 `ES_ID` to a program element that has none.
+    ExternalEsId(ExternalEsIdDescriptor),
+    /// `0x21` Muxcode_descriptor (§2.6.48) — MuxCodeTableEntry
+    /// configuration records for the FlexMux MuxCode mode.
+    MuxCode(MuxCodeDescriptor<'a>),
+    /// `0x22` FmxBufferSize_descriptor (§2.6.50) — FlexMux buffer
+    /// sizes for the SL-packetized streams of a FlexMux stream.
+    FmxBufferSize(FmxBufferSizeDescriptor<'a>),
+    /// `0x23` MultiplexBuffer_descriptor (§2.6.52) — `MBn` size and
+    /// `TBn → MBn` leak rate for an ISO/IEC 14496 program element.
+    MultiplexBuffer(MultiplexBufferDescriptor),
     /// `0x28` AVC_video_descriptor (§2.6.64).
     AvcVideo(AvcVideoDescriptor),
     /// `0x38` HEVC_video_descriptor (Amd. 3 §2.6.95).
@@ -1119,6 +1160,181 @@ impl SmoothingBufferDescriptor {
     }
 }
 
+/// private_data_indicator_descriptor body (§2.6.28 Table 2-58).
+///
+/// A single 32-bit value whose semantics are private and, per §2.6.29,
+/// shall not be defined by the specification. Scoping conventionally
+/// comes from a preceding `registration_descriptor` /
+/// `private_data_specifier_descriptor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivateDataIndicatorDescriptor {
+    /// 32-bit `private_data_indicator` — opaque.
+    pub private_data_indicator: u32,
+}
+
+/// MPEG-4_video_descriptor body (§2.6.36).
+///
+/// Identifies the coding parameters of an ISO/IEC 14496-2 visual
+/// elementary stream carried directly in PES packets (§2.11.2). Does
+/// not apply to 14496-2 streams inside SL packets or FlexMux packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mpeg4VideoDescriptor {
+    /// 8-bit `MPEG-4_visual_profile_and_level` — same coding as the
+    /// `profile_and_level_indication` of the stream's Visual Object
+    /// Sequence Header (§2.6.37).
+    pub visual_profile_and_level: u8,
+}
+
+/// MPEG-4_audio_descriptor body (§2.6.38).
+///
+/// Identifies the coding parameters of an ISO/IEC 14496-3 audio
+/// elementary stream carried directly in PES packets (§2.11.2). Does
+/// not apply to 14496-3 streams inside SL packets or FlexMux packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mpeg4AudioDescriptor {
+    /// 8-bit `MPEG-4_audio_profile_and_level`, coded per Table 2-62 —
+    /// see [`Self::classification`].
+    pub audio_profile_and_level: u8,
+}
+
+impl Mpeg4AudioDescriptor {
+    /// The Table 2-62 `(profile name, level)` assignment of
+    /// [`Self::audio_profile_and_level`]; `None` for reserved values.
+    pub fn classification(self) -> Option<(&'static str, u8)> {
+        let v = self.audio_profile_and_level;
+        let (name, base, max_level) = match v & 0xF8 {
+            0x10 => ("Main", 0x10, 4),
+            0x18 => ("Scalable", 0x18, 4),
+            0x20 => ("Speech", 0x20, 2),
+            0x28 => ("Synthesis", 0x28, 3),
+            0x30 => ("High quality audio", 0x30, 8),
+            0x38 => ("Low delay audio", 0x38, 8),
+            0x40 => ("Natural audio", 0x40, 4),
+            0x48 => ("Mobile audio internetworking", 0x48, 6),
+            _ => return None,
+        };
+        let level = v - base + 1;
+        if level > max_level {
+            return None;
+        }
+        Some((name, level))
+    }
+}
+
+/// IOD_descriptor body (§2.6.40).
+///
+/// Carried in the PMT program-info loop; encapsulates an ISO/IEC
+/// 14496-1 §8.6.3 InitialObjectDescriptor giving access to the scene
+/// description / object descriptor streams of a 14496 presentation.
+/// The InitialObjectDescriptor's internal structure belongs to
+/// ISO/IEC 14496-1 and is surfaced as raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IodDescriptor<'a> {
+    /// 8-bit `Scope_of_IOD_label` (§2.6.41) — `0x10`: the label is
+    /// unique within this program; `0x11`: unique within the whole
+    /// Transport Stream; other values reserved.
+    pub scope_of_iod_label: u8,
+    /// 8-bit `IOD_label`.
+    pub iod_label: u8,
+    /// Raw `InitialObjectDescriptor()` bytes (ISO/IEC 14496-1
+    /// §8.6.3.1).
+    pub initial_object_descriptor: &'a [u8],
+}
+
+/// SL_descriptor body (§2.6.42).
+///
+/// Carried in a PMT `ES_info` loop when a single ISO/IEC 14496-1
+/// SL-packetized stream is encapsulated in PES packets; binds that
+/// stream's `ES_ID` to the `elementary_PID`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlDescriptor {
+    /// 16-bit `ES_ID` of the SL-packetized stream.
+    pub es_id: u16,
+}
+
+/// One `(ES_ID, FlexMuxChannel)` entry of an [`FmcDescriptor`]
+/// (§2.6.44).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FmcEntry {
+    /// 16-bit `ES_ID` of one SL-packetized stream in the FlexMux
+    /// stream.
+    pub es_id: u16,
+    /// 8-bit `FlexMuxChannel` carrying that stream.
+    pub flex_mux_channel: u8,
+}
+
+/// FMC_descriptor body (§2.6.44).
+///
+/// Carried in a PMT `ES_info` loop for a program element conveying an
+/// ISO/IEC 14496-1 FlexMux stream; associates each FlexMux channel
+/// with the `ES_ID` of the SL-packetized stream it carries (one entry
+/// per stream, 3 bytes each on the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FmcDescriptor {
+    /// The channel-association entries.
+    pub entries: Vec<FmcEntry>,
+}
+
+/// External_ES_ID_descriptor body (§2.6.46).
+///
+/// Assigns an ISO/IEC 14496-1 `ES_ID` to a program element that has
+/// none, so non-14496 components can be referenced from the scene
+/// description or associated with an IPMP stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalEsIdDescriptor {
+    /// The assigned 16-bit `External_ES_ID`.
+    pub external_es_id: u16,
+}
+
+/// Muxcode_descriptor body (§2.6.48).
+///
+/// Conveys ISO/IEC 14496-1 §11.2.4.3 MuxCodeTableEntry structures
+/// configuring the FlexMux MuxCode mode; their internal structure
+/// belongs to ISO/IEC 14496-1 and is surfaced as raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxCodeDescriptor<'a> {
+    /// Raw concatenated `MuxCodeTableEntry()` bytes.
+    pub mux_code_table_entries: &'a [u8],
+}
+
+/// FmxBufferSize_descriptor body (§2.6.50).
+///
+/// Conveys the FlexMux buffer (FBn) sizes for the SL-packetized
+/// streams of a FlexMux stream: a DefaultFlexMuxBufferDescriptor
+/// followed by per-stream FlexMuxBufferDescriptors. Both structures
+/// are defined in ISO/IEC 14496-1 §11.2 and are surfaced as raw
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FmxBufferSizeDescriptor<'a> {
+    /// Raw `DefaultFlexMuxBufferDescriptor()` +
+    /// `FlexMuxBufferDescriptor()` bytes.
+    pub flex_mux_buffer_descriptors: &'a [u8],
+}
+
+/// MultiplexBuffer_descriptor body (§2.6.52).
+///
+/// Carried in a PMT `ES_info` loop for each `elementary_PID` conveying
+/// an ISO/IEC 14496 FlexMux / SL-packetized stream (including
+/// `ISO_IEC_14496_section` carriage); sizes the T-STD multiplex buffer
+/// `MBn` and the `TBn → MBn` transfer rate for the §2.11.3.9 extended
+/// model. On the wire the body is two big-endian 24-bit fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiplexBufferDescriptor {
+    /// 24-bit `MB_buffer_size` — size of `MBn` in bytes (§2.6.53).
+    pub mb_buffer_size: u32,
+    /// 24-bit `TB_leak_rate` — `TBn → MBn` transfer rate in units of
+    /// 400 bit/s (§2.6.53).
+    pub tb_leak_rate: u32,
+}
+
+impl MultiplexBufferDescriptor {
+    /// `TB_leak_rate` in bits per second (the wire field is in
+    /// 400 bit/s units; fits in `u64` for the full 24-bit range).
+    pub fn tb_leak_rate_bits_per_second(self) -> u64 {
+        (self.tb_leak_rate as u64) * 400
+    }
+}
+
 /// stuffing_descriptor body (ETSI EN 300 468 §6.2.40 Table 98).
 ///
 /// The descriptor invalidates previously-coded descriptors or inserts
@@ -1869,6 +2085,20 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x10 => decode_smoothing_buffer(data).unwrap_or(DescriptorBody::Raw),
         0x11 => decode_std(data).unwrap_or(DescriptorBody::Raw),
         0x12 => decode_ibp(data).unwrap_or(DescriptorBody::Raw),
+        0x0F => decode_private_data_indicator(data).unwrap_or(DescriptorBody::Raw),
+        0x1B => decode_mpeg4_video(data).unwrap_or(DescriptorBody::Raw),
+        0x1C => decode_mpeg4_audio(data).unwrap_or(DescriptorBody::Raw),
+        0x1D => decode_iod(data).unwrap_or(DescriptorBody::Raw),
+        0x1E => decode_sl(data).unwrap_or(DescriptorBody::Raw),
+        0x1F => decode_fmc(data).unwrap_or(DescriptorBody::Raw),
+        0x20 => decode_external_es_id(data).unwrap_or(DescriptorBody::Raw),
+        0x21 => DescriptorBody::MuxCode(MuxCodeDescriptor {
+            mux_code_table_entries: data,
+        }),
+        0x22 => DescriptorBody::FmxBufferSize(FmxBufferSizeDescriptor {
+            flex_mux_buffer_descriptors: data,
+        }),
+        0x23 => decode_multiplex_buffer(data).unwrap_or(DescriptorBody::Raw),
         0x28 => decode_avc_video(data).unwrap_or(DescriptorBody::Raw),
         0x38 => decode_hevc_video(data).unwrap_or(DescriptorBody::Raw),
         0x42 => DescriptorBody::Stuffing(StuffingDescriptor {
@@ -1909,6 +2139,101 @@ fn decode_body<'a>(tag: u8, data: &'a [u8]) -> DescriptorBody<'a> {
         0x64 => decode_data_broadcast(data).unwrap_or(DescriptorBody::Raw),
         _ => DescriptorBody::Raw,
     }
+}
+
+fn decode_private_data_indicator(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.28 Table 2-58 — a single 32-bit private_data_indicator.
+    if data.len() != 4 {
+        return None;
+    }
+    Some(DescriptorBody::PrivateDataIndicator(
+        PrivateDataIndicatorDescriptor {
+            private_data_indicator: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
+        },
+    ))
+}
+
+fn decode_mpeg4_video(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.36 — a single MPEG-4_visual_profile_and_level byte.
+    if data.len() != 1 {
+        return None;
+    }
+    Some(DescriptorBody::Mpeg4Video(Mpeg4VideoDescriptor {
+        visual_profile_and_level: data[0],
+    }))
+}
+
+fn decode_mpeg4_audio(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.38 — a single Table 2-62 MPEG-4_audio_profile_and_level
+    // byte.
+    if data.len() != 1 {
+        return None;
+    }
+    Some(DescriptorBody::Mpeg4Audio(Mpeg4AudioDescriptor {
+        audio_profile_and_level: data[0],
+    }))
+}
+
+fn decode_iod(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.40 — Scope_of_IOD_label (8), IOD_label (8), then the
+    // ISO/IEC 14496-1 §8.6.3.1 InitialObjectDescriptor() (raw here).
+    if data.len() < 2 {
+        return None;
+    }
+    Some(DescriptorBody::Iod(IodDescriptor {
+        scope_of_iod_label: data[0],
+        iod_label: data[1],
+        initial_object_descriptor: &data[2..],
+    }))
+}
+
+fn decode_sl(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.42 — a single 16-bit ES_ID.
+    if data.len() != 2 {
+        return None;
+    }
+    Some(DescriptorBody::Sl(SlDescriptor {
+        es_id: u16::from_be_bytes([data[0], data[1]]),
+    }))
+}
+
+fn decode_fmc(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.44 — a flat array of 3-byte records: ES_ID (16),
+    // FlexMuxChannel (8).
+    const ENTRY_LEN: usize = 3;
+    if data.len() % ENTRY_LEN != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
+    for chunk in data.chunks_exact(ENTRY_LEN) {
+        entries.push(FmcEntry {
+            es_id: u16::from_be_bytes([chunk[0], chunk[1]]),
+            flex_mux_channel: chunk[2],
+        });
+    }
+    Some(DescriptorBody::Fmc(FmcDescriptor { entries }))
+}
+
+fn decode_external_es_id(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.46 — a single 16-bit External_ES_ID.
+    if data.len() != 2 {
+        return None;
+    }
+    Some(DescriptorBody::ExternalEsId(ExternalEsIdDescriptor {
+        external_es_id: u16::from_be_bytes([data[0], data[1]]),
+    }))
+}
+
+fn decode_multiplex_buffer(data: &[u8]) -> Option<DescriptorBody<'_>> {
+    // §2.6.52 — MB_buffer_size (24) then TB_leak_rate (24), both
+    // big-endian.
+    if data.len() != 6 {
+        return None;
+    }
+    Some(DescriptorBody::MultiplexBuffer(MultiplexBufferDescriptor {
+        mb_buffer_size: ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | data[2] as u32,
+        tb_leak_rate: ((data[3] as u32) << 16) | ((data[4] as u32) << 8) | data[5] as u32,
+    }))
 }
 
 fn decode_partial_transport_stream(data: &[u8]) -> Option<DescriptorBody<'_>> {
@@ -5379,6 +5704,165 @@ mod tests {
             let block = tlv(tag, &[0u8; 10]); // one short of 11
             let d = iter_descriptors(&block).next().unwrap().unwrap();
             assert!(matches!(d.body, DescriptorBody::Raw), "tag {tag:#x}");
+        }
+    }
+
+    #[test]
+    fn mpeg4_carriage_descriptors_decode() {
+        // 0x0F private_data_indicator (§2.6.28).
+        let block = tlv(0x0F, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::PrivateDataIndicator(p) => {
+                assert_eq!(p.private_data_indicator, 0xDEAD_BEEF);
+            }
+            other => panic!("expected PrivateDataIndicator, got {other:?}"),
+        }
+
+        // 0x1B MPEG-4 video (§2.6.36).
+        let block = tlv(0x1B, &[0xF1]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Mpeg4Video(v) => assert_eq!(v.visual_profile_and_level, 0xF1),
+            other => panic!("expected Mpeg4Video, got {other:?}"),
+        }
+
+        // 0x1D IOD (§2.6.40) — scope + label typed, IOD raw.
+        let block = tlv(0x1D, &[0x11, 0x42, 0x02, 0x07, 0x00]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Iod(i) => {
+                assert_eq!(i.scope_of_iod_label, 0x11);
+                assert_eq!(i.iod_label, 0x42);
+                assert_eq!(i.initial_object_descriptor, &[0x02, 0x07, 0x00]);
+            }
+            other => panic!("expected Iod, got {other:?}"),
+        }
+
+        // 0x1E SL (§2.6.42) + 0x20 External_ES_ID (§2.6.46).
+        let block = tlv(0x1E, &[0x12, 0x34]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Sl(s) => assert_eq!(s.es_id, 0x1234),
+            other => panic!("expected Sl, got {other:?}"),
+        }
+        let block = tlv(0x20, &[0xAB, 0xCD]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::ExternalEsId(e) => assert_eq!(e.external_es_id, 0xABCD),
+            other => panic!("expected ExternalEsId, got {other:?}"),
+        }
+
+        // 0x1F FMC (§2.6.44) — 3-byte (ES_ID, FlexMuxChannel) records.
+        let block = tlv(0x1F, &[0x00, 0x01, 0x05, 0x00, 0x02, 0x06]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Fmc(f) => {
+                assert_eq!(
+                    f.entries,
+                    vec![
+                        FmcEntry {
+                            es_id: 1,
+                            flex_mux_channel: 5
+                        },
+                        FmcEntry {
+                            es_id: 2,
+                            flex_mux_channel: 6
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected Fmc, got {other:?}"),
+        }
+
+        // 0x21 MuxCode + 0x22 FmxBufferSize surface their ISO/IEC
+        // 14496-1-internal structures raw but recognised.
+        let block = tlv(0x21, &[9, 8, 7]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::MuxCode(m) => assert_eq!(m.mux_code_table_entries, &[9, 8, 7]),
+            other => panic!("expected MuxCode, got {other:?}"),
+        }
+        let block = tlv(0x22, &[1, 2, 3, 4]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::FmxBufferSize(f) => {
+                assert_eq!(f.flex_mux_buffer_descriptors, &[1, 2, 3, 4]);
+            }
+            other => panic!("expected FmxBufferSize, got {other:?}"),
+        }
+
+        // 0x23 MultiplexBuffer (§2.6.52) — two 24-bit fields, leak
+        // rate in 400 bit/s units.
+        let block = tlv(0x23, &[0x01, 0x00, 0x00, 0x00, 0x30, 0x39]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::MultiplexBuffer(m) => {
+                assert_eq!(m.mb_buffer_size, 0x010000);
+                assert_eq!(m.tb_leak_rate, 12_345);
+                assert_eq!(m.tb_leak_rate_bits_per_second(), 12_345 * 400);
+            }
+            other => panic!("expected MultiplexBuffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mpeg4_audio_descriptor_classifies_table_2_62() {
+        let cls = |v: u8| {
+            Mpeg4AudioDescriptor {
+                audio_profile_and_level: v,
+            }
+            .classification()
+        };
+        assert_eq!(cls(0x10), Some(("Main", 1)));
+        assert_eq!(cls(0x13), Some(("Main", 4)));
+        assert_eq!(cls(0x14), None); // reserved tail of the Main block
+        assert_eq!(cls(0x1B), Some(("Scalable", 4)));
+        assert_eq!(cls(0x21), Some(("Speech", 2)));
+        assert_eq!(cls(0x22), None);
+        assert_eq!(cls(0x2A), Some(("Synthesis", 3)));
+        assert_eq!(cls(0x37), Some(("High quality audio", 8)));
+        assert_eq!(cls(0x3F), Some(("Low delay audio", 8)));
+        assert_eq!(cls(0x43), Some(("Natural audio", 4)));
+        assert_eq!(cls(0x44), None);
+        assert_eq!(cls(0x4D), Some(("Mobile audio internetworking", 6)));
+        assert_eq!(cls(0x4E), None);
+        assert_eq!(cls(0x00), None);
+        assert_eq!(cls(0xFF), None);
+
+        let block = tlv(0x1C, &[0x19]);
+        let d = iter_descriptors(&block).next().unwrap().unwrap();
+        match d.body {
+            DescriptorBody::Mpeg4Audio(a) => {
+                assert_eq!(a.classification(), Some(("Scalable", 2)));
+            }
+            other => panic!("expected Mpeg4Audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mpeg4_carriage_descriptors_wrong_size_fall_back_to_raw() {
+        for (tag, body) in [
+            (0x0Fu8, &[0u8; 3][..]), // indicator needs exactly 4
+            (0x0F, &[0u8; 5][..]),
+            (0x1B, &[][..]), // profile byte missing
+            (0x1B, &[0u8; 2][..]),
+            (0x1C, &[][..]),
+            (0x1D, &[0u8; 1][..]), // IOD needs scope + label
+            (0x1E, &[0u8; 1][..]),
+            (0x1E, &[0u8; 3][..]),
+            (0x1F, &[0u8; 4][..]), // FMC stride is 3
+            (0x20, &[0u8; 3][..]),
+            (0x23, &[0u8; 5][..]), // MultiplexBuffer needs exactly 6
+            (0x23, &[0u8; 7][..]),
+        ] {
+            let block = tlv(tag, body);
+            let d = iter_descriptors(&block).next().unwrap().unwrap();
+            assert!(
+                matches!(d.body, DescriptorBody::Raw),
+                "tag {tag:#x} len {}",
+                body.len()
+            );
         }
     }
 
