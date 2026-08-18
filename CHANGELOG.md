@@ -28,7 +28,11 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   ~2 packets more backlog than the pacer budgeted. The hint
   validates its target (video-only, non-zero, known index); an
   `Rmax` below the stream's true rate surfaces as the existing
-  cannot-deliver-in-time error rather than silent violations.
+  cannot-deliver-in-time error rather than silent violations. The
+  `mux_roundtrip` structure-aware fuzz plan gained the hint as a
+  dimension: hinted CBR plans are T-STD-checked against the tighter
+  `Rmax`-based video chain model rather than the generous wire rate
+  (≈ 490 000 plans locally clean).
 
 - **The Table 2-39 descriptor set is closed out.** The `descriptor`
   module decodes the last ten program / program-element descriptors

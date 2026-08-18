@@ -432,6 +432,11 @@ pub struct MuxPlan {
     pub network: bool,
     /// CBR mux rate (bit/s), `None` for unpaced output.
     pub cbr_rate: Option<u64>,
+    /// §2.4.2.3 video `Rmax` declared to the muxer for every video
+    /// stream (CBR plans only) — exercises the video transport-buffer
+    /// pacing path (`Rxn = 1.2 × Rmax`). Kept far above the planned
+    /// per-frame demand so every plan stays deliverable.
+    pub video_rmax: Option<u64>,
     pub psi_interval: Option<i64>,
     /// Arm a time-base discontinuity on `(program_number)` before the
     /// `k`-th globally written frame.
@@ -570,6 +575,11 @@ impl MuxPlan {
             programs,
             streams,
             network: r.chance(64),
+            // CBR video frames are ≤ 1 KiB every ≥ 20 ms (≤ ~0,5
+            // Mbit/s incl. overhead), so a 4 Mbit/s Rmax paces the
+            // TB visibly while every frame stays deliverable well
+            // inside its decode lead.
+            video_rmax: (cbr && r.chance(128)).then_some(4_000_000),
             cbr_rate,
             psi_interval: r.chance(128).then(|| 4_500 + i64::from(r.u8()) * 900),
             discontinuity_before,
@@ -641,6 +651,12 @@ impl MuxPlan {
         if let Some(rate) = self.cbr_rate {
             mux.set_mux_rate(Some(rate));
         }
+        if let Some(rmax) = self.video_rmax {
+            for s in self.streams.iter().filter(|s| s.is_video) {
+                mux.set_video_max_bitrate(s.index, Some(rmax))
+                    .expect("valid plan: video Rmax hint");
+            }
+        }
         mux.set_psi_repetition_interval(self.psi_interval);
         mux.write_header().expect("valid plan: write_header");
 
@@ -708,9 +724,14 @@ impl MuxPlan {
                 .map(|(i, s)| {
                     let pid = 0x1011 + i as u16;
                     if s.is_video {
+                        // With a declared Rmax the video chain is
+                        // modelled at that tighter figure — the
+                        // muxer's §2.4.2.3 TB pacing must hold there,
+                        // not just at the generous wire rate.
+                        let rmax = self.video_rmax.unwrap_or(rate);
                         (
                             pid,
-                            TStdStreamModel::video_high_level(rate, rate / 2, 1_048_576),
+                            TStdStreamModel::video_high_level(rmax, rmax / 2, 1_048_576),
                         )
                     } else {
                         (pid, TStdStreamModel::audio())

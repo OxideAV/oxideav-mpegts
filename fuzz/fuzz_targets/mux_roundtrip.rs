@@ -7,9 +7,11 @@
 //! mux plan: 1–2 programs x 1–3 streams x 1–16 frames, DVB SDT / EIT
 //! / NIT options, §2.4.3.5 / Annex-K splice signalling (plain and
 //! seamless, with post-splice countdowns), §2.4.3.5 / §2.7.6
-//! time-base discontinuities, §2.4.2 CBR pacing, PSI repetition
-//! intervals, §2.7.5 DTS coding, and 33-bit PTS-wrap-crossing
-//! timelines.
+//! time-base discontinuities, §2.4.2 CBR pacing (optionally with a
+//! declared §2.4.2.3 video `Rmax` so the video transport buffer is
+//! paced at `Rxn = 1.2 × Rmax` and modelled at that tighter figure),
+//! PSI repetition intervals, §2.7.5 DTS coding, and 33-bit
+//! PTS-wrap-crossing timelines.
 //!
 //! Contract: the muxer must accept every decoded plan; its output
 //! must be conformant under `validate_ts` (§2.4.3.3 continuity,
