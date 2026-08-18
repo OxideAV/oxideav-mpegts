@@ -620,6 +620,7 @@ impl MuxPlan {
                 network_descriptors: Vec::new(),
                 transport_descriptors: Vec::new(),
             }),
+            ..Default::default()
         }
     }
 

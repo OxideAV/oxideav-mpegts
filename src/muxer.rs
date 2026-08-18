@@ -273,6 +273,24 @@ pub struct NetworkSpec {
     pub transport_descriptors: Vec<u8>,
 }
 
+/// Wall-clock metadata carried in the DVB TDT / TOT (EN 300 468 §5.2.5
+/// / §5.2.6). When a [`MpegTsMuxConfig`] carries one, the muxer emits a
+/// Time and Date Table on PID 0x0014 at the header and — advanced by
+/// the elapsed stream time — at every PSI repetition and the trailer,
+/// so the carried `UTC_time` tracks the §2.4.2 delivery schedule the
+/// way a live transmission's wall clock would. When `offsets` is
+/// non-empty a Time Offset Table follows each TDT, carrying the
+/// `local_time_offset_descriptor`.
+#[derive(Debug, Clone)]
+pub struct TimeSpec {
+    /// The UTC wall-clock instant corresponding to the first written
+    /// frame's PTS (the stream's capture / transmission start).
+    pub utc_time: crate::psi::EitDateTime,
+    /// Per-country local-time-offset entries for a TOT (§6.2.20);
+    /// empty → TDT only.
+    pub offsets: Vec<crate::build::LocalTimeOffsetSpec>,
+}
+
 /// Multi-program muxer configuration passed to
 /// [`MpegTsMuxer::with_config`].
 #[derive(Debug, Clone)]
@@ -285,6 +303,15 @@ pub struct MpegTsMuxConfig {
     pub programs: Vec<ProgramSpec>,
     /// Optional network metadata → a NIT on PID 0x0010.
     pub network: Option<NetworkSpec>,
+    /// Optional TS-wide CA descriptor loop (raw `CA_descriptor` TLVs,
+    /// §2.6.16 — built with [`crate::build::ca_descriptor`]) → a
+    /// Conditional Access Table (§2.4.4.6) on PID 0x0001, emitted with
+    /// the same header / repetition / trailer cadence as the PAT.
+    /// Empty → no CAT.
+    pub ca_descriptors: Vec<u8>,
+    /// Optional wall-clock anchor → a TDT (and, with offsets, a TOT)
+    /// on PID 0x0014.
+    pub time: Option<TimeSpec>,
 }
 
 impl Default for MpegTsMuxConfig {
@@ -294,6 +321,8 @@ impl Default for MpegTsMuxConfig {
             original_network_id: 1,
             programs: Vec::new(),
             network: None,
+            ca_descriptors: Vec::new(),
+            time: None,
         }
     }
 }
@@ -320,8 +349,22 @@ pub struct MpegTsMuxer {
     nit_cc: u8,
     /// Continuity counter for EIT TS packets (PID 0x0012).
     eit_cc: u8,
+    /// Continuity counter for CAT TS packets (PID 0x0001).
+    cat_cc: u8,
+    /// Continuity counter for TDT/TOT TS packets (PID 0x0014).
+    tdt_cc: u8,
     /// Optional network metadata for the NIT.
     network: Option<NetworkSpec>,
+    /// TS-wide CA descriptor loop for the CAT (empty → no CAT).
+    ca_descriptors: Vec<u8>,
+    /// Optional wall-clock anchor for the TDT/TOT.
+    time: Option<TimeSpec>,
+    /// PTS of the first timestamped frame — the instant
+    /// `TimeSpec::utc_time` anchors to; TDT/TOT re-emissions advance
+    /// from here.
+    first_pts: Option<i64>,
+    /// Highest PTS seen so far (drives the trailer TDT/TOT).
+    last_pts_seen: Option<i64>,
     /// PSI re-emission interval in 90 kHz ticks, or `None` to emit the
     /// program tables only at header + trailer. When set, the PAT / PMTs
     /// / SDT are re-emitted mid-stream whenever the running PTS advances
@@ -479,6 +522,7 @@ impl MpegTsMuxer {
                 es_descriptors: Vec::new(),
             }],
             network: None,
+            ..Default::default()
         };
         Self::with_config(output, streams, config)
     }
@@ -602,10 +646,16 @@ impl MpegTsMuxer {
             transport_stream_id: config.transport_stream_id,
             original_network_id: config.original_network_id,
             network: config.network.clone(),
+            ca_descriptors: config.ca_descriptors.clone(),
+            time: config.time.clone(),
+            first_pts: None,
+            last_pts_seen: None,
             pat_cc: 0,
             sdt_cc: 0,
             nit_cc: 0,
             eit_cc: 0,
+            cat_cc: 0,
+            tdt_cc: 0,
             // ~200 ms (18000 ticks of the 90 kHz clock) — a conformant
             // default that keeps the tables fresh without flooding the
             // multiplex. Callers can widen / disable it.
@@ -977,21 +1027,25 @@ impl MpegTsMuxer {
         if due {
             // CBR: a repetition is a best-effort refresh — defer it
             // (retry on the next write) unless the whole system-PID
-            // burst (PAT + one PMT per program) fits the pooled
-            // 1536-byte §2.4.2.3 Bsys without null-burning, so the
-            // slow equation 2-7 drain is never outrun and frames are
-            // never delayed behind a PSI null burn.
+            // burst (PAT + CAT when configured + one PMT per program)
+            // fits the pooled 1536-byte §2.4.2.3 Bsys without
+            // null-burning, so the slow equation 2-7 drain is never
+            // outrun and frames are never delayed behind a PSI null
+            // burn.
             if self.cbr.is_some() {
-                let burst = (1 + self.programs.len()) as f64 * TS_PACKET_LEN as f64;
+                let cat_packets = usize::from(!self.ca_descriptors.is_empty());
+                let burst = (1 + cat_packets + self.programs.len()) as f64 * TS_PACKET_LEN as f64;
                 if self.cbr_bsys_fullness() + burst > BSYS_SIZE as f64 {
                     return Ok(());
                 }
             }
             self.write_pat()?;
+            self.write_cat()?;
             self.write_pmt()?;
             self.write_sdt()?;
             self.write_nit()?;
             self.write_eit()?;
+            self.write_time_tables(self.elapsed_seconds(Some(pts)))?;
             self.last_psi_pts = Some(pts);
         }
         Ok(())
@@ -1216,6 +1270,58 @@ impl MpegTsMuxer {
             self.eit_cc = cc;
         }
         Ok(())
+    }
+
+    /// Emit a Conditional Access Table (§2.4.4.6) on PID 0x0001
+    /// carrying the configured TS-wide CA descriptor loop. Skipped when
+    /// no CA descriptors were configured. PID 0x0001 is a §2.4.2.3
+    /// system PID, so in CBR mode the packets pace against the pooled
+    /// `TBsys` / `Bsys` accounts like the PAT and PMTs.
+    fn write_cat(&mut self) -> CoreResult<()> {
+        if self.ca_descriptors.is_empty() {
+            return Ok(());
+        }
+        let section = crate::build::build_cat(0, &self.ca_descriptors.clone());
+        let mut cc = self.cat_cc;
+        self.write_psi_packet(crate::psi::CAT_PID, &mut cc, &section)?;
+        self.cat_cc = cc;
+        Ok(())
+    }
+
+    /// Emit the DVB time tables (PID 0x0014): a TDT (EN 300 468
+    /// §5.2.5) stamped `TimeSpec::utc_time + elapsed_seconds`, plus a
+    /// TOT (§5.2.6) with the configured `local_time_offset_descriptor`
+    /// when offsets were given. Skipped when no [`TimeSpec`] was
+    /// configured. The advance keeps the carried wall clock in step
+    /// with the stream time a receiver would observe, the way a live
+    /// transmission's TDT tracks real time.
+    fn write_time_tables(&mut self, elapsed_seconds: u64) -> CoreResult<()> {
+        let spec = match &self.time {
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+        let stamped = advance_utc(spec.utc_time, elapsed_seconds);
+        let tdt = crate::build::build_tdt(Some(stamped));
+        let mut cc = self.tdt_cc;
+        self.write_psi_packet(crate::psi::TDT_TOT_PID, &mut cc, &tdt)?;
+        if !spec.offsets.is_empty() {
+            let tot = crate::build::build_tot(
+                Some(stamped),
+                &crate::build::local_time_offset_descriptor(&spec.offsets),
+            );
+            self.write_psi_packet(crate::psi::TDT_TOT_PID, &mut cc, &tot)?;
+        }
+        self.tdt_cc = cc;
+        Ok(())
+    }
+
+    /// Seconds of stream time elapsed between the first timestamped
+    /// frame and `pts` (zero before the first frame).
+    fn elapsed_seconds(&self, pts: Option<i64>) -> u64 {
+        match (self.first_pts, pts) {
+            (Some(first), Some(now)) => (now.saturating_sub(first).max(0) as u64) / 90_000,
+            _ => 0,
+        }
     }
 
     /// Emit a standalone PCR-only TS packet on the PCR_PID. The packet
@@ -1648,10 +1754,12 @@ impl Muxer for MpegTsMuxer {
 
     fn write_header(&mut self) -> CoreResult<()> {
         self.write_pat()?;
+        self.write_cat()?;
         self.write_pmt()?;
         self.write_sdt()?;
         self.write_nit()?;
         self.write_eit()?;
+        self.write_time_tables(0)?;
         self.header_written = true;
         Ok(())
     }
@@ -1669,6 +1777,10 @@ impl Muxer for MpegTsMuxer {
             ))
         })?;
         if let Some(p) = packet.pts {
+            if self.first_pts.is_none() {
+                self.first_pts = Some(p);
+            }
+            self.last_pts_seen = Some(self.last_pts_seen.map_or(p, |l| l.max(p)));
             self.maybe_repeat_psi(p)?;
         }
         // CBR: hold non-video frames until CBR_AUDIO_LEAD before
@@ -1706,13 +1818,38 @@ impl Muxer for MpegTsMuxer {
         // Re-emit the program / SI tables once so a late-joining player
         // still finds them after seeking near the end.
         self.write_pat()?;
+        self.write_cat()?;
         self.write_pmt()?;
         self.write_sdt()?;
         self.write_nit()?;
         self.write_eit()?;
+        self.write_time_tables(self.elapsed_seconds(self.last_pts_seen))?;
         self.output.flush().map_err(CoreError::Io)?;
         Ok(())
     }
+}
+
+/// Advance a DVB `UTC_time` instant by whole seconds: the
+/// hours/minutes/seconds roll over into extra Modified-Julian-Date
+/// days, and the MJD → Gregorian conversion reuses the EN 300 468
+/// annex-C integer arithmetic shared with the parse path.
+fn advance_utc(dt: crate::psi::EitDateTime, seconds: u64) -> crate::psi::EitDateTime {
+    if seconds == 0 {
+        return dt;
+    }
+    let day_seconds = dt.hour as u64 * 3600 + dt.minute as u64 * 60 + dt.second as u64 + seconds;
+    let extra_days = (day_seconds / 86_400) as u16;
+    let rem = day_seconds % 86_400;
+    let mjd = crate::build::encode_mjd(dt.year, dt.month, dt.day).wrapping_add(extra_days);
+    let [m0, m1] = mjd.to_be_bytes();
+    crate::psi::decode_utc_time([
+        m0,
+        m1,
+        crate::build::to_bcd((rem / 3600) as u8),
+        crate::build::to_bcd(((rem % 3600) / 60) as u8),
+        crate::build::to_bcd((rem % 60) as u8),
+    ])
+    .unwrap_or(dt)
 }
 
 /// Build the PES packet(s) for one [`Packet`] through the shared
@@ -1954,6 +2091,7 @@ mod tests {
                 },
             ],
             network: None,
+            ..Default::default()
         };
         let sink = SharedSink::new();
         {
@@ -2019,6 +2157,7 @@ mod tests {
                 es_descriptors: Vec::new(),
             }],
             network: None,
+            ..Default::default()
         };
         let sink = SharedSink::new();
         {
@@ -2110,6 +2249,7 @@ mod tests {
                 network_descriptors: Vec::new(),
                 transport_descriptors: crate::build::service_list_descriptor(&[(1, 0x01)]),
             }),
+            ..Default::default()
         };
         let sink = SharedSink::new();
         {
@@ -2176,6 +2316,7 @@ mod tests {
                 es_descriptors: Vec::new(),
             }],
             network: None,
+            ..Default::default()
         };
         let sink = SharedSink::new();
         {
@@ -2283,6 +2424,7 @@ mod tests {
                     (2, 0x1F),
                 ]),
             }),
+            ..Default::default()
         };
 
         let sink = SharedSink::new();
@@ -2457,6 +2599,7 @@ mod tests {
                 es_descriptors: Vec::new(),
             }],
             network: None,
+            ..Default::default()
         };
         let out: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
         assert!(MpegTsMuxer::with_config(out, &streams, bad).is_err());
@@ -2599,6 +2742,7 @@ mod tests {
                 es_descriptors: vec![(1, teletext)],
             }],
             network: None,
+            ..Default::default()
         };
         let sink = SharedSink::new();
         {
@@ -3336,6 +3480,7 @@ mod tests {
                         network_descriptors: Vec::new(),
                         transport_descriptors: Vec::new(),
                     }),
+                    ..Default::default()
                 },
             )
             .expect("open");
@@ -3406,6 +3551,7 @@ mod tests {
                         },
                     ],
                     network: None,
+                    ..Default::default()
                 },
             )
             .expect("open");
@@ -3913,5 +4059,244 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    /// A configured CA descriptor loop and wall-clock anchor must come
+    /// out as a CAT on PID 0x0001 (§2.4.4.6) and a TDT + TOT on PID
+    /// 0x0014 (EN 300 468 §5.2.5/§5.2.6) that parse back identically,
+    /// with the whole stream still validator-conformant.
+    #[test]
+    fn cat_and_time_tables_round_trip_through_mux() {
+        use crate::psi::{
+            ConditionalAccessTable, TimeDateTable, TimeOffsetTable, CAT_PID, TDT_TOT_PID,
+        };
+        let streams = vec![stream_info(0, "h264", true)];
+        let anchor = crate::psi::EitDateTime {
+            year: 2026,
+            month: 8,
+            day: 18,
+            hour: 6,
+            minute: 30,
+            second: 0,
+            mjd: 0,
+        };
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 0x0007,
+            original_network_id: 0x1000,
+            programs: vec![ProgramSpec {
+                program_number: 1,
+                pmt_pid: 0x0100,
+                pcr_pid: None,
+                stream_indices: vec![0],
+                service: None,
+                events: Vec::new(),
+                es_descriptors: Vec::new(),
+            }],
+            ca_descriptors: crate::build::ca_descriptor(0x0B00, 0x1F00, &[0xAB]),
+            time: Some(TimeSpec {
+                utc_time: anchor,
+                offsets: vec![crate::build::LocalTimeOffsetSpec {
+                    country_code: *b"JPN",
+                    country_region_id: 0,
+                    offset_negative: false,
+                    local_time_offset_minutes: 9 * 60,
+                    time_of_change: None,
+                    next_time_offset_minutes: 9 * 60,
+                }],
+            }),
+            ..Default::default()
+        };
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.write_header().unwrap();
+            mx.write_packet(&Packet::new(0, TimeBase::new(1, 90_000), vec![1; 64]).with_pts(90))
+                .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+
+        let cat = first_section_on(&bytes, CAT_PID, ConditionalAccessTable::parse)
+            .expect("CAT on PID 0x0001");
+        match cat.iter_descriptors().next().unwrap().unwrap().body {
+            crate::descriptor::DescriptorBody::Ca(ca) => {
+                assert_eq!(ca.ca_system_id, 0x0B00);
+                assert_eq!(ca.ca_pid, 0x1F00);
+                assert_eq!(ca.private_data, &[0xAB]);
+            }
+            other => panic!("expected CA descriptor, got {other:?}"),
+        }
+
+        let tdt =
+            first_section_on(&bytes, TDT_TOT_PID, TimeDateTable::parse).expect("TDT on PID 0x0014");
+        let u = tdt.utc_time.expect("defined UTC_time");
+        assert_eq!((u.year, u.month, u.day), (2026, 8, 18));
+        assert_eq!((u.hour, u.minute, u.second), (6, 30, 0));
+
+        let tot = first_section_on(&bytes, TDT_TOT_PID, TimeOffsetTable::parse)
+            .expect("TOT on PID 0x0014");
+        assert_eq!(tot.utc_time.unwrap().hour, 6);
+        match tot.iter_descriptors().next().unwrap().unwrap().body {
+            crate::descriptor::DescriptorBody::LocalTimeOffset(l) => {
+                assert_eq!(l.entries.len(), 1);
+                assert_eq!(l.entries[0].country_code, *b"JPN");
+                assert_eq!(l.entries[0].local_time_offset_minutes, 540);
+            }
+            other => panic!("expected LocalTimeOffset, got {other:?}"),
+        }
+
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+    }
+
+    /// Mid-stream TDT re-emissions advance the carried wall clock by
+    /// the elapsed stream time — across a midnight/MJD boundary — so
+    /// the TDT tracks the delivery schedule like a live transmission.
+    #[test]
+    fn tdt_advances_with_stream_time_across_midnight() {
+        use crate::psi::{iter_sections, TimeDateTable, TDT_TOT_PID};
+        let streams = vec![stream_info(0, "h264", true)];
+        let config = MpegTsMuxConfig {
+            transport_stream_id: 1,
+            original_network_id: 1,
+            programs: vec![ProgramSpec {
+                program_number: 1,
+                pmt_pid: 0x0100,
+                pcr_pid: None,
+                stream_indices: vec![0],
+                service: None,
+                events: Vec::new(),
+                es_descriptors: Vec::new(),
+            }],
+            time: Some(TimeSpec {
+                // Two seconds before midnight on New Year's Eve 1999 —
+                // the advance must carry through seconds → minutes →
+                // hours → the MJD day (annex-C arithmetic).
+                utc_time: crate::psi::EitDateTime {
+                    year: 1999,
+                    month: 12,
+                    day: 31,
+                    hour: 23,
+                    minute: 59,
+                    second: 58,
+                    mjd: 0,
+                },
+                offsets: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.set_psi_repetition_interval(Some(45_000)); // 0.5 s
+            mx.write_header().unwrap();
+            // 4 s of 25 fps frames.
+            for k in 0..100i64 {
+                mx.write_packet(
+                    &Packet::new(0, TimeBase::new(1, 90_000), vec![0; 32])
+                        .with_pts(90_000 + k * 3_600),
+                )
+                .unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let mut times = Vec::new();
+        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+            let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
+            let pusi = chunk[1] & 0x40 != 0;
+            if pid == TDT_TOT_PID && pusi {
+                for sec in iter_sections(&chunk[4..]) {
+                    if let Ok(tdt) = TimeDateTable::parse(sec) {
+                        times.push(tdt.utc_time.unwrap());
+                    }
+                }
+            }
+        }
+        assert!(times.len() >= 3, "want header + repeats, got {times:?}");
+        let first = times.first().unwrap();
+        assert_eq!(
+            (first.year, first.month, first.day, first.hour),
+            (1999, 12, 31, 23)
+        );
+        let last = times.last().unwrap();
+        assert_eq!(
+            (last.year, last.month, last.day, last.hour),
+            (2000, 1, 1, 0),
+            "the trailer TDT must have crossed midnight: {last:?}"
+        );
+        assert!(last.second >= 1, "~4 s elapsed past midnight: {last:?}");
+    }
+
+    /// CBR mode with a CAT: PID 0x0001 is a §2.4.2.3 system PID, so
+    /// the CAT packets must ride the pooled TBsys/Bsys accounts and
+    /// the output must stay T-STD- and validator-conformant.
+    #[test]
+    fn cbr_mux_with_cat_and_tdt_stays_conformant() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let config = MpegTsMuxConfig {
+                transport_stream_id: 1,
+                original_network_id: 1,
+                programs: vec![ProgramSpec {
+                    program_number: DEFAULT_PROGRAM_NUMBER,
+                    pmt_pid: DEFAULT_PMT_PID,
+                    pcr_pid: None,
+                    stream_indices: vec![0],
+                    service: None,
+                    events: Vec::new(),
+                    es_descriptors: Vec::new(),
+                }],
+                ca_descriptors: crate::build::ca_descriptor(0x0B00, 0x1F00, &[]),
+                time: Some(TimeSpec {
+                    utc_time: crate::psi::EitDateTime {
+                        year: 2026,
+                        month: 8,
+                        day: 18,
+                        hour: 12,
+                        minute: 0,
+                        second: 0,
+                        mjd: 0,
+                    },
+                    offsets: Vec::new(),
+                }),
+                ..Default::default()
+            };
+            let mut mx = MpegTsMuxer::with_config(output, &streams, config).expect("open");
+            mx.set_mux_rate(Some(4_000_000));
+            mx.write_header().expect("hdr");
+            for k in 0..50i64 {
+                let mut p = Packet::new(0, TimeBase::new(1, 90_000), vec![0; 2_048])
+                    .with_pts(90_000 + k * 3_600);
+                p.flags.keyframe = true;
+                mx.write_packet(&p).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+        let config = crate::tstd::TStdConfig::single_program(
+            FIRST_ES_PID,
+            DEFAULT_PMT_PID,
+            vec![(
+                FIRST_ES_PID,
+                crate::tstd::TStdStreamModel::video_low_main_level(4_000_000, 131_072, 262_144),
+            )],
+        );
+        let tstd = crate::tstd::analyze_tstd(&bytes, &config).expect("tstd");
+        assert!(tstd.is_conformant(), "{:?}", tstd.violations);
+        // The CAT really rode PID 0x0001.
+        assert!(
+            first_section_on(&bytes, crate::psi::CAT_PID, |s| {
+                crate::psi::ConditionalAccessTable::parse(s)
+            })
+            .is_some(),
+            "CAT missing from CBR output"
+        );
     }
 }

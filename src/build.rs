@@ -865,7 +865,7 @@ pub fn build_dit(transition_flag: bool) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Encode a 0–99 integer into one 4-bit-BCD byte.
-fn to_bcd(v: u8) -> u8 {
+pub(crate) fn to_bcd(v: u8) -> u8 {
     ((v / 10) << 4) | (v % 10)
 }
 
@@ -880,7 +880,7 @@ fn to_bcd(v: u8) -> u8 {
 /// ```
 ///
 /// where `Y = year − 1900` and `M = month`.
-fn encode_mjd(year: u16, month: u8, day: u8) -> u16 {
+pub(crate) fn encode_mjd(year: u16, month: u8, day: u8) -> u16 {
     let y = year as i64 - 1900;
     let m = month as i64;
     let l: i64 = if m == 1 || m == 2 { 1 } else { 0 };

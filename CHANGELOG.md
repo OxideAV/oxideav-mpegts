@@ -39,6 +39,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   advisory, event/channel ETMs, both caption-service forms, and
   CRC / truncation rejection.
 
+- **CAT + TDT/TOT emission on the mux side.**
+  `MpegTsMuxConfig.ca_descriptors` (raw §2.6.16 `CA_descriptor` TLVs,
+  built with `build::ca_descriptor`) makes the muxer emit a
+  Conditional Access Table (§2.4.4.6) on PID 0x0001 with the same
+  header / repetition / trailer cadence as the PAT; PID 0x0001 is a
+  §2.4.2.3 system PID, so in CBR mode the CAT packets ride the pooled
+  `TBsys`/`Bsys` accounts and the repetition-burst budget counts them.
+  `MpegTsMuxConfig.time` (a `TimeSpec`: the UTC instant of the first
+  frame plus optional §6.2.20 offset entries) emits a TDT — and, with
+  offsets, a TOT — on PID 0x0014 (EN 300 468 §5.2.5/§5.2.6); each
+  re-emission advances the carried `UTC_time` by the elapsed stream
+  time with annex-C MJD arithmetic, so the wall clock tracks the
+  delivery schedule like a live transmission's (pinned across a
+  midnight/MJD rollover). Round-trip pinned through the CAT/TDT/TOT
+  parsers, `validate_ts`, and a CBR run under `analyze_tstd`.
+
 - **Write-side coverage for every remaining parsed table.** The `build`
   module now mirrors the whole `psi` parse surface: `build_cat`
   (§2.4.4.6) and `build_tsdt` (§2.4.4.12) long-form descriptor-loop

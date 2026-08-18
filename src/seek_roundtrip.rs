@@ -94,6 +94,7 @@ fn mux_video(
                     es_descriptors: Vec::new(),
                 }],
                 network: None,
+                ..Default::default()
             },
         )
         .expect("mux open");
@@ -226,6 +227,7 @@ fn roundtrip_multi_program_seek_uses_selected_programs_pcr() {
                     },
                 ],
                 network: None,
+                ..Default::default()
             },
         )
         .expect("mux open");
