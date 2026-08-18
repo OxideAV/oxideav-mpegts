@@ -2018,15 +2018,15 @@ impl PsiSectionAssembler {
 }
 
 /// Shared header parse — verifies sync, length, CRC.
-struct SectionHeader {
-    table_id_extension: u16,
-    version_number: u8,
-    current_next_indicator: bool,
-    section_number: u8,
-    last_section_number: u8,
+pub(crate) struct SectionHeader {
+    pub(crate) table_id_extension: u16,
+    pub(crate) version_number: u8,
+    pub(crate) current_next_indicator: bool,
+    pub(crate) section_number: u8,
+    pub(crate) last_section_number: u8,
 }
 
-fn parse_section_header(
+pub(crate) fn parse_section_header(
     section: &[u8],
     expected_table_id: u8,
 ) -> Result<(SectionHeader, &[u8]), TsError> {

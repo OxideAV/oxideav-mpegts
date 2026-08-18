@@ -136,6 +136,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod atsc;
 pub mod build;
 pub mod clock;
 pub mod descriptor;

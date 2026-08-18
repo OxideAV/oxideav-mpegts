@@ -11,6 +11,34 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **ATSC PSIP table family (A/65:2013).** New `atsc` module closing
+  the North-American SI gap: parsers for the base-PID (`0x1FFB`)
+  tables — STT (§6.1, GPS seconds + `GPS_UTC_offset` + annex-A
+  daylight-saving accessors, `gps_to_unix` helper), MGT (§6.2, the
+  PID/version/size directory with typed Table 6.3 classifiers for
+  EIT-k / event-ETT-k / RRT-region entries), TVCT/CVCT (§6.3, one
+  shared wire shape with the cable-only `path_select` /
+  `out_of_band` bits and the CVCT one-part channel-number formula),
+  RRT (§6.4, region name + dimensions + rating values) — and the
+  MGT-announced guide tables ATSC EIT (§6.5, per-`source_id` events
+  with 14-bit `event_id`, GPS `start_time`, 20-bit duration, MSS
+  title) and ETT (§6.6, `ETM_id`-keyed with Table 6.14 channel/event
+  decomposition). The §6.10 Multiple String Structure decodes the
+  Table 6.41 Unicode range-select modes and UTF-16 mode `0x3F`;
+  annex-C Huffman segments surface raw with their
+  `compression_type`. A separate PSIP descriptor walker
+  (`iter_atsc_descriptors` — the §6.9 tags sit in the MPEG-2
+  user-private range, so they stay out of the MPEG/DVB descriptor
+  table) types caption_service (608/708 forms), content_advisory,
+  extended_channel_name, service_location, time_shifted_service,
+  component_name, DCC departing/arriving requests,
+  redistribution_control, and genre. Every parse enforces the §4.1
+  generic PSIP section: CRC-32 verified, `protocol_version` must be
+  zero. Pinned by hand-built sections covering both VCT flavours,
+  MGT directories, RRT dimension/value nesting, EIT + content
+  advisory, event/channel ETMs, both caption-service forms, and
+  CRC / truncation rejection.
+
 - **Write-side coverage for every remaining parsed table.** The `build`
   module now mirrors the whole `psi` parse surface: `build_cat`
   (§2.4.4.6) and `build_tsdt` (§2.4.4.12) long-form descriptor-loop
