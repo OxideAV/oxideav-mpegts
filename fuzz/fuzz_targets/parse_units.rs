@@ -146,6 +146,28 @@ fn parse_all_atsc(data: &[u8]) {
         let _ = ett.message.first_text();
         let _ = (ett.source_id(), ett.is_event_etm(), ett.event_id());
     }
+    if let Ok(dcct) = atsc::DirectedChannelChangeTable::parse(data) {
+        for t in &dcct.tests {
+            for term in &t.terms {
+                let _ = (term.category(), term.postal_code_text(), term.genre_codes());
+                walk!(term.iter_descriptors());
+            }
+            walk!(t.iter_descriptors());
+        }
+        walk!(dcct.iter_descriptors());
+    }
+    if let Ok(dccsct) = atsc::DccSelectionCodeTable::parse(data) {
+        for u in &dccsct.updates {
+            if let atsc::DccsctUpdate::NewGenreCategory { name, .. }
+            | atsc::DccsctUpdate::NewState { name, .. }
+            | atsc::DccsctUpdate::NewCounty { name, .. } = &u.update
+            {
+                let _ = name.first_text();
+            }
+            walk!(u.iter_descriptors());
+        }
+        walk!(dccsct.iter_descriptors());
+    }
     if let Ok((mss, _)) = atsc::MultipleStringStructure::parse(data) {
         for s in &mss.strings {
             let _ = s.decode();

@@ -11,6 +11,35 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **DCCT + DCCSCT — the A/65 table set is complete.** The `atsc`
+  module gains the optional directed-channel-change pair on the base
+  PID: `DirectedChannelChangeTable` (§6.7 Table 6.15, `table_id 0xD3`)
+  parses the per-test `dcc_context` (Table 6.16 Temporary Retune vs
+  Channel Redirect), the 10-bit from/to major·minor virtual-channel
+  numbers, the GPS `dcc_start_time`/`dcc_end_time` window, and the
+  ANDed selection-term loop — each term's `dcc_selection_type`
+  classifies per Table 6.17 (`DccSelectionCategory`, including the
+  exclusion/non-member forms and Viewer Direct Select buttons A–D),
+  with helpers unpacking the 64-bit `dcc_selection_id` as postal-code
+  text (§6.7's right-justified, `'?'`-wild-carded forms) or Table 6.19
+  right-justified genre codes, plus the Table 6.18 demographic bit
+  assignments as `dcc_demographic` constants; descriptor loops surface
+  at term, test, and table level (the DCC departing/arriving request
+  descriptors already decode typed). `DccSelectionCodeTable` (§6.8
+  Table 6.23, `table_id 0xD4`) parses the Table 6.24 code-set updates
+  — new genre category / state / county (10-bit location code), each
+  with its MSS name — skipping reserved update types via
+  `update_data_length` with the raw body kept. Both parsers reject
+  non-zero `dcc_subtype` / `dccsct_type` (only zero is defined; §6.8
+  expects non-zero DCCSCT types discarded) and any loop slack. New
+  `MgtTableEntry::dcct_dcc_id` / `is_dccsct` classifiers cover the
+  Table 6.3 rows `0x1400 + dcc_id` and `0x0005`. Both tables join the
+  hostile mutation battery (seeded well-formed sections) and the
+  `parse_units` fuzz walk. Pinned by wire round-trips covering both
+  contexts, 10-bit channel-number extremes, all three DCCSCT update
+  types, an unknown-type skip, and truncation / overrun / slack /
+  bad-subtype rejections.
+
 - **ATSC PSIP table family (A/65:2013).** New `atsc` module closing
   the North-American SI gap: parsers for the base-PID (`0x1FFB`)
   tables — STT (§6.1, GPS seconds + `GPS_UTC_offset` + annex-A

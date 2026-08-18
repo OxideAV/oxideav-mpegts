@@ -25,6 +25,15 @@
 //! covering one 3-hour slot, and the [`ExtendedTextTable`]s (ETT, §6.6,
 //! `table_id 0xCC`) carrying long descriptions keyed by `ETM_id`.
 //!
+//! The optional directed-channel-change pair also rides the base PID:
+//! the [`DirectedChannelChangeTable`] (DCCT, §6.7, `table_id 0xD3`)
+//! carries channel-change requests — per-test "from"/"to" virtual
+//! channels, a GPS start/end window, and ANDed Table 6.17 selection
+//! terms (postal code / demographic / genre / geographic tests, with
+//! the [`dcc_demographic`] Table 6.18 bit assignments) — and the
+//! [`DccSelectionCodeTable`] (DCCSCT, §6.8, `table_id 0xD4`) extends
+//! the genre / state / county code sets those terms reference.
+//!
 //! Text in PSIP is never a bare byte run: titles, channel names, and
 //! rating labels are all [`MultipleStringStructure`]s (§6.10) — a list
 //! of per-language strings, each a run of segments with their own
@@ -65,6 +74,10 @@ pub const ATSC_EIT_TABLE_ID: u8 = 0xCB;
 pub const ETT_TABLE_ID: u8 = 0xCC;
 /// `table_id` of the System Time Table (A/65 §6.1).
 pub const STT_TABLE_ID: u8 = 0xCD;
+/// `table_id` of the Directed Channel Change Table (A/65 §6.7).
+pub const DCCT_TABLE_ID: u8 = 0xD3;
+/// `table_id` of the DCC Selection Code Table (A/65 §6.8).
+pub const DCCSCT_TABLE_ID: u8 = 0xD4;
 
 /// The Unix timestamp of the GPS epoch (1980-01-06 00:00:00 UTC) —
 /// the zero point of every PSIP `system_time` / `start_time` field.
@@ -897,6 +910,22 @@ impl MgtTableEntry {
         }
     }
 
+    /// The `dcc_id` when this entry announces a DCCT instance
+    /// (`table_type 0x1400..=0x14FF`, Table 6.3).
+    pub fn dcct_dcc_id(&self) -> Option<u8> {
+        if (0x1400..=0x14FF).contains(&self.table_type) {
+            Some((self.table_type - 0x1400) as u8)
+        } else {
+            None
+        }
+    }
+
+    /// `true` when this entry announces the DCCSCT
+    /// (`table_type 0x0005`, Table 6.3).
+    pub fn is_dccsct(&self) -> bool {
+        self.table_type == 0x0005
+    }
+
     /// Walk this entry's descriptor loop.
     pub fn iter_descriptors(&self) -> AtscDescriptorIter<'_> {
         iter_atsc_descriptors(&self.descriptors)
@@ -1613,6 +1642,601 @@ impl ExtendedTextTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Directed Channel Change Table (§6.7)
+// ---------------------------------------------------------------------------
+
+/// Table 6.18 demographic-category bit assignments for the
+/// `dcc_selection_id` of the demographic [`DccSelectionCategory`]
+/// tests (`dcc_selection_type` `0x05`/`0x06`/`0x15`/`0x16`) — OR the
+/// bits together to form the selection bit vector.
+pub mod dcc_demographic {
+    /// Males.
+    pub const MALES: u64 = 0x0000_0000_0000_0001;
+    /// Females.
+    pub const FEMALES: u64 = 0x0000_0000_0000_0002;
+    /// Ages 2–5.
+    pub const AGES_2_5: u64 = 0x0000_0000_0000_0004;
+    /// Ages 6–11.
+    pub const AGES_6_11: u64 = 0x0000_0000_0000_0008;
+    /// Ages 12–17.
+    pub const AGES_12_17: u64 = 0x0000_0000_0000_0010;
+    /// Ages 18–34.
+    pub const AGES_18_34: u64 = 0x0000_0000_0000_0020;
+    /// Ages 35–49.
+    pub const AGES_35_49: u64 = 0x0000_0000_0000_0040;
+    /// Ages 50–54.
+    pub const AGES_50_54: u64 = 0x0000_0000_0000_0080;
+    /// Ages 55–64.
+    pub const AGES_55_64: u64 = 0x0000_0000_0000_0100;
+    /// Ages 65+.
+    pub const AGES_65_PLUS: u64 = 0x0000_0000_0000_0200;
+    /// Working.
+    pub const WORKING: u64 = 0x0000_0000_0000_0400;
+}
+
+/// How a DCC directive interacts with navigation / channel-number
+/// display (A/65 §6.7 Table 6.16, the `dcc_context` bit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DccContext {
+    /// `'0'` — Temporary Retune: acquire the "to" channel but keep
+    /// displaying the "from" channel number; only a Return-to-Original
+    /// request (or the end time / a manual change) undoes it (§6.7.1).
+    TemporaryRetune,
+    /// `'1'` — Channel Redirect: an ordinary channel change to the
+    /// "to" channel; further DCC requests stay accepted (§6.7.2).
+    ChannelRedirect,
+}
+
+/// Classified `dcc_selection_type` per A/65 §6.7 Table 6.17.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DccSelectionCategory {
+    /// `0x00` — term always evaluates True.
+    Unconditional,
+    /// `0x01` / `0x11` — numeric postal-code test (the flag is `true`
+    /// for the `0x11` exclusion form). `dcc_selection_id` carries 8
+    /// ASCII characters, `'?'` wild-carding a digit.
+    NumericPostalCode { exclusion: bool },
+    /// `0x02` / `0x12` — alphanumeric postal-code test (the flag is
+    /// `true` for the `0x12` exclusion form).
+    AlphanumericPostalCode { exclusion: bool },
+    /// `0x05` / `0x15` — membership (or non-membership, `negated`)
+    /// in at least one Table 6.18 demographic category.
+    DemographicOneOrMore { negated: bool },
+    /// `0x06` / `0x16` — membership (or non-membership, `negated`)
+    /// in all indicated Table 6.18 demographic categories.
+    DemographicAll { negated: bool },
+    /// `0x07` / `0x17` — interest (or non-interest, `negated`) in at
+    /// least one Table 6.20 genre category.
+    GenreOneOrMore { negated: bool },
+    /// `0x08` / `0x18` — interest (or non-interest, `negated`) in all
+    /// indicated Table 6.20 genre categories.
+    GenreAll { negated: bool },
+    /// `0x09` — True when the receiver cannot be authorized to decode
+    /// the "from" channel's services.
+    CannotBeAuthorized,
+    /// `0x0C` / `0x1C` — geographic location_code test (the flag is
+    /// `true` for the `0x1C` exclusion form).
+    GeographicLocation { exclusion: bool },
+    /// `0x0D` — True when the current program is rating-blocked.
+    RatingBlocked,
+    /// `0x0F` — unconditional return to the original channel.
+    ReturnToOriginalChannel,
+    /// `0x20..=0x23` — Viewer Direct Select buttons A–D (`button` is
+    /// 0 for A .. 3 for D).
+    ViewerDirectSelect { button: u8 },
+    /// Any Table 6.17 reserved code point.
+    Reserved,
+}
+
+impl DccSelectionCategory {
+    /// Classify a raw `dcc_selection_type` per Table 6.17.
+    pub fn classify(selection_type: u8) -> Self {
+        match selection_type {
+            0x00 => Self::Unconditional,
+            0x01 => Self::NumericPostalCode { exclusion: false },
+            0x02 => Self::AlphanumericPostalCode { exclusion: false },
+            0x05 => Self::DemographicOneOrMore { negated: false },
+            0x06 => Self::DemographicAll { negated: false },
+            0x07 => Self::GenreOneOrMore { negated: false },
+            0x08 => Self::GenreAll { negated: false },
+            0x09 => Self::CannotBeAuthorized,
+            0x0C => Self::GeographicLocation { exclusion: false },
+            0x0D => Self::RatingBlocked,
+            0x0F => Self::ReturnToOriginalChannel,
+            0x11 => Self::NumericPostalCode { exclusion: true },
+            0x12 => Self::AlphanumericPostalCode { exclusion: true },
+            0x15 => Self::DemographicOneOrMore { negated: true },
+            0x16 => Self::DemographicAll { negated: true },
+            0x17 => Self::GenreOneOrMore { negated: true },
+            0x18 => Self::GenreAll { negated: true },
+            0x1C => Self::GeographicLocation { exclusion: true },
+            0x20..=0x23 => Self::ViewerDirectSelect {
+                button: selection_type - 0x20,
+            },
+            _ => Self::Reserved,
+        }
+    }
+}
+
+/// One `dcc_term_count` entry of a [`DccTest`] (A/65 §6.7 Table 6.15)
+/// — a single selection criterion; all terms of a test AND together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DccTerm {
+    /// Raw 8-bit `dcc_selection_type` (Table 6.17) — see
+    /// [`Self::category`].
+    pub selection_type: u8,
+    /// 64-bit `dcc_selection_id` — the data the selection type tests
+    /// against; see [`Self::postal_code_text`] / [`Self::genre_codes`]
+    /// and the [`dcc_demographic`] bit assignments.
+    pub selection_id: u64,
+    /// Raw bytes of the term's descriptor loop — walk with
+    /// [`Self::iter_descriptors`].
+    pub descriptors: Vec<u8>,
+}
+
+impl DccTerm {
+    /// The Table 6.17 classification of [`Self::selection_type`].
+    pub fn category(&self) -> DccSelectionCategory {
+        DccSelectionCategory::classify(self.selection_type)
+    }
+
+    /// The postal-code characters of a postal-code term — the eight
+    /// `dcc_selection_id` bytes as ISO/IEC 8859-1 text (numeric codes
+    /// are right-justified five digits padded with `'0'`; alphanumeric
+    /// codes are right-justified padded with spaces; `'?'` is a wild
+    /// card). `None` when the term is not a postal-code test.
+    pub fn postal_code_text(&self) -> Option<String> {
+        match self.category() {
+            DccSelectionCategory::NumericPostalCode { .. }
+            | DccSelectionCategory::AlphanumericPostalCode { .. } => Some(
+                self.selection_id
+                    .to_be_bytes()
+                    .iter()
+                    .map(|&b| b as char)
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The genre-category selection codes of a genre term — the
+    /// non-zero `dcc_selection_id` bytes (codes pack right-justified,
+    /// `0x00` marks an unused slot per Table 6.19), most significant
+    /// first. `None` when the term is not a genre test.
+    pub fn genre_codes(&self) -> Option<Vec<u8>> {
+        match self.category() {
+            DccSelectionCategory::GenreOneOrMore { .. } | DccSelectionCategory::GenreAll { .. } => {
+                Some(
+                    self.selection_id
+                        .to_be_bytes()
+                        .iter()
+                        .copied()
+                        .filter(|&b| b != 0)
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Walk this term's descriptor loop.
+    pub fn iter_descriptors(&self) -> AtscDescriptorIter<'_> {
+        iter_atsc_descriptors(&self.descriptors)
+    }
+}
+
+/// One `dcc_test_count` entry of a [`DirectedChannelChangeTable`]
+/// (A/65 §6.7 Table 6.15) — a single DCC request: change from one
+/// virtual channel to another between two GPS instants when every
+/// term evaluates True.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DccTest {
+    /// The Table 6.16 `dcc_context` — Temporary Retune vs Channel
+    /// Redirect handling.
+    pub context: DccContext,
+    /// 10-bit `dcc_from_major_channel_number` (1–999).
+    pub from_major_channel_number: u16,
+    /// 10-bit `dcc_from_minor_channel_number` (1–999).
+    pub from_minor_channel_number: u16,
+    /// 10-bit `dcc_to_major_channel_number` (1–999).
+    pub to_major_channel_number: u16,
+    /// 10-bit `dcc_to_minor_channel_number` (1–999).
+    pub to_minor_channel_number: u16,
+    /// `dcc_start_time` — GPS seconds (see [`gps_to_unix`]).
+    pub start_time: u32,
+    /// `dcc_end_time` — GPS seconds (see [`gps_to_unix`]).
+    pub end_time: u32,
+    /// The request's terms — all must evaluate True (an OR is spelled
+    /// as separate tests).
+    pub terms: Vec<DccTerm>,
+    /// Raw bytes of the test's descriptor loop — walk with
+    /// [`Self::iter_descriptors`].
+    pub descriptors: Vec<u8>,
+}
+
+impl DccTest {
+    /// Walk this test's descriptor loop.
+    pub fn iter_descriptors(&self) -> AtscDescriptorIter<'_> {
+        iter_atsc_descriptors(&self.descriptors)
+    }
+}
+
+/// Read the §6.7/§6.8 `reserved (6) | length (10)` descriptor-loop
+/// header at `body[i..]` and return `(loop_bytes, next_index)`.
+fn dcc_descriptor_loop<'a>(
+    body: &'a [u8],
+    i: usize,
+    what: &'static str,
+) -> Result<(&'a [u8], usize), TsError> {
+    if i + 2 > body.len() {
+        return Err(TsError::Truncated {
+            what,
+            have: body.len().saturating_sub(i),
+            need: 2,
+        });
+    }
+    let len = (((body[i] & 0x03) as usize) << 8) | body[i + 1] as usize;
+    let start = i + 2;
+    if start + len > body.len() {
+        return Err(TsError::SectionLengthOverrun {
+            claimed: len,
+            have: body.len() - start,
+        });
+    }
+    Ok((&body[start..start + len], start + len))
+}
+
+/// Parsed Directed Channel Change Table section (A/65 §6.7
+/// Table 6.15) — carried on [`ATSC_BASE_PID`] with `table_id == 0xD3`,
+/// always a single section (`section_number == 0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectedChannelChangeTable {
+    /// 8-bit `dcc_id` distinguishing concurrently transmitted DCCT
+    /// instances (the MGT announces each as `table_type 0x1400 +
+    /// dcc_id`).
+    pub dcc_id: u8,
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// The channel-change requests; the receiver acts on the first
+    /// eligible one.
+    pub tests: Vec<DccTest>,
+    /// Raw bytes of the `dcc_additional_descriptors` loop — walk with
+    /// [`Self::iter_descriptors`].
+    pub additional_descriptors: Vec<u8>,
+}
+
+impl DirectedChannelChangeTable {
+    /// Parse a single DCCT section (from `table_id` through the CRC).
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let (hdr, body) = parse_psip_section(section, DCCT_TABLE_ID)?;
+        // The table_id_extension position carries dcc_subtype (high
+        // byte) + dcc_id (low byte). Only dcc_subtype 0x00 is defined;
+        // a non-zero value signals a structurally different future
+        // table (§6.7).
+        if hdr.table_id_extension >> 8 != 0 {
+            return Err(TsError::Unsupported(
+                "DCCT dcc_subtype is not zero (A/65 defines only zero)",
+            ));
+        }
+        let dcc_id = (hdr.table_id_extension & 0xFF) as u8;
+        let (&test_count, rest) = body.split_first().ok_or(TsError::Truncated {
+            what: "DCCT dcc_test_count",
+            have: 0,
+            need: 1,
+        })?;
+        let mut i = 0usize;
+        let mut tests = Vec::with_capacity((test_count as usize).min(64));
+        for _ in 0..test_count {
+            // dcc_context (1) + reserved (3) + from major/minor (20),
+            // reserved (4) + to major/minor (20), start (32), end
+            // (32), dcc_term_count (8) = 15 fixed bytes.
+            if i + 15 > rest.len() {
+                return Err(TsError::Truncated {
+                    what: "DCCT test entry",
+                    have: rest.len() - i,
+                    need: 15,
+                });
+            }
+            let context = if rest[i] & 0x80 != 0 {
+                DccContext::ChannelRedirect
+            } else {
+                DccContext::TemporaryRetune
+            };
+            let from_major = (((rest[i] & 0x0F) as u16) << 6) | (rest[i + 1] >> 2) as u16;
+            let from_minor = (((rest[i + 1] & 0x03) as u16) << 8) | rest[i + 2] as u16;
+            let to_major = (((rest[i + 3] & 0x0F) as u16) << 6) | (rest[i + 4] >> 2) as u16;
+            let to_minor = (((rest[i + 4] & 0x03) as u16) << 8) | rest[i + 5] as u16;
+            let start_time =
+                u32::from_be_bytes([rest[i + 6], rest[i + 7], rest[i + 8], rest[i + 9]]);
+            let end_time =
+                u32::from_be_bytes([rest[i + 10], rest[i + 11], rest[i + 12], rest[i + 13]]);
+            let term_count = rest[i + 14] as usize;
+            i += 15;
+            let mut terms = Vec::with_capacity(term_count.min(64));
+            for _ in 0..term_count {
+                // dcc_selection_type (8) + dcc_selection_id (64) = 9
+                // fixed bytes, then the term descriptor loop.
+                if i + 9 > rest.len() {
+                    return Err(TsError::Truncated {
+                        what: "DCCT term entry",
+                        have: rest.len() - i,
+                        need: 9,
+                    });
+                }
+                let selection_type = rest[i];
+                let selection_id = u64::from_be_bytes([
+                    rest[i + 1],
+                    rest[i + 2],
+                    rest[i + 3],
+                    rest[i + 4],
+                    rest[i + 5],
+                    rest[i + 6],
+                    rest[i + 7],
+                    rest[i + 8],
+                ]);
+                let (descs, next) =
+                    dcc_descriptor_loop(rest, i + 9, "DCCT dcc_term_descriptors_length")?;
+                terms.push(DccTerm {
+                    selection_type,
+                    selection_id,
+                    descriptors: descs.to_vec(),
+                });
+                i = next;
+            }
+            let (descs, next) = dcc_descriptor_loop(rest, i, "DCCT dcc_test_descriptors_length")?;
+            tests.push(DccTest {
+                context,
+                from_major_channel_number: from_major,
+                from_minor_channel_number: from_minor,
+                to_major_channel_number: to_major,
+                to_minor_channel_number: to_minor,
+                start_time,
+                end_time,
+                terms,
+                descriptors: descs.to_vec(),
+            });
+            i = next;
+        }
+        let (descs, next) = dcc_descriptor_loop(rest, i, "DCCT dcc_additional_descriptors_length")?;
+        if next != rest.len() {
+            return Err(TsError::Unsupported(
+                "DCCT loops do not fill the section exactly",
+            ));
+        }
+        Ok(Self {
+            dcc_id,
+            version_number: hdr.version_number,
+            tests,
+            additional_descriptors: descs.to_vec(),
+        })
+    }
+
+    /// Walk the `dcc_additional_descriptors` loop.
+    pub fn iter_descriptors(&self) -> AtscDescriptorIter<'_> {
+        iter_atsc_descriptors(&self.additional_descriptors)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DCC Selection Code Table (§6.8)
+// ---------------------------------------------------------------------------
+
+/// One update of a [`DccSelectionCodeTable`] (A/65 §6.8 Table 6.23) —
+/// an extension of the Table 6.20 genre codes or the annex-H
+/// state / county location codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DccsctUpdate {
+    /// `update_type 0x01` — a new Table 6.20 genre category: the code
+    /// (`0x01..=0x1F` basic / `0xAE..=0xFE` detailed) plus its display
+    /// name (≤ 24 characters).
+    NewGenreCategory {
+        /// 8-bit `genre_category_code`.
+        genre_category_code: u8,
+        /// The genre category name.
+        name: MultipleStringStructure,
+    },
+    /// `update_type 0x02` — a new State / Territory: the location code
+    /// (79–99) plus its name.
+    NewState {
+        /// 8-bit `dcc_state_location_code`.
+        dcc_state_location_code: u8,
+        /// The State / Territory name.
+        name: MultipleStringStructure,
+    },
+    /// `update_type 0x03` — a new county within a State: the FIPS
+    /// `state_code` (0–99), the 10-bit county code (1–999), and the
+    /// county name.
+    NewCounty {
+        /// 8-bit `state_code`.
+        state_code: u8,
+        /// 10-bit `dcc_county_location_code`.
+        dcc_county_location_code: u16,
+        /// The county name.
+        name: MultipleStringStructure,
+    },
+    /// A Table 6.24 reserved `update_type` — skipped via
+    /// `update_data_length` per §6.8, body kept raw.
+    Unknown {
+        /// The raw 8-bit `update_type`.
+        update_type: u8,
+        /// The raw update body.
+        data: Vec<u8>,
+    },
+}
+
+/// One `updates_defined` entry of a [`DccSelectionCodeTable`] — the
+/// typed update plus its descriptor loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DccsctUpdateEntry {
+    /// The typed update.
+    pub update: DccsctUpdate,
+    /// Raw bytes of the update's `dccsct_descriptors` loop — walk with
+    /// [`Self::iter_descriptors`].
+    pub descriptors: Vec<u8>,
+}
+
+impl DccsctUpdateEntry {
+    /// Walk this update's descriptor loop.
+    pub fn iter_descriptors(&self) -> AtscDescriptorIter<'_> {
+        iter_atsc_descriptors(&self.descriptors)
+    }
+}
+
+/// Parsed DCC Selection Code Table section (A/65 §6.8 Table 6.23) —
+/// carried on [`ATSC_BASE_PID`] with `table_id == 0xD4`, always a
+/// single section; extends the genre / location code sets the DCCT
+/// selection terms reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DccSelectionCodeTable {
+    /// 5-bit `version_number`.
+    pub version_number: u8,
+    /// The code-set updates.
+    pub updates: Vec<DccsctUpdateEntry>,
+    /// Raw bytes of the `dccsct_additional_descriptors` loop — walk
+    /// with [`Self::iter_descriptors`].
+    pub additional_descriptors: Vec<u8>,
+}
+
+impl DccSelectionCodeTable {
+    /// Parse a single DCCSCT section (from `table_id` through the
+    /// CRC).
+    pub fn parse(section: &[u8]) -> Result<Self, TsError> {
+        let (hdr, body) = parse_psip_section(section, DCCSCT_TABLE_ID)?;
+        // The table_id_extension position carries the 16-bit
+        // dccsct_type; only 0x0000 is defined, and §6.8 expects
+        // receivers to discard sections with a non-zero value.
+        if hdr.table_id_extension != 0 {
+            return Err(TsError::Unsupported(
+                "DCCSCT dccsct_type is not zero (A/65 defines only zero)",
+            ));
+        }
+        let (&updates_defined, rest) = body.split_first().ok_or(TsError::Truncated {
+            what: "DCCSCT updates_defined",
+            have: 0,
+            need: 1,
+        })?;
+        let mut i = 0usize;
+        let mut updates = Vec::with_capacity((updates_defined as usize).min(64));
+        for _ in 0..updates_defined {
+            if i + 2 > rest.len() {
+                return Err(TsError::Truncated {
+                    what: "DCCSCT update entry",
+                    have: rest.len() - i,
+                    need: 2,
+                });
+            }
+            let update_type = rest[i];
+            let data_len = rest[i + 1] as usize;
+            i += 2;
+            if i + data_len > rest.len() {
+                return Err(TsError::SectionLengthOverrun {
+                    claimed: data_len,
+                    have: rest.len() - i,
+                });
+            }
+            let data = &rest[i..i + data_len];
+            i += data_len;
+            let update = Self::parse_update(update_type, data)?;
+            let (descs, next) = dcc_descriptor_loop(rest, i, "DCCSCT dccsct_descriptors_length")?;
+            updates.push(DccsctUpdateEntry {
+                update,
+                descriptors: descs.to_vec(),
+            });
+            i = next;
+        }
+        let (descs, next) =
+            dcc_descriptor_loop(rest, i, "DCCSCT dccsct_additional_descriptors_length")?;
+        if next != rest.len() {
+            return Err(TsError::Unsupported(
+                "DCCSCT loops do not fill the section exactly",
+            ));
+        }
+        Ok(Self {
+            version_number: hdr.version_number,
+            updates,
+            additional_descriptors: descs.to_vec(),
+        })
+    }
+
+    /// Decode one Table 6.24-typed update body (`data` spans exactly
+    /// `update_data_length` bytes).
+    fn parse_update(update_type: u8, data: &[u8]) -> Result<DccsctUpdate, TsError> {
+        /// Parse an MSS that must fill `bytes` exactly.
+        fn full_mss(bytes: &[u8], what: &'static str) -> Result<MultipleStringStructure, TsError> {
+            let (mss, used) = MultipleStringStructure::parse(bytes)?;
+            if used != bytes.len() {
+                return Err(TsError::Unsupported(what));
+            }
+            Ok(mss)
+        }
+        match update_type {
+            0x01 => {
+                // new_genre_category: genre_category_code (8) +
+                // genre_category_name_text().
+                let (&code, text) = data.split_first().ok_or(TsError::Truncated {
+                    what: "DCCSCT genre_category_code",
+                    have: 0,
+                    need: 1,
+                })?;
+                Ok(DccsctUpdate::NewGenreCategory {
+                    genre_category_code: code,
+                    name: full_mss(
+                        text,
+                        "DCCSCT genre_category_name_text does not fill the update exactly",
+                    )?,
+                })
+            }
+            0x02 => {
+                // new_state: dcc_state_location_code (8) +
+                // dcc_state_location_code_text().
+                let (&code, text) = data.split_first().ok_or(TsError::Truncated {
+                    what: "DCCSCT dcc_state_location_code",
+                    have: 0,
+                    need: 1,
+                })?;
+                Ok(DccsctUpdate::NewState {
+                    dcc_state_location_code: code,
+                    name: full_mss(
+                        text,
+                        "DCCSCT dcc_state_location_code_text does not fill the update exactly",
+                    )?,
+                })
+            }
+            0x03 => {
+                // new_county: state_code (8), reserved (6) |
+                // dcc_county_location_code (10), then
+                // dcc_county_location_code_text().
+                if data.len() < 3 {
+                    return Err(TsError::Truncated {
+                        what: "DCCSCT new_county header",
+                        have: data.len(),
+                        need: 3,
+                    });
+                }
+                let county = (((data[1] & 0x03) as u16) << 8) | data[2] as u16;
+                Ok(DccsctUpdate::NewCounty {
+                    state_code: data[0],
+                    dcc_county_location_code: county,
+                    name: full_mss(
+                        &data[3..],
+                        "DCCSCT dcc_county_location_code_text does not fill the update exactly",
+                    )?,
+                })
+            }
+            _ => Ok(DccsctUpdate::Unknown {
+                update_type,
+                data: data.to_vec(),
+            }),
+        }
+    }
+
+    /// Walk the `dccsct_additional_descriptors` loop.
+    pub fn iter_descriptors(&self) -> AtscDescriptorIter<'_> {
+        iter_atsc_descriptors(&self.additional_descriptors)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1803,6 +2427,12 @@ mod tests {
         assert_eq!(e.rrt_rating_region(), Some(1));
         e.table_type = 0x017F;
         assert_eq!(e.eit_index(), Some(127));
+        e.table_type = 0x1442;
+        assert_eq!(e.dcct_dcc_id(), Some(0x42));
+        assert!(!e.is_dccsct());
+        e.table_type = 0x0005;
+        assert!(e.is_dccsct());
+        assert_eq!(e.dcct_dcc_id(), None);
     }
 
     /// Build one 32-byte VCT channel prefix + descriptor loop.
@@ -2377,5 +3007,345 @@ mod tests {
         let last = s.len() - 1;
         s[last] ^= 0xFF;
         assert!(SystemTimeTable::parse(&s).is_err());
+    }
+
+    /// Append a §6.7/§6.8 `reserved (6) | length (10)` descriptor-loop
+    /// header + bytes.
+    fn push_dcc_loop(v: &mut Vec<u8>, descs: &[u8]) {
+        v.push(0xFC | ((descs.len() >> 8) as u8 & 0x03));
+        v.push(descs.len() as u8);
+        v.extend_from_slice(descs);
+    }
+
+    /// Append the Table 6.15 fixed test-entry head (channel numbers +
+    /// GPS window + term count).
+    #[allow(clippy::too_many_arguments)]
+    fn push_dcc_test_head(
+        v: &mut Vec<u8>,
+        redirect: bool,
+        from: (u16, u16),
+        to: (u16, u16),
+        start: u32,
+        end: u32,
+        term_count: u8,
+    ) {
+        let ctx = if redirect { 0x80 } else { 0x00 };
+        v.push(ctx | 0x70 | (from.0 >> 6) as u8);
+        v.push(((from.0 & 0x3F) as u8) << 2 | (from.1 >> 8) as u8);
+        v.push(from.1 as u8);
+        v.push(0xF0 | (to.0 >> 6) as u8);
+        v.push(((to.0 & 0x3F) as u8) << 2 | (to.1 >> 8) as u8);
+        v.push(to.1 as u8);
+        v.extend_from_slice(&start.to_be_bytes());
+        v.extend_from_slice(&end.to_be_bytes());
+        v.push(term_count);
+    }
+
+    #[test]
+    fn dcct_round_trips_tests_terms_and_descriptors() {
+        let mut body = vec![2u8]; // dcc_test_count
+
+        // Test 1: Temporary Retune 12.1 → 12.2, two ANDed terms.
+        push_dcc_test_head(
+            &mut body,
+            false,
+            (12, 1),
+            (12, 2),
+            1_000_000_000,
+            1_000_000_600,
+            2,
+        );
+        // Term A: numeric postal inclusion on "00055?98", with a
+        // stuffing descriptor in the term loop.
+        body.push(0x01);
+        body.extend_from_slice(b"00055?98");
+        push_dcc_loop(&mut body, &[0x80, 2, 0xAA, 0xBB]);
+        // Term B: demographic one-or-more (males or 18-34), bare.
+        body.push(0x05);
+        let demo = dcc_demographic::MALES | dcc_demographic::AGES_18_34;
+        body.extend_from_slice(&demo.to_be_bytes());
+        push_dcc_loop(&mut body, &[]);
+        // Empty test descriptor loop.
+        push_dcc_loop(&mut body, &[]);
+
+        // Test 2: Channel Redirect at the 10-bit extremes, no terms,
+        // a DCC departing request descriptor in the test loop.
+        push_dcc_test_head(&mut body, true, (999, 999), (1, 1), 5, 6, 0);
+        let text = mss(*b"eng", 0x00, b"Back soon");
+        let mut dep = vec![0xA8, (2 + text.len()) as u8, 0x01, text.len() as u8];
+        dep.extend_from_slice(&text);
+        push_dcc_loop(&mut body, &dep);
+
+        // dcc_additional_descriptors: one stuffing descriptor.
+        push_dcc_loop(&mut body, &[0x80, 1, 0xFF]);
+
+        let s = psip_section(DCCT_TABLE_ID, 0x0007, 9, &body);
+        let dcct = DirectedChannelChangeTable::parse(&s).unwrap();
+        assert_eq!(dcct.dcc_id, 7);
+        assert_eq!(dcct.version_number, 9);
+        assert_eq!(dcct.tests.len(), 2);
+
+        let t = &dcct.tests[0];
+        assert_eq!(t.context, DccContext::TemporaryRetune);
+        assert_eq!(
+            (t.from_major_channel_number, t.from_minor_channel_number),
+            (12, 1)
+        );
+        assert_eq!(
+            (t.to_major_channel_number, t.to_minor_channel_number),
+            (12, 2)
+        );
+        assert_eq!((t.start_time, t.end_time), (1_000_000_000, 1_000_000_600));
+        assert_eq!(t.terms.len(), 2);
+        assert_eq!(
+            t.terms[0].category(),
+            DccSelectionCategory::NumericPostalCode { exclusion: false }
+        );
+        assert_eq!(t.terms[0].postal_code_text().unwrap(), "00055?98");
+        assert!(t.terms[0].genre_codes().is_none());
+        let d = t.terms[0].iter_descriptors().next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x80);
+        assert_eq!(
+            t.terms[1].category(),
+            DccSelectionCategory::DemographicOneOrMore { negated: false }
+        );
+        assert_eq!(t.terms[1].selection_id, demo);
+        assert!(t.terms[1].postal_code_text().is_none());
+
+        let t = &dcct.tests[1];
+        assert_eq!(t.context, DccContext::ChannelRedirect);
+        assert_eq!(
+            (t.from_major_channel_number, t.from_minor_channel_number),
+            (999, 999),
+            "10-bit channel numbers survive the 4/6 + 2/8 bit split"
+        );
+        assert_eq!(
+            (t.to_major_channel_number, t.to_minor_channel_number),
+            (1, 1)
+        );
+        assert!(t.terms.is_empty());
+        match t.iter_descriptors().next().unwrap().unwrap().body {
+            AtscDescriptorBody::DccDepartingRequest { request_type, text } => {
+                assert_eq!(request_type, 0x01);
+                assert_eq!(text.first_text().unwrap(), "Back soon");
+            }
+            other => panic!("expected DCC departing request, got {other:?}"),
+        }
+
+        let d = dcct.iter_descriptors().next().unwrap().unwrap();
+        assert_eq!(d.tag, 0x80);
+        assert_eq!(d.body, AtscDescriptorBody::Stuffing(vec![0xFF]));
+    }
+
+    #[test]
+    fn dcc_selection_categories_classify_per_table_6_17() {
+        for (code, want) in [
+            (0x00, DccSelectionCategory::Unconditional),
+            (0x09, DccSelectionCategory::CannotBeAuthorized),
+            (0x0D, DccSelectionCategory::RatingBlocked),
+            (0x0F, DccSelectionCategory::ReturnToOriginalChannel),
+            (
+                0x11,
+                DccSelectionCategory::NumericPostalCode { exclusion: true },
+            ),
+            (
+                0x12,
+                DccSelectionCategory::AlphanumericPostalCode { exclusion: true },
+            ),
+            (0x16, DccSelectionCategory::DemographicAll { negated: true }),
+            (
+                0x0C,
+                DccSelectionCategory::GeographicLocation { exclusion: false },
+            ),
+            (
+                0x1C,
+                DccSelectionCategory::GeographicLocation { exclusion: true },
+            ),
+            (0x22, DccSelectionCategory::ViewerDirectSelect { button: 2 }),
+            (0x03, DccSelectionCategory::Reserved),
+            (0x24, DccSelectionCategory::Reserved),
+            (0xFF, DccSelectionCategory::Reserved),
+        ] {
+            assert_eq!(DccSelectionCategory::classify(code), want, "0x{code:02X}");
+        }
+
+        // Table 6.19 packing example: three codes in the least
+        // significant 24 bits, zero bytes are unused slots.
+        let term = DccTerm {
+            selection_type: 0x07,
+            selection_id: 0x0000_0000_0022_2120,
+            descriptors: Vec::new(),
+        };
+        assert_eq!(term.genre_codes().unwrap(), vec![0x22, 0x21, 0x20]);
+        let all = DccTerm {
+            selection_type: 0x18,
+            selection_id: 0x3031_3233_3435_3620,
+            descriptors: Vec::new(),
+        };
+        assert_eq!(all.genre_codes().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn dcct_rejects_bad_subtype_truncation_and_slack() {
+        // Non-zero dcc_subtype (high byte of the extension position).
+        let mut body = vec![0u8];
+        push_dcc_loop(&mut body, &[]);
+        let s = psip_section(DCCT_TABLE_ID, 0x0100, 0, &body);
+        assert!(matches!(
+            DirectedChannelChangeTable::parse(&s),
+            Err(TsError::Unsupported(_))
+        ));
+
+        // dcc_test_count promises a test the body cannot hold.
+        let s = psip_section(DCCT_TABLE_ID, 0x0000, 0, &[1, 0xF0, 0x04]);
+        assert!(matches!(
+            DirectedChannelChangeTable::parse(&s),
+            Err(TsError::Truncated { .. })
+        ));
+
+        // Term descriptor loop overruns the section body.
+        let mut body = vec![1u8];
+        push_dcc_test_head(&mut body, false, (2, 1), (2, 2), 0, 1, 1);
+        body.push(0x00);
+        body.extend_from_slice(&[0u8; 8]);
+        body.push(0xFC | 0x01); // claims 256+ bytes of descriptors
+        body.push(0x00);
+        let s = psip_section(DCCT_TABLE_ID, 0x0000, 0, &body);
+        assert!(matches!(
+            DirectedChannelChangeTable::parse(&s),
+            Err(TsError::SectionLengthOverrun { .. })
+        ));
+
+        // Trailing slack after the additional-descriptor loop.
+        let mut body = vec![0u8];
+        push_dcc_loop(&mut body, &[]);
+        body.push(0xEE);
+        let s = psip_section(DCCT_TABLE_ID, 0x0000, 0, &body);
+        assert!(matches!(
+            DirectedChannelChangeTable::parse(&s),
+            Err(TsError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn dccsct_round_trips_all_update_types() {
+        let mut body = vec![4u8]; // updates_defined
+
+        // 0x01 new_genre_category.
+        let name = mss(*b"eng", 0x00, b"Rugby");
+        body.push(0x01);
+        body.push((1 + name.len()) as u8);
+        body.push(0x1A);
+        body.extend_from_slice(&name);
+        push_dcc_loop(&mut body, &[]);
+
+        // 0x02 new_state, with a stuffing descriptor on the entry.
+        let name = mss(*b"eng", 0x00, b"Newland");
+        body.push(0x02);
+        body.push((1 + name.len()) as u8);
+        body.push(81);
+        body.extend_from_slice(&name);
+        push_dcc_loop(&mut body, &[0x80, 0]);
+
+        // 0x03 new_county (10-bit county code).
+        let name = mss(*b"eng", 0x00, b"Wayne");
+        body.push(0x03);
+        body.push((3 + name.len()) as u8);
+        body.push(26);
+        body.push(0xFC | ((163 >> 8) as u8));
+        body.push(163u16 as u8);
+        body.extend_from_slice(&name);
+        push_dcc_loop(&mut body, &[]);
+
+        // Reserved update type — must be skipped via
+        // update_data_length and kept raw.
+        body.push(0xB7);
+        body.push(3);
+        body.extend_from_slice(&[1, 2, 3]);
+        push_dcc_loop(&mut body, &[]);
+
+        push_dcc_loop(&mut body, &[0x80, 1, 0x00]);
+
+        let s = psip_section(DCCSCT_TABLE_ID, 0x0000, 3, &body);
+        let t = DccSelectionCodeTable::parse(&s).unwrap();
+        assert_eq!(t.version_number, 3);
+        assert_eq!(t.updates.len(), 4);
+        match &t.updates[0].update {
+            DccsctUpdate::NewGenreCategory {
+                genre_category_code,
+                name,
+            } => {
+                assert_eq!(*genre_category_code, 0x1A);
+                assert_eq!(name.first_text().unwrap(), "Rugby");
+            }
+            other => panic!("expected genre update, got {other:?}"),
+        }
+        match &t.updates[1].update {
+            DccsctUpdate::NewState {
+                dcc_state_location_code,
+                name,
+            } => {
+                assert_eq!(*dcc_state_location_code, 81);
+                assert_eq!(name.first_text().unwrap(), "Newland");
+            }
+            other => panic!("expected state update, got {other:?}"),
+        }
+        assert_eq!(
+            t.updates[1].iter_descriptors().next().unwrap().unwrap().tag,
+            0x80
+        );
+        match &t.updates[2].update {
+            DccsctUpdate::NewCounty {
+                state_code,
+                dcc_county_location_code,
+                name,
+            } => {
+                assert_eq!(*state_code, 26);
+                assert_eq!(*dcc_county_location_code, 163);
+                assert_eq!(name.first_text().unwrap(), "Wayne");
+            }
+            other => panic!("expected county update, got {other:?}"),
+        }
+        assert_eq!(
+            t.updates[3].update,
+            DccsctUpdate::Unknown {
+                update_type: 0xB7,
+                data: vec![1, 2, 3],
+            }
+        );
+        assert_eq!(t.additional_descriptors, vec![0x80, 1, 0x00]);
+    }
+
+    #[test]
+    fn dccsct_rejects_bad_type_overrun_and_slack_mss() {
+        // Non-zero dccsct_type is discarded per §6.8.
+        let mut body = vec![0u8];
+        push_dcc_loop(&mut body, &[]);
+        let s = psip_section(DCCSCT_TABLE_ID, 0x0001, 0, &body);
+        assert!(matches!(
+            DccSelectionCodeTable::parse(&s),
+            Err(TsError::Unsupported(_))
+        ));
+
+        // update_data_length overruns the body.
+        let s = psip_section(DCCSCT_TABLE_ID, 0x0000, 0, &[1, 0x01, 200, 0x1A]);
+        assert!(matches!(
+            DccSelectionCodeTable::parse(&s),
+            Err(TsError::SectionLengthOverrun { .. })
+        ));
+
+        // A known update whose MSS does not fill update_data_length
+        // exactly.
+        let name = mss(*b"eng", 0x00, b"X");
+        let mut body = vec![1u8, 0x01, (1 + name.len() + 1) as u8, 0x1A];
+        body.extend_from_slice(&name);
+        body.push(0x00); // slack inside the update body
+        push_dcc_loop(&mut body, &[]);
+        push_dcc_loop(&mut body, &[]);
+        let s = psip_section(DCCSCT_TABLE_ID, 0x0000, 0, &body);
+        assert!(matches!(
+            DccSelectionCodeTable::parse(&s),
+            Err(TsError::Unsupported(_))
+        ));
     }
 }

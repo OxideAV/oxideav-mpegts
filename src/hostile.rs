@@ -262,6 +262,35 @@ fn exercise_atsc(bytes: &[u8]) {
     if let Ok(ett) = atsc::ExtendedTextTable::parse(bytes) {
         let _ = ett.message.first_text();
     }
+    if let Ok(dcct) = atsc::DirectedChannelChangeTable::parse(bytes) {
+        for t in &dcct.tests {
+            for term in &t.terms {
+                let _ = (term.category(), term.postal_code_text(), term.genre_codes());
+                for d in term.iter_descriptors() {
+                    let _ = d;
+                }
+            }
+            for d in t.iter_descriptors() {
+                let _ = d;
+            }
+        }
+        for d in dcct.iter_descriptors() {
+            let _ = d;
+        }
+    }
+    if let Ok(dccsct) = atsc::DccSelectionCodeTable::parse(bytes) {
+        for u in &dccsct.updates {
+            if let atsc::DccsctUpdate::NewGenreCategory { name, .. }
+            | atsc::DccsctUpdate::NewState { name, .. }
+            | atsc::DccsctUpdate::NewCounty { name, .. } = &u.update
+            {
+                let _ = name.first_text();
+            }
+            for d in u.iter_descriptors() {
+                let _ = d;
+            }
+        }
+    }
     if let Ok((mss, _)) = atsc::MultipleStringStructure::parse(bytes) {
         for s in &mss.strings {
             let _ = s.decode();
@@ -314,11 +343,34 @@ fn seed_psip_sections() -> Vec<Vec<u8>> {
     eit_body.push(title.len() as u8);
     eit_body.extend_from_slice(&title);
     eit_body.extend_from_slice(&[0xF0, 0x00]);
+    // DCCT: one Temporary Retune test 7.1 → 7.2 with one term
+    // (numeric postal inclusion) so mutations reach the term walk.
+    let mut dcct_body = vec![1u8];
+    dcct_body.extend_from_slice(&[0x70, 0x1C, 0x01]);
+    dcct_body.extend_from_slice(&[0xF0, 0x1C, 0x02]);
+    dcct_body.extend_from_slice(&900_000_000u32.to_be_bytes());
+    dcct_body.extend_from_slice(&900_000_600u32.to_be_bytes());
+    dcct_body.push(1); // dcc_term_count
+    dcct_body.push(0x01);
+    dcct_body.extend_from_slice(b"00055?98");
+    dcct_body.extend_from_slice(&[0xFC, 0x00]); // term descriptors
+    dcct_body.extend_from_slice(&[0xFC, 0x00]); // test descriptors
+    dcct_body.extend_from_slice(&[0xFC, 0x00]); // additional descriptors
+                                                // DCCSCT: one new_genre_category update.
+    let name = [
+        1u8, b'e', b'n', b'g', 1, 0x00, 0x00, 4, b'N', b'e', b'w', b's',
+    ];
+    let mut dccsct_body = vec![1u8, 0x01, (1 + name.len()) as u8, 0x1A];
+    dccsct_body.extend_from_slice(&name);
+    dccsct_body.extend_from_slice(&[0xFC, 0x00]); // entry descriptors
+    dccsct_body.extend_from_slice(&[0xFC, 0x00]); // additional descriptors
     vec![
         psip_section(0xCD, 0x0000, stt_body),
         psip_section(0xC7, 0x0000, &mgt_body),
         psip_section(0xC8, 0x0F01, &vct_body),
         psip_section(0xCB, 0x1001, &eit_body),
+        psip_section(0xD3, 0x0005, &dcct_body),
+        psip_section(0xD4, 0x0000, &dccsct_body),
     ]
 }
 
@@ -331,6 +383,8 @@ fn mutated_psip_sections_never_panic() {
     assert!(crate::atsc::MasterGuideTable::parse(&seeds[1]).is_ok());
     assert!(crate::atsc::VirtualChannelTable::parse(&seeds[2]).is_ok());
     assert!(crate::atsc::AtscEventInformationTable::parse(&seeds[3]).is_ok());
+    assert!(crate::atsc::DirectedChannelChangeTable::parse(&seeds[4]).is_ok());
+    assert!(crate::atsc::DccSelectionCodeTable::parse(&seeds[5]).is_ok());
     let mut rng = Lcg::new(0xA65_2013_0448);
     for round in 0..400 {
         let seed = &seeds[round % seeds.len()];
