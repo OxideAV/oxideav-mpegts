@@ -39,6 +39,23 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   advisory, event/channel ETMs, both caption-service forms, and
   CRC / truncation rejection.
 
+- **Annex-C Huffman text decompression for PSIP strings.** The A/65
+  annex-C standard order-1 Huffman code tables (Table C4
+  program-title / Table C6 program-description — 1745 entries across
+  2 × 128 prior-character contexts) are transcribed as numeric data
+  (`atsc_huffman`), and `MssSegment::decode` now resolves
+  `compression_type` `0x01`/`0x02` segments (text modes `0x00` and
+  the §C.3 `0xFF` spelling both accepted): decoding starts from the
+  Terminate context, symbol 27 escapes to one uncompressed 8-bit
+  character (§C.2.1), characters ≥ 128 force the following character
+  uncompressed, symbol 0 terminates, and the output is ISO/IEC
+  8859-1. Transcription is pinned structurally — every multi-entry
+  context satisfies the Kraft equality exactly (a complete
+  prefix-free tree), every context can escape, spot literals match
+  the printed table — plus encode∘decode round-trips (escape and
+  raw-follow paths included), corrupt-stream sweeps, and MSS-level
+  integration for both table types.
+
 - **Two-generation remux gates for §2.4.3.5 / §2.7.6 signalling.**
   New round-trip tests pin that a full remux generation (mux → demux
   → mux → demux) preserves the random-access grid — the wire RAI

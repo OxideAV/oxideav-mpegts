@@ -137,6 +137,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod atsc;
+mod atsc_huffman;
 pub mod build;
 pub mod clock;
 pub mod descriptor;

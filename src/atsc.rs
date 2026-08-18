@@ -30,8 +30,10 @@
 //! of per-language strings, each a run of segments with their own
 //! `compression_type` / `mode`. [`MssSegment::decode`] resolves the
 //! uncompressed modes (the Table 6.41 Unicode range-select modes and
-//! UTF-16 mode `0x3F`); Huffman-compressed segments (Annex C) surface
-//! raw with their `compression_type` so a caller can defer them.
+//! UTF-16 mode `0x3F`) and the annex-C standard Huffman compressions
+//! (`compression_type` `0x01` title / `0x02` description) via the
+//! transcribed Table C4/C6 order-1 code tables, including the §C.2.1
+//! escape-to-uncompressed and ≥128-raw-follow rules.
 //!
 //! PSIP descriptors use tags in the MPEG-2 *user private* range
 //! (`0x80`–`0xAB`), which collides with how other systems (e.g. DVB)
@@ -106,15 +108,29 @@ impl MssSegment {
         matches!(mode, 0x00..=0x06 | 0x09..=0x10 | 0x20..=0x27 | 0x30..=0x33)
     }
 
-    /// Decode this segment to text where the A/65 encoding permits it
-    /// without the annex-C Huffman tables: uncompressed range-select
-    /// modes and uncompressed UTF-16 (`mode 0x3F`). Returns `None` for
-    /// Huffman-compressed segments (`compression_type` `0x01`/`0x02`),
-    /// SCSU (`0x3E`), and reserved / other-system modes — the raw
+    /// Decode this segment to text: the uncompressed Table 6.41
+    /// range-select modes, uncompressed UTF-16 (`mode 0x3F`), and the
+    /// annex-C standard Huffman compressions (`compression_type`
+    /// `0x01` title / `0x02` description — order-1 code tables with
+    /// the §C.2.1 escape-to-uncompressed rule, output interpreted as
+    /// ISO/IEC 8859-1). Returns `None` for SCSU (`0x3E`), reserved /
+    /// other-system modes, and corrupt Huffman streams — the raw
     /// bytes stay available in [`Self::bytes`].
     pub fn decode(&self) -> Option<String> {
-        if self.compression_type != 0x00 {
-            return None;
+        match self.compression_type {
+            0x00 => {}
+            // Annex C Huffman: §6.10 ties compression types 0x01/0x02
+            // to text mode 0x00, while §C.3/§C.4 describe them with
+            // mode 0xFF ("not applicable") — accept both spellings.
+            0x01 | 0x02 if matches!(self.mode, 0x00 | 0xFF) => {
+                let table = if self.compression_type == 0x01 {
+                    crate::atsc_huffman::TITLE_CODES
+                } else {
+                    crate::atsc_huffman::DESCRIPTION_CODES
+                };
+                return huffman_decode_text(&self.bytes, table);
+            }
+            _ => return None,
         }
         if Self::is_range_select_mode(self.mode) {
             let base = (self.mode as u32) << 8;
@@ -138,6 +154,108 @@ impl MssSegment {
         }
         None
     }
+}
+
+/// MSB-first bit reader over a byte slice.
+struct BitReader<'a> {
+    data: &'a [u8],
+    /// Next bit index (0 = MSB of byte 0).
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn bit(&mut self) -> Option<u16> {
+        let byte = *self.data.get(self.pos / 8)?;
+        let bit = (byte >> (7 - (self.pos % 8))) & 1;
+        self.pos += 1;
+        Some(bit as u16)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        let mut v = 0u8;
+        for _ in 0..8 {
+            v = (v << 1) | self.bit()? as u8;
+        }
+        Some(v)
+    }
+}
+
+/// The `(prior, symbol, len, bits)` slice for one order-1 context of
+/// an annex-C code table (entries are sorted by `prior`).
+fn huffman_context(table: &'static [(u8, u8, u8, u16)], prior: u8) -> &'static [(u8, u8, u8, u16)] {
+    let start = table.partition_point(|e| e.0 < prior);
+    let end = table.partition_point(|e| e.0 <= prior);
+    &table[start..end]
+}
+
+/// Decode an annex-C Huffman-compressed PSIP text segment
+/// (A/65 §C.2): the first character decodes from the Terminate (0)
+/// context, each decoded character selects the next order-1 context,
+/// symbol 27 escapes to one uncompressed 8-bit character, characters
+/// ≥ 128 force the following character uncompressed, and symbol 0
+/// terminates the string. Output bytes are ISO/IEC 8859-1. Returns
+/// `None` on a corrupt stream (a bit pattern no code in the active
+/// context matches); a stream that runs out of bits before the
+/// Terminate yields the text decoded so far.
+fn huffman_decode_text(bytes: &[u8], table: &'static [(u8, u8, u8, u16)]) -> Option<String> {
+    let mut r = BitReader::new(bytes);
+    let mut prior: u8 = 0;
+    let mut out = String::new();
+    loop {
+        let ch = if prior >= 128 {
+            // §C.2.1: any character following a (128..255) character
+            // is uncompressed.
+            match r.byte() {
+                Some(b) => b,
+                None => break,
+            }
+        } else {
+            let ctx = huffman_context(table, prior);
+            if ctx.is_empty() {
+                return None;
+            }
+            let max_len = ctx.iter().map(|e| e.2).max().unwrap_or(0);
+            let mut acc = 0u16;
+            let mut n = 0u8;
+            let sym = loop {
+                let Some(b) = r.bit() else {
+                    // Bits exhausted mid-code: truncated stream (the
+                    // Terminate normally lands first) — keep what
+                    // decoded cleanly.
+                    return Some(out);
+                };
+                acc = (acc << 1) | b;
+                n += 1;
+                if let Some(e) = ctx.iter().find(|e| e.2 == n && e.3 == acc) {
+                    break e.1;
+                }
+                if n >= max_len {
+                    return None;
+                }
+            };
+            if sym == 27 {
+                // Order-1 escape: the next 8 bits are an uncompressed
+                // character.
+                match r.byte() {
+                    Some(b) => b,
+                    None => break,
+                }
+            } else {
+                sym
+            }
+        };
+        if ch == 0 {
+            break; // string Terminate
+        }
+        // ISO/IEC 8859-1 maps byte values directly onto U+0000..U+00FF.
+        out.push(char::from(ch));
+        prior = ch;
+    }
+    Some(out)
 }
 
 /// One per-language string of a [`MultipleStringStructure`].
@@ -1558,9 +1676,11 @@ mod tests {
             MultipleStringStructure::parse(&mss(*b"jpn", 0x3F, &[0x30, 0x42, 0x30, 0x44])).unwrap();
         assert_eq!(m.first_text().unwrap(), "\u{3042}\u{3044}");
 
-        // Huffman-compressed segments stay raw (no annex-C tables).
+        // Huffman-compressed segments now decode via the annex-C
+        // tables (pinned separately); a reserved compression type
+        // stays raw.
         let mut h = mss(*b"eng", 0x00, &[0x12, 0x34]);
-        h[5] = 0x01; // compression_type
+        h[5] = 0x03; // reserved compression_type
         let (m, _) = MultipleStringStructure::parse(&h).unwrap();
         assert!(m.first_text().is_none());
         assert_eq!(m.strings[0].segments[0].bytes, vec![0x12, 0x34]);
@@ -2064,6 +2184,184 @@ mod tests {
             decode_atsc_descriptor(0x42, &[1, 2]),
             AtscDescriptorBody::Raw
         );
+    }
+
+    /// Test-local annex-C encoder — the inverse of
+    /// `huffman_decode_text`, used to pin decode round-trips. Emits
+    /// the order-1 code for each character (Terminate appended), the
+    /// §C.2.1 escape + 8-bit literal when the pair has no code, and a
+    /// raw 8-bit character after any prior ≥ 128.
+    fn huffman_encode_text(text: &[u8], table: &'static [(u8, u8, u8, u16)]) -> Vec<u8> {
+        let mut bits: Vec<u16> = Vec::new();
+        let push_code = |bits: &mut Vec<u16>, len: u8, code: u16| {
+            for k in (0..len).rev() {
+                bits.push((code >> k) & 1);
+            }
+        };
+        let mut prior = 0u8;
+        for &ch in text.iter().chain(std::iter::once(&0u8)) {
+            if prior >= 128 {
+                push_code(&mut bits, 8, ch as u16);
+            } else {
+                let ctx = huffman_context(table, prior);
+                if let Some(e) = ctx.iter().find(|e| e.1 == ch) {
+                    push_code(&mut bits, e.2, e.3);
+                } else {
+                    let esc = ctx
+                        .iter()
+                        .find(|e| e.1 == 27)
+                        .expect("every context escapes");
+                    push_code(&mut bits, esc.2, esc.3);
+                    push_code(&mut bits, 8, ch as u16);
+                }
+            }
+            prior = ch;
+        }
+        let mut out = Vec::with_capacity(bits.len().div_ceil(8));
+        for chunk in bits.chunks(8) {
+            let mut b = 0u8;
+            for (k, &bit) in chunk.iter().enumerate() {
+                b |= (bit as u8) << (7 - k);
+            }
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn annex_c_tables_are_complete_prefix_free_trees() {
+        for table in [
+            crate::atsc_huffman::TITLE_CODES,
+            crate::atsc_huffman::DESCRIPTION_CODES,
+        ] {
+            // Sorted by (prior, symbol), one context per possible
+            // prior character.
+            assert!(table
+                .windows(2)
+                .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+            for prior in 0u8..128 {
+                let ctx = huffman_context(table, prior);
+                assert!(!ctx.is_empty(), "context {prior} missing");
+                // The order-1 escape is reachable from every context.
+                assert!(
+                    ctx.iter().any(|e| e.1 == 27),
+                    "context {prior} cannot escape"
+                );
+                // Prefix-free: no code is a prefix of another.
+                for (i, a) in ctx.iter().enumerate() {
+                    assert!(a.2 >= 1 && a.2 <= 11);
+                    for b in &ctx[i + 1..] {
+                        let (short, long) = if a.2 <= b.2 { (a, b) } else { (b, a) };
+                        assert_ne!(
+                            long.3 >> (long.2 - short.2),
+                            short.3,
+                            "context {prior}: prefix clash {a:?} vs {b:?}"
+                        );
+                    }
+                }
+                // Multi-entry contexts are COMPLETE binary trees: the
+                // Kraft sum equals one exactly (single-entry contexts
+                // are printed in the spec as the lone escape at code
+                // '1', giving 1/2).
+                let kraft: u32 = ctx.iter().map(|e| 1u32 << (11 - e.2)).sum();
+                if ctx.len() > 1 {
+                    assert_eq!(kraft, 1 << 11, "context {prior} tree incomplete");
+                } else {
+                    assert_eq!((ctx[0].1, ctx[0].2, ctx[0].3), (27, 1, 1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn annex_c_spot_codes_match_the_printed_table() {
+        use crate::atsc_huffman::TITLE_CODES;
+        // A handful of literals read straight off Table C4: the
+        // Terminate context codes 'S' as 000 and 'T' as 010; a space
+        // codes 'T' as 1000; '1' codes '9' as 00; an apostrophe codes
+        // 's' as 1.
+        for want in [
+            (0u8, b'S', 3u8, 0b000u16),
+            (0, b'T', 3, 0b010),
+            (b' ', b'T', 4, 0b1000),
+            (b'1', b'9', 2, 0b00),
+            (b'\'', b's', 1, 0b1),
+        ] {
+            assert!(
+                TITLE_CODES.contains(&want),
+                "missing spot-check entry {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn annex_c_decode_round_trips_typical_text() {
+        for table in [
+            crate::atsc_huffman::TITLE_CODES,
+            crate::atsc_huffman::DESCRIPTION_CODES,
+        ] {
+            for text in [
+                &b"The Evening News"[..],
+                b"Movie: The Great Escape (1963)",
+                b"SPORTS Tonight at 10:30",
+                b"A",
+                b"",
+                // Pairs with no order-1 code force the escape path.
+                b"qp qq zx",
+                // A Latin-1 character (>= 128) forces the raw-follow
+                // rule.
+                b"Caf\xE9 au lait",
+            ] {
+                let coded = huffman_encode_text(text, table);
+                let decoded = huffman_decode_text(&coded, table).expect("clean stream decodes");
+                let want: String = text.iter().map(|&b| char::from(b)).collect();
+                assert_eq!(decoded, want);
+            }
+        }
+    }
+
+    #[test]
+    fn annex_c_decode_flags_corrupt_streams_not_panics() {
+        // First title-context code space: '11001011' is the Terminate
+        // context's ESC... corrupting bits must either error (None) or
+        // decode to some bounded string — never panic. Sweep all
+        // single-byte streams plus a few longer patterns.
+        for b in 0u8..=255 {
+            let _ = huffman_decode_text(&[b], crate::atsc_huffman::TITLE_CODES);
+            let _ = huffman_decode_text(&[b, !b, b], crate::atsc_huffman::DESCRIPTION_CODES);
+        }
+    }
+
+    #[test]
+    fn mss_huffman_segment_decodes_through_the_structure() {
+        let coded = huffman_encode_text(b"Evening News", crate::atsc_huffman::TITLE_CODES);
+        let mut v = vec![1u8, b'e', b'n', b'g', 1, 0x01, 0xFF, coded.len() as u8];
+        v.extend_from_slice(&coded);
+        let (m, used) = MultipleStringStructure::parse(&v).unwrap();
+        assert_eq!(used, v.len());
+        assert_eq!(m.first_text().unwrap(), "Evening News");
+
+        // compression_type 0x02 with text mode 0x00 (the §6.10
+        // spelling).
+        let coded = huffman_encode_text(
+            b"A long description of the program.",
+            crate::atsc_huffman::DESCRIPTION_CODES,
+        );
+        let mut v = vec![1u8, b'e', b'n', b'g', 1, 0x02, 0x00, coded.len() as u8];
+        v.extend_from_slice(&coded);
+        let (m, _) = MultipleStringStructure::parse(&v).unwrap();
+        assert_eq!(
+            m.first_text().unwrap(),
+            "A long description of the program."
+        );
+
+        // A Huffman segment with a non-text mode stays undecoded.
+        let seg = MssSegment {
+            compression_type: 0x01,
+            mode: 0x3F,
+            bytes: vec![0x12],
+        };
+        assert!(seg.decode().is_none());
     }
 
     #[test]
