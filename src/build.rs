@@ -19,8 +19,10 @@
 //!   construction; callers that assemble a descriptor loop simply
 //!   concatenate the returned buffers.
 //! * **Section builders** — emit a complete long-form PSI section
-//!   (`table_id` through the CRC-32 trailer) for the PAT, PMT, SDT, NIT,
-//!   and present/following EIT. The section is ready to hand to
+//!   (`table_id` through the CRC-32 trailer) for the PAT, PMT, CAT,
+//!   TSDT, SDT, NIT, BAT, SIT, and present/following EIT, plus the
+//!   short-form DVB SI sections (TDT, TOT with its CRC, RST, ST, DIT).
+//!   The section is ready to hand to
 //!   [`crate::psi::PsiSectionAssembler`]-style fragmentation and, once
 //!   inside a TS packet, reads back identically through the matching
 //!   `parse` routine.
@@ -32,8 +34,10 @@
 
 use crate::descriptor::{SubtitlingEntry, TeletextEntry};
 use crate::psi::{
-    mpeg2_crc32, EitDateTime, EitDuration, RunningStatus, NIT_ACTUAL_TABLE_ID, NIT_OTHER_TABLE_ID,
-    PAT_TABLE_ID, PMT_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID,
+    mpeg2_crc32, EitDateTime, EitDuration, RstEntry, RunningStatus, BAT_TABLE_ID, CAT_TABLE_ID,
+    DIT_TABLE_ID, NIT_ACTUAL_TABLE_ID, NIT_OTHER_TABLE_ID, PAT_TABLE_ID, PMT_TABLE_ID,
+    RST_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SIT_TABLE_ID, ST_TABLE_ID, TDT_TABLE_ID,
+    TOT_TABLE_ID, TSDT_TABLE_ID,
 };
 
 /// DVB present/following EIT `table_id` for the actual TS (`0x4E`).
@@ -260,6 +264,164 @@ pub fn aac_descriptor(
         body.extend_from_slice(additional_info);
     }
     tlv(0x7C, &body)
+}
+
+/// Generic descriptor TLV — wrap arbitrary body bytes under a caller's
+/// `descriptor_tag`. The escape hatch for tags without a dedicated
+/// builder; the body is truncated to the 255-byte `descriptor_length`
+/// ceiling like every other builder.
+pub fn raw_descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
+    tlv(tag, body)
+}
+
+/// `CA_descriptor` (tag `0x09`, ISO/IEC 13818-1 §2.6.16 Table 2-50) —
+/// the `CA_system_ID` plus the 13-bit `CA_PID` carrying the ECM (PMT
+/// placement) or EMM (CAT placement) stream, plus private data.
+pub fn ca_descriptor(ca_system_id: u16, ca_pid: u16, private_data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + private_data.len());
+    body.extend_from_slice(&ca_system_id.to_be_bytes());
+    body.push(0b1110_0000 | ((ca_pid >> 8) & 0x1F) as u8);
+    body.push((ca_pid & 0xFF) as u8);
+    body.extend_from_slice(private_data);
+    tlv(0x09, &body)
+}
+
+/// `stuffing_descriptor` (tag `0x42`, EN 300 468 §6.2.40) — `len` bytes
+/// of `0xFF` padding (the `stuffing_byte` run carries no meaning).
+pub fn stuffing_descriptor(len: u8) -> Vec<u8> {
+    tlv(0x42, &vec![0xFF; len as usize])
+}
+
+/// `extended_event_descriptor` (tag `0x4E`, EN 300 468 §6.2.15) — the
+/// long-form EIT event synopsis: the `descriptor_number` /
+/// `last_descriptor_number` association pair, the language code, the
+/// two-column `(item_description, item)` list, and the non-itemized
+/// free text. Item / text runs are raw DVB text-string bytes (annex A
+/// charset selection is the caller's). Over-long items or text are
+/// truncated to their 8-bit length prefixes; a body pushing the
+/// descriptor past 255 bytes is truncated by the TLV envelope, so
+/// callers splitting a long synopsis across an associated set should
+/// size each descriptor's content themselves.
+pub fn extended_event_descriptor(
+    descriptor_number: u8,
+    last_descriptor_number: u8,
+    language_code: [u8; 3],
+    items: &[(&[u8], &[u8])],
+    text: &[u8],
+) -> Vec<u8> {
+    let mut item_loop = Vec::new();
+    for (description, item) in items {
+        let dl = description.len().min(0xFF);
+        item_loop.push(dl as u8);
+        item_loop.extend_from_slice(&description[..dl]);
+        let il = item.len().min(0xFF);
+        item_loop.push(il as u8);
+        item_loop.extend_from_slice(&item[..il]);
+    }
+    let ill = item_loop.len().min(0xFF);
+    item_loop.truncate(ill);
+    let tl = text.len().min(0xFF);
+    let mut body = Vec::with_capacity(5 + ill + tl);
+    body.push((descriptor_number << 4) | (last_descriptor_number & 0x0F));
+    body.extend_from_slice(&language_code);
+    body.push(ill as u8);
+    body.extend_from_slice(&item_loop);
+    body.push(tl as u8);
+    body.extend_from_slice(&text[..tl]);
+    tlv(0x4E, &body)
+}
+
+/// `content_descriptor` (tag `0x54`, EN 300 468 §6.2.9) — the per-event
+/// genre classification: a flat run of `(content_nibble_level_1,
+/// content_nibble_level_2, user_byte)` triples (Table 29 indexes the
+/// two nibbles).
+pub fn content_descriptor(entries: &[(u8, u8, u8)]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(entries.len() * 2);
+    for (level_1, level_2, user_byte) in entries {
+        body.push((level_1 << 4) | (level_2 & 0x0F));
+        body.push(*user_byte);
+    }
+    tlv(0x54, &body)
+}
+
+/// `parental_rating_descriptor` (tag `0x55`, EN 300 468 §6.2.28) — a
+/// flat run of `(country_code, rating)` records (Table 83: `0x01..=0x0F`
+/// codes minimum age `rating + 3`).
+pub fn parental_rating_descriptor(entries: &[([u8; 3], u8)]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(entries.len() * 4);
+    for (country_code, rating) in entries {
+        body.extend_from_slice(country_code);
+        body.push(*rating);
+    }
+    tlv(0x55, &body)
+}
+
+/// One country entry for a `local_time_offset_descriptor` (write-side
+/// mirror of [`crate::descriptor::LocalTimeOffsetEntry`], minus the raw
+/// MJD bookkeeping the parser preserves).
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTimeOffsetSpec {
+    /// 3-byte ISO 3166 alpha-3 country code (e.g. `b"GBR"`).
+    pub country_code: [u8; 3],
+    /// 6-bit `country_region_id` (`0` = no time-zone subdivision).
+    pub country_region_id: u8,
+    /// `local_time_offset_polarity` — `true` when local time is behind
+    /// UTC (negative offset). Applies to both offsets.
+    pub offset_negative: bool,
+    /// Current offset in whole minutes (encoded as BCD `HHMM`).
+    pub local_time_offset_minutes: u16,
+    /// The UTC instant at which the offset changes; `None` encodes the
+    /// all-ones sentinel.
+    pub time_of_change: Option<EitDateTime>,
+    /// Offset in force after `time_of_change`, in whole minutes.
+    pub next_time_offset_minutes: u16,
+}
+
+/// Encode a whole-minutes offset as the §6.2.20 16-bit BCD `HHMM` pair.
+fn bcd_hhmm(minutes: u16) -> [u8; 2] {
+    [to_bcd((minutes / 60) as u8), to_bcd((minutes % 60) as u8)]
+}
+
+/// `local_time_offset_descriptor` (tag `0x58`, EN 300 468 §6.2.20
+/// Table 69) — per-country local-time-offset entries, 13 bytes each.
+pub fn local_time_offset_descriptor(entries: &[LocalTimeOffsetSpec]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(entries.len() * 13);
+    for e in entries {
+        body.extend_from_slice(&e.country_code);
+        // country_region_id (6) | reserved_future_use (1) | polarity (1).
+        body.push((e.country_region_id << 2) | 0b10 | u8::from(e.offset_negative));
+        body.extend_from_slice(&bcd_hhmm(e.local_time_offset_minutes));
+        body.extend_from_slice(&encode_utc_time(e.time_of_change));
+        body.extend_from_slice(&bcd_hhmm(e.next_time_offset_minutes));
+    }
+    tlv(0x58, &body)
+}
+
+/// `partial_transport_stream_descriptor` (tag `0x63`, EN 300 468 §7.2.1
+/// Table 165) — the SIT transmission-info descriptor carrying the
+/// partial-TS play-out rates: 22-bit `peak_rate` and
+/// `minimum_overall_smoothing_rate` (units of 400 bit/s; all-ones =
+/// undefined) plus the 14-bit `maximum_overall_smoothing_buffer` (bytes;
+/// all-ones = undefined). Values are masked to their field widths.
+pub fn partial_transport_stream_descriptor(
+    peak_rate: u32,
+    minimum_overall_smoothing_rate: u32,
+    maximum_overall_smoothing_buffer: u16,
+) -> Vec<u8> {
+    let pr = peak_rate & 0x3F_FFFF;
+    let sr = minimum_overall_smoothing_rate & 0x3F_FFFF;
+    let sb = maximum_overall_smoothing_buffer & 0x3FFF;
+    let body = [
+        0b1100_0000 | (pr >> 16) as u8,
+        (pr >> 8) as u8,
+        pr as u8,
+        0b1100_0000 | (sr >> 16) as u8,
+        (sr >> 8) as u8,
+        sr as u8,
+        0b1100_0000 | (sb >> 8) as u8,
+        sb as u8,
+    ];
+    tlv(0x63, &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +684,180 @@ pub fn build_eit_pf(
         body.extend_from_slice(&ev.descriptors[..dlen as usize]);
     }
     long_section(table_id, service_id, version, true, 0, 0, &body)
+}
+
+/// Build a Conditional Access Table section (§2.4.4.6 Table 2-27). The
+/// body is one `descriptor()` loop — normally `CA_descriptor`s (see
+/// [`ca_descriptor`]) pointing at the EMM PIDs. The 18 reserved bits in
+/// the `table_id_extension` slot are transmitted as `1`s.
+pub fn build_cat(version: u8, descriptors: &[u8]) -> Vec<u8> {
+    long_section(CAT_TABLE_ID, 0xFFFF, version, true, 0, 0, descriptors)
+}
+
+/// Build a Transport Stream Description Table section (§2.4.4.12
+/// Table 2-30-1) — a TS-wide `descriptor()` loop on PID `0x0002`,
+/// structurally the CAT's twin.
+pub fn build_tsdt(version: u8, descriptors: &[u8]) -> Vec<u8> {
+    long_section(TSDT_TABLE_ID, 0xFFFF, version, true, 0, 0, descriptors)
+}
+
+/// Build a DVB Bouquet Association Table section (EN 300 468 §5.2.2).
+/// The body is byte-for-byte the NIT shape — a bouquet-level descriptor
+/// loop then a `transport_stream_loop` — keyed by `bouquet_id` in the
+/// `table_id_extension` slot; [`NitTsEntry`] doubles as the BAT's TS
+/// entry.
+pub fn build_bat(
+    bouquet_id: u16,
+    version: u8,
+    bouquet_descriptors: &[u8],
+    transport_streams: &[NitTsEntry],
+) -> Vec<u8> {
+    let mut ts_loop = Vec::new();
+    for ts in transport_streams {
+        ts_loop.extend_from_slice(&ts.transport_stream_id.to_be_bytes());
+        ts_loop.extend_from_slice(&ts.original_network_id.to_be_bytes());
+        let dlen = ts.descriptors.len().min(0x0FFF) as u16;
+        ts_loop.push(0b1111_0000 | ((dlen >> 8) & 0x0F) as u8);
+        ts_loop.push((dlen & 0xFF) as u8);
+        ts_loop.extend_from_slice(&ts.descriptors[..dlen as usize]);
+    }
+    let bdl = bouquet_descriptors.len().min(0x0FFF) as u16;
+    let tsll = ts_loop.len().min(0x0FFF) as u16;
+    let mut body = Vec::new();
+    body.push(0b1111_0000 | ((bdl >> 8) & 0x0F) as u8);
+    body.push((bdl & 0xFF) as u8);
+    body.extend_from_slice(&bouquet_descriptors[..bdl as usize]);
+    body.push(0b1111_0000 | ((tsll >> 8) & 0x0F) as u8);
+    body.push((tsll & 0xFF) as u8);
+    body.extend_from_slice(&ts_loop);
+    long_section(BAT_TABLE_ID, bouquet_id, version, true, 0, 0, &body)
+}
+
+/// One service entry for a Selection Information Table (EN 300 468
+/// §7.1.2 Table 164).
+#[derive(Debug, Clone)]
+pub struct SitServiceEntry {
+    /// 16-bit `service_id` (equals the PMT `program_number`).
+    pub service_id: u16,
+    /// 3-bit `running_status` of the original present event.
+    pub running_status: RunningStatus,
+    /// Per-service descriptor loop.
+    pub descriptors: Vec<u8>,
+}
+
+/// Build a DVB Selection Information Table section (EN 300 468 §5.2.10 /
+/// §7.1.2 Table 164) — the partial-TS description: a transmission-info
+/// descriptor loop (usually a [`partial_transport_stream_descriptor`])
+/// plus per-service entries. `section_number` / `last_section_number`
+/// are fixed at `0` per §7.1.2; the `table_id_extension` bits are
+/// reserved and transmitted as `1`s.
+pub fn build_sit(
+    version: u8,
+    transmission_info_descriptors: &[u8],
+    services: &[SitServiceEntry],
+) -> Vec<u8> {
+    let til = transmission_info_descriptors.len().min(0x0FFF) as u16;
+    let mut body = Vec::new();
+    body.push(0b1111_0000 | ((til >> 8) & 0x0F) as u8);
+    body.push((til & 0xFF) as u8);
+    body.extend_from_slice(&transmission_info_descriptors[..til as usize]);
+    for svc in services {
+        body.extend_from_slice(&svc.service_id.to_be_bytes());
+        let dlen = svc.descriptors.len().min(0x0FFF) as u16;
+        // reserved_future_use (1) | running_status (3) | length high (4).
+        body.push(0b1000_0000 | (svc.running_status.to_bits() << 4) | ((dlen >> 8) & 0x0F) as u8);
+        body.push((dlen & 0xFF) as u8);
+        body.extend_from_slice(&svc.descriptors[..dlen as usize]);
+    }
+    long_section(SIT_TABLE_ID, 0xFFFF, version, true, 0, 0, &body)
+}
+
+// ---------------------------------------------------------------------------
+// Short-form DVB SI section envelope
+// ---------------------------------------------------------------------------
+
+/// Assemble a short-form DVB SI section (`section_syntax_indicator == 0`,
+/// EN 300 468 §5.2.5–§5.2.9): `table_id`, the syntax/length word, and the
+/// caller's body verbatim (any CRC is the caller's to append inside
+/// `body`). `syntax` sets the `section_syntax_indicator` bit — only the
+/// ST may legally carry `1` here.
+fn short_section(table_id: u8, syntax: bool, body: &[u8]) -> Vec<u8> {
+    let section_length = body.len().min(0x0FFD);
+    let mut s = Vec::with_capacity(3 + section_length);
+    s.push(table_id);
+    // section_syntax_indicator | reserved_future_use=1 | reserved=0b11 |
+    // section_length high.
+    s.push((u8::from(syntax) << 7) | 0b0111_0000 | ((section_length >> 8) & 0x0F) as u8);
+    s.push((section_length & 0xFF) as u8);
+    s.extend_from_slice(&body[..section_length]);
+    s
+}
+
+/// Build a DVB Time and Date Table section (EN 300 468 §5.2.5 Table 8) —
+/// a short-form section whose whole body is the 40-bit MJD + BCD
+/// `UTC_time`. `None` encodes the all-ones sentinel.
+pub fn build_tdt(utc_time: Option<EitDateTime>) -> Vec<u8> {
+    short_section(TDT_TABLE_ID, false, &encode_utc_time(utc_time))
+}
+
+/// Build a DVB Time Offset Table section (EN 300 468 §5.2.6 Table 9) —
+/// the TDT plus a descriptor loop (normally a
+/// [`local_time_offset_descriptor`]) and a CRC-32 trailer.
+pub fn build_tot(utc_time: Option<EitDateTime>, descriptors: &[u8]) -> Vec<u8> {
+    let dlen = descriptors.len().min(0x0FFF);
+    let mut body = Vec::with_capacity(5 + 2 + dlen + 4);
+    body.extend_from_slice(&encode_utc_time(utc_time));
+    body.push(0b1111_0000 | ((dlen >> 8) & 0x0F) as u8);
+    body.push((dlen & 0xFF) as u8);
+    body.extend_from_slice(&descriptors[..dlen]);
+    // Reserve the CRC's four bytes inside section_length, then compute it
+    // over table_id .. the byte before the CRC slot.
+    body.extend_from_slice(&[0; 4]);
+    let mut s = short_section(TOT_TABLE_ID, false, &body);
+    let crc_pos = s.len() - 4;
+    let crc = mpeg2_crc32(&s[..crc_pos]);
+    s[crc_pos..].copy_from_slice(&crc.to_be_bytes());
+    s
+}
+
+/// Build a DVB Running Status Table section (EN 300 468 §5.2.7
+/// Table 10) — a short-form section whose body is a flat run of 9-byte
+/// event-status entries, no CRC.
+pub fn build_rst(entries: &[RstEntry]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(entries.len() * 9);
+    for e in entries {
+        body.extend_from_slice(&e.transport_stream_id.to_be_bytes());
+        body.extend_from_slice(&e.original_network_id.to_be_bytes());
+        body.extend_from_slice(&e.service_id.to_be_bytes());
+        body.extend_from_slice(&e.event_id.to_be_bytes());
+        // reserved_future_use (5) | running_status (3).
+        body.push(0b1111_1000 | e.running_status.to_bits());
+    }
+    short_section(RST_TABLE_ID, false, &body)
+}
+
+/// Build a DVB Stuffing Table section (EN 300 468 §5.2.8 Table 11) —
+/// `len` `data_byte`s of `0xFF` (their value carries no meaning). The
+/// ST is the section-invalidation mechanism at a delivery-system
+/// boundary; `section_syntax_indicator` may be either value, so it is
+/// caller-selected.
+pub fn build_st(section_syntax_indicator: bool, len: usize) -> Vec<u8> {
+    short_section(
+        ST_TABLE_ID,
+        section_syntax_indicator,
+        &vec![0xFF; len.min(0x0FFD)],
+    )
+}
+
+/// Build a DVB Discontinuity Information Table section (EN 300 468
+/// §5.2.9 / §7.1.1 Table 163) — the single `transition_flag` bit padded
+/// with 7 `reserved_future_use` bits, `section_length` fixed at 1.
+pub fn build_dit(transition_flag: bool) -> Vec<u8> {
+    short_section(
+        DIT_TABLE_ID,
+        false,
+        &[(u8::from(transition_flag) << 7) | 0b0111_1111],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +1277,318 @@ mod tests {
                 crate::psi::decode_utc_time([mjd.to_be_bytes()[0], mjd.to_be_bytes()[1], 0, 0, 0])
                     .unwrap();
             assert_eq!((decoded.year, decoded.month, decoded.day), (y, m, d));
+        }
+    }
+
+    #[test]
+    fn ca_descriptor_round_trips() {
+        let d = ca_descriptor(0x0B00, 0x1F00, &[0xDE, 0xAD]);
+        match one_descriptor(&d) {
+            DescriptorBody::Ca(ca) => {
+                assert_eq!(ca.ca_system_id, 0x0B00);
+                assert_eq!(ca.ca_pid, 0x1F00);
+                assert_eq!(ca.private_data, &[0xDE, 0xAD]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn stuffing_descriptor_round_trips() {
+        let d = stuffing_descriptor(3);
+        match one_descriptor(&d) {
+            DescriptorBody::Stuffing(s) => assert_eq!(s.stuffing_bytes, &[0xFF, 0xFF, 0xFF]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn extended_event_descriptor_round_trips() {
+        let d = extended_event_descriptor(
+            1,
+            2,
+            *b"eng",
+            &[(b"Director", b"A. Person"), (b"Year", b"1999")],
+            b"A long synopsis.",
+        );
+        match one_descriptor(&d) {
+            DescriptorBody::ExtendedEvent(e) => {
+                assert_eq!(e.descriptor_number, 1);
+                assert_eq!(e.last_descriptor_number, 2);
+                assert_eq!(e.language_code, *b"eng");
+                assert_eq!(e.items.len(), 2);
+                assert_eq!(e.items[0].item_description, b"Director");
+                assert_eq!(e.items[0].item, b"A. Person");
+                assert_eq!(e.items[1].item_description, b"Year");
+                assert_eq!(e.text, b"A long synopsis.");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_descriptor_round_trips() {
+        let d = content_descriptor(&[(0x1, 0x4, 0x00), (0x4, 0x3, 0xAB)]);
+        match one_descriptor(&d) {
+            DescriptorBody::Content(c) => {
+                assert_eq!(c.entries.len(), 2);
+                assert_eq!((c.entries[0].level_1, c.entries[0].level_2), (0x1, 0x4));
+                assert_eq!(c.entries[1].user_byte, 0xAB);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parental_rating_descriptor_round_trips() {
+        let d = parental_rating_descriptor(&[(*b"FRA", 0x09), (*b"GBR", 0x00)]);
+        match one_descriptor(&d) {
+            DescriptorBody::ParentalRating(p) => {
+                assert_eq!(p.entries.len(), 2);
+                assert_eq!(p.entries[0].country_code, *b"FRA");
+                assert_eq!(p.entries[0].rating, 0x09);
+                assert_eq!(p.entries[0].minimum_age_years(), Some(12));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_time_offset_descriptor_round_trips() {
+        let change = EitDateTime {
+            year: 2026,
+            month: 10,
+            day: 25,
+            hour: 1,
+            minute: 0,
+            second: 0,
+            mjd: 0,
+        };
+        let spec = LocalTimeOffsetSpec {
+            country_code: *b"GBR",
+            country_region_id: 0,
+            offset_negative: false,
+            local_time_offset_minutes: 60,
+            time_of_change: Some(change),
+            next_time_offset_minutes: 0,
+        };
+        let d = local_time_offset_descriptor(&[spec]);
+        match one_descriptor(&d) {
+            DescriptorBody::LocalTimeOffset(l) => {
+                assert_eq!(l.entries.len(), 1);
+                let e = &l.entries[0];
+                assert_eq!(e.country_code, *b"GBR");
+                assert!(!e.offset_negative);
+                assert_eq!(e.local_time_offset_minutes, 60);
+                assert_eq!(e.next_time_offset_minutes, 0);
+                let t = e.time_of_change.unwrap();
+                assert_eq!((t.year, t.month, t.day, t.hour), (2026, 10, 25, 1));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_transport_stream_descriptor_round_trips() {
+        let d = partial_transport_stream_descriptor(20_000, 15_000, 1_400);
+        match one_descriptor(&d) {
+            DescriptorBody::PartialTransportStream(p) => {
+                assert_eq!(p.peak_rate, 20_000);
+                assert_eq!(p.minimum_overall_smoothing_rate, 15_000);
+                assert_eq!(p.maximum_overall_smoothing_buffer, 1_400);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cat_round_trips() {
+        let s = build_cat(4, &ca_descriptor(0x0B00, 0x1F00, &[]));
+        let cat = crate::psi::ConditionalAccessTable::parse(&s).unwrap();
+        assert_eq!(cat.version_number, 4);
+        match cat.iter_descriptors().next().unwrap().unwrap().body {
+            DescriptorBody::Ca(ca) => assert_eq!(ca.ca_pid, 0x1F00),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn tsdt_round_trips() {
+        let s = build_tsdt(1, &registration_descriptor(*b"OXAV", &[]));
+        let tsdt = crate::psi::TransportStreamDescriptionTable::parse(&s).unwrap();
+        assert_eq!(tsdt.version_number, 1);
+        assert!(matches!(
+            tsdt.iter_descriptors().next().unwrap().unwrap().body,
+            DescriptorBody::Registration { .. }
+        ));
+    }
+
+    #[test]
+    fn bat_round_trips() {
+        let ts = NitTsEntry {
+            transport_stream_id: 0x0007,
+            original_network_id: 0x2024,
+            descriptors: service_list_descriptor(&[(0x0064, 0x01)]),
+        };
+        let s = build_bat(0x0042, 9, &bouquet_name_descriptor(b"Premium"), &[ts]);
+        let bat = crate::psi::BouquetAssociationTable::parse(&s).unwrap();
+        assert_eq!(bat.bouquet_id, 0x0042);
+        assert_eq!(bat.version_number, 9);
+        match bat.iter_descriptors().next().unwrap().unwrap().body {
+            DescriptorBody::BouquetName(b) => assert_eq!(b.bouquet_name, b"Premium"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(bat.transport_streams.len(), 1);
+        let e = &bat.transport_streams[0];
+        assert_eq!(e.transport_stream_id, 0x0007);
+        assert_eq!(e.original_network_id, 0x2024);
+        assert!(matches!(
+            e.iter_descriptors().next().unwrap().unwrap().body,
+            DescriptorBody::ServiceList(_)
+        ));
+    }
+
+    #[test]
+    fn sit_round_trips() {
+        let svc = SitServiceEntry {
+            service_id: 0x0064,
+            running_status: RunningStatus::Running,
+            descriptors: service_descriptor(0x01, b"Prov", b"Name"),
+        };
+        let s = build_sit(
+            2,
+            &partial_transport_stream_descriptor(20_000, 0x3F_FFFF, 0x3FFF),
+            &[svc],
+        );
+        let sit = crate::psi::SelectionInformationTable::parse(&s).unwrap();
+        assert_eq!(sit.version_number, 2);
+        match sit.iter_descriptors().next().unwrap().unwrap().body {
+            DescriptorBody::PartialTransportStream(p) => {
+                assert_eq!(p.peak_rate, 20_000);
+                assert!(p.minimum_overall_smoothing_rate_undefined());
+                assert!(p.maximum_overall_smoothing_buffer_undefined());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(sit.services.len(), 1);
+        assert_eq!(sit.services[0].service_id, 0x0064);
+        assert_eq!(sit.services[0].running_status, RunningStatus::Running);
+        assert!(matches!(
+            sit.services[0]
+                .iter_descriptors()
+                .next()
+                .unwrap()
+                .unwrap()
+                .body,
+            DescriptorBody::Service(_)
+        ));
+    }
+
+    #[test]
+    fn tdt_round_trips_spec_example() {
+        // The EN 300 468 annex-C worked example: 1993-10-13 12:45:00.
+        let dt = EitDateTime {
+            year: 1993,
+            month: 10,
+            day: 13,
+            hour: 12,
+            minute: 45,
+            second: 0,
+            mjd: 0,
+        };
+        let s = build_tdt(Some(dt));
+        assert_eq!(&s[3..8], &[0xC0, 0x79, 0x12, 0x45, 0x00]);
+        let tdt = crate::psi::TimeDateTable::parse(&s).unwrap();
+        let u = tdt.utc_time.unwrap();
+        assert_eq!((u.year, u.month, u.day), (1993, 10, 13));
+        assert_eq!((u.hour, u.minute, u.second), (12, 45, 0));
+        // The all-ones sentinel round-trips to None.
+        assert!(crate::psi::TimeDateTable::parse(&build_tdt(None))
+            .unwrap()
+            .utc_time
+            .is_none());
+    }
+
+    #[test]
+    fn tot_round_trips_with_offset_descriptor() {
+        let dt = EitDateTime {
+            year: 2026,
+            month: 8,
+            day: 18,
+            hour: 6,
+            minute: 30,
+            second: 15,
+            mjd: 0,
+        };
+        let spec = LocalTimeOffsetSpec {
+            country_code: *b"JPN",
+            country_region_id: 0,
+            offset_negative: false,
+            local_time_offset_minutes: 9 * 60,
+            time_of_change: None,
+            next_time_offset_minutes: 9 * 60,
+        };
+        let s = build_tot(Some(dt), &local_time_offset_descriptor(&[spec]));
+        let tot = crate::psi::TimeOffsetTable::parse(&s).unwrap();
+        let u = tot.utc_time.unwrap();
+        assert_eq!((u.year, u.month, u.day), (2026, 8, 18));
+        assert_eq!((u.hour, u.minute, u.second), (6, 30, 15));
+        match tot.iter_descriptors().next().unwrap().unwrap().body {
+            DescriptorBody::LocalTimeOffset(l) => {
+                assert_eq!(l.entries[0].country_code, *b"JPN");
+                assert_eq!(l.entries[0].local_time_offset_minutes, 540);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn tot_crc_corruption_is_rejected() {
+        let mut s = build_tot(None, &[]);
+        let last = s.len() - 1;
+        s[last] ^= 0xFF;
+        assert!(crate::psi::TimeOffsetTable::parse(&s).is_err());
+    }
+
+    #[test]
+    fn rst_round_trips() {
+        let entries = [
+            RstEntry {
+                transport_stream_id: 1,
+                original_network_id: 2,
+                service_id: 3,
+                event_id: 4,
+                running_status: RunningStatus::Running,
+            },
+            RstEntry {
+                transport_stream_id: 5,
+                original_network_id: 6,
+                service_id: 7,
+                event_id: 8,
+                running_status: RunningStatus::NotRunning,
+            },
+        ];
+        let s = build_rst(&entries);
+        let rst = crate::psi::RunningStatusTable::parse(&s).unwrap();
+        assert_eq!(rst.entries, entries);
+    }
+
+    #[test]
+    fn st_round_trips_both_syntax_forms() {
+        for syntax in [false, true] {
+            let s = build_st(syntax, 16);
+            let st = crate::psi::StuffingTable::parse(&s).unwrap();
+            assert_eq!(st.section_syntax_indicator, syntax);
+            assert_eq!(st.data_bytes, vec![0xFF; 16]);
+        }
+    }
+
+    #[test]
+    fn dit_round_trips_both_flags() {
+        for flag in [false, true] {
+            let s = build_dit(flag);
+            let dit = crate::psi::DiscontinuityInformationTable::parse(&s).unwrap();
+            assert_eq!(dit.transition_flag, flag);
         }
     }
 }

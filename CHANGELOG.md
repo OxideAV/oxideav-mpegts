@@ -9,6 +9,30 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Write-side coverage for every remaining parsed table.** The `build`
+  module now mirrors the whole `psi` parse surface: `build_cat`
+  (§2.4.4.6) and `build_tsdt` (§2.4.4.12) long-form descriptor-loop
+  sections, `build_bat` (EN 300 468 §5.2.2 — the NIT-shaped bouquet
+  section, reusing `NitTsEntry`), `build_sit` (§5.2.10 / §7.1.2 — the
+  partial-TS description with its transmission-info loop and typed
+  `SitServiceEntry` service loop), and the short-form family via a
+  shared §5.2.5–§5.2.9 envelope: `build_tdt`, `build_tot` (with the
+  CRC-32 trailer inside `section_length`), `build_rst` (reusing the
+  parser's `RstEntry`), `build_st`, and `build_dit`. New descriptor
+  builders back them: `ca_descriptor` (§2.6.16 — CAT/PMT CA
+  signalling), `local_time_offset_descriptor` (§6.2.20, with a typed
+  `LocalTimeOffsetSpec` and BCD `HHMM` encoding),
+  `partial_transport_stream_descriptor` (§7.2.1),
+  `extended_event_descriptor` (§6.2.15 — item loop + free text),
+  `content_descriptor` (§6.2.9), `parental_rating_descriptor`
+  (§6.2.28), `stuffing_descriptor` (§6.2.40), and a generic
+  `raw_descriptor` escape hatch. Every builder is round-trip pinned
+  against its parser, including the EN 300 468 annex-C worked example
+  (`1993-10-13 12:45:00` → `0xC0 7912 4500`) on the TDT wire bytes and
+  a TOT CRC-corruption rejection.
+
 ### Fixed
 
 - **Multi-program CBR muxes keep every program's PCR cadence alive.**
