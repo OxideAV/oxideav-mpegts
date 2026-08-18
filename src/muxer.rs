@@ -121,6 +121,10 @@ const TB_SIZE_BYTES: f64 = 512.0;
 const AUDIO_TB_RX_BPS: f64 = 2_000_000.0;
 /// §2.4.2.3 `Rxsys` (bit/s) — the drain the pacer assumes for PSI.
 const SYS_TB_RX_BPS: f64 = 1_000_000.0;
+/// §2.4.2.3 video transport-buffer drain factor — `Rxn = 1.2 × Rmax`.
+/// Applied to the caller-declared `Rmax` of
+/// [`MpegTsMuxer::set_video_max_bitrate`].
+const VIDEO_TB_RX_FACTOR: f64 = 1.2;
 /// Pacer key for the pooled §2.4.2.3 system branch. PID 0 (PAT),
 /// PID 1 (CAT), and every program_map_PID share ONE `TBsys`, so their
 /// packets must be spaced against a single 512-byte account — pacing
@@ -497,6 +501,12 @@ struct TrackState {
     /// next payload packet on this PID gets `splice_countdown = -next`
     /// until `next > total` (§2.4.3.5).
     post_splice: Option<(u8, u8)>,
+    /// §2.4.2.3 `Rmax` (bit/s) declared via
+    /// [`MpegTsMuxer::set_video_max_bitrate`] — enables CBR
+    /// transport-buffer pacing for this video PID at
+    /// `Rxn = 1.2 × Rmax`. `None` → the PID's packets are written
+    /// back-to-back.
+    video_rmax_bps: Option<u64>,
 }
 
 impl MpegTsMuxer {
@@ -605,6 +615,7 @@ impl MpegTsMuxer {
                     extra_es_descriptors,
                     pending_splice: None,
                     post_splice: None,
+                    video_rmax_bps: None,
                 });
                 idx_to_track.insert(sidx, track_idx);
                 track_indices.push(track_idx);
@@ -681,11 +692,13 @@ impl MpegTsMuxer {
     /// audio / PSI packets are spaced with nulls whenever emitting one
     /// back-to-back would push that PID's §2.4.2.3 512-byte transport
     /// buffer past its size at the spec drain rates (2 Mbit/s audio,
-    /// 1 Mbit/s system). Video PIDs are not TB-paced: their §2.4.2.3
-    /// drain (`1.2 × Rmax`) exceeds any mux rate this pacer would be
-    /// asked for. `write_packet` errors when the byte clock has
-    /// already passed a frame's decode time — the configured rate is
-    /// too low to deliver it.
+    /// 1 Mbit/s system). Video PIDs are TB-paced at
+    /// `Rxn = 1.2 × Rmax` once [`Self::set_video_max_bitrate`]
+    /// declares the stream's `Rmax`; undeclared video is written
+    /// back-to-back (conformant whenever the mux rate itself stays
+    /// within the stream's `Rxn`). `write_packet` errors when the
+    /// byte clock has already passed a frame's decode time — the
+    /// configured rate is too low to deliver it.
     pub fn set_mux_rate(&mut self, rate_bps: Option<u64>) {
         self.cbr = rate_bps.map(|rate_bps| CbrState {
             rate_bps: rate_bps.max(1),
@@ -697,6 +710,51 @@ impl MpegTsMuxer {
             held: vec![std::collections::VecDeque::new(); self.tracks.len()],
             flushing: false,
         });
+    }
+
+    /// Declare a video stream's maximum elementary-stream bit rate
+    /// `Rmax` (bit/s), enabling §2.4.2.3 transport-buffer pacing for
+    /// its PID in CBR mode.
+    ///
+    /// §2.4.2.3 drains a video PID's 512-byte transport buffer `TBn`
+    /// at `Rxn = 1.2 × Rmax`. When the configured mux rate exceeds
+    /// that drain, writing a PES envelope's TS packets back-to-back
+    /// overflows `TBn` — so once `Rmax` is declared the CBR pacer
+    /// spaces this PID's packets with null packets against the same
+    /// 512-byte account it keeps for the audio and system branches.
+    /// Without a declaration the PID stays unpaced (conformant
+    /// whenever the mux rate itself does not exceed the stream's
+    /// `Rxn`). Pacing stretches a frame's delivery to
+    /// `frame_bits / Rxn`; the write path still errors when the byte
+    /// clock can no longer land a frame before its decode time, so an
+    /// `Rmax` below the stream's real bit rate surfaces as that error
+    /// rather than silent T-STD violations.
+    ///
+    /// `None` clears the hint. Errors for an unknown `stream_index`,
+    /// a non-video stream (§2.4.2.3 fixes the audio drain), or a zero
+    /// rate. May be called before or after `write_header`.
+    pub fn set_video_max_bitrate(
+        &mut self,
+        stream_index: u32,
+        rmax_bps: Option<u64>,
+    ) -> CoreResult<()> {
+        let track_idx = *self.idx_to_track.get(&stream_index).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "mpegts muxer: video Rmax for unknown stream_index {stream_index}"
+            ))
+        })?;
+        if !self.tracks[track_idx].is_video {
+            return Err(CoreError::invalid(
+                "mpegts muxer: video Rmax on a non-video stream (§2.4.2.3 fixes the audio TB drain)",
+            ));
+        }
+        if rmax_bps == Some(0) {
+            return Err(CoreError::invalid(
+                "mpegts muxer: video Rmax must be non-zero",
+            ));
+        }
+        self.tracks[track_idx].video_rmax_bps = rmax_bps;
+        Ok(())
     }
 
     /// CBR: equation 2-7 `Rsys` drain in bytes/second for the pooled
@@ -1344,9 +1402,38 @@ impl MpegTsMuxer {
         Ok(())
     }
 
+    /// The §2.4.2.3 transport-buffer drain (bit/s) the CBR pacer
+    /// books for `track_idx`'s PID, when one is defined: the
+    /// spec-fixed audio rate for non-video tracks, `1.2 × Rmax` for a
+    /// video track whose `Rmax` was declared, `None` for undeclared
+    /// video (written back-to-back).
+    fn cbr_tb_rx_for_track(&self, track_idx: usize) -> Option<f64> {
+        if self.tracks[track_idx].is_video {
+            self.tracks[track_idx]
+                .video_rmax_bps
+                .map(|rmax| rmax as f64 * VIDEO_TB_RX_FACTOR)
+        } else {
+            Some(AUDIO_TB_RX_BPS)
+        }
+    }
+
     /// CBR variant: PCR fields read from the byte clock; also records
     /// the byte position for the byte-clock cadence.
     fn write_pcr_only_packet_cbr(&mut self, prog_idx: usize) -> CoreResult<()> {
+        // A PCR-only packet is a whole TS packet on the PCR PID — it
+        // enters that PID's §2.4.2.3 transport buffer exactly like a
+        // payload packet, so it is paced and booked against the same
+        // TB account (before reading the byte clock: pacing may burn
+        // null packets first).
+        let pcr_pid = self.programs[prog_idx].pcr_pid;
+        if let Some(rx) = self
+            .tracks
+            .iter()
+            .position(|t| t.pid == pcr_pid)
+            .and_then(|ti| self.cbr_tb_rx_for_track(ti))
+        {
+            self.cbr_pace_tb(pcr_pid, rx)?;
+        }
         let Some((base, ext)) = self.cbr_pcr_fields() else {
             return Ok(());
         };
@@ -1609,13 +1696,12 @@ impl MpegTsMuxer {
                 });
         let cbr_on = self.cbr.as_ref().is_some_and(|c| c.anchor.is_some());
         // CBR TB pacing applies to non-video PIDs (§2.4.2.3 audio
-        // Rx = 2 Mbit/s); video TBs drain at 1.2 × Rmax, above any
-        // sensible mux rate.
-        let tb_rx = if self.tracks[track_idx].is_video {
-            None
-        } else {
-            Some(AUDIO_TB_RX_BPS)
-        };
+        // Rx = 2 Mbit/s) — and to video PIDs whose §2.4.2.3
+        // `Rxn = 1.2 × Rmax` drain was declared via
+        // `set_video_max_bitrate` (a mux rate above that drain would
+        // otherwise overflow the 512-byte TBn on back-to-back
+        // packets). Undeclared video stays back-to-back.
+        let tb_rx = self.cbr_tb_rx_for_track(track_idx);
         let mut cursor = 0usize;
         let mut first = true;
         // `Some(n)` once countdown annotation has started: this packet
@@ -3680,6 +3766,102 @@ mod tests {
         want.sort();
         got.sort();
         assert_eq!(got, want);
+    }
+
+    /// §2.4.2.3 video transport-buffer pacing: at a mux rate far above
+    /// the video chain's `Rxn = 1.2 × Rmax` drain, back-to-back video
+    /// packets overflow the 512-byte TBn — declaring `Rmax` via
+    /// `set_video_max_bitrate` makes the pacer space them and the
+    /// whole output T-STD-conformant.
+    #[test]
+    fn cbr_video_tb_pacing_keeps_tbn_inside_512() {
+        let mux_with_hint = |hint: Option<u64>| {
+            let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+            let sink = SharedSink::new();
+            {
+                let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+                let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+                // 20 Mbit/s wire, ~1,6 Mbit/s video: the wire feeds
+                // TBn more than 4× faster than the Rmax-4-Mbit/s
+                // chain drains it.
+                mx.set_mux_rate(Some(20_000_000));
+                if let Some(rmax) = hint {
+                    mx.set_video_max_bitrate(0, Some(rmax)).expect("hint");
+                }
+                mx.write_header().expect("hdr");
+                let mut events: Vec<(u32, i64, usize)> = Vec::new();
+                for k in 0..50i64 {
+                    events.push((0, 90_000 + k * 3_600, 8_192));
+                }
+                for k in 0..83i64 {
+                    events.push((1, 90_000 + k * 2_160, 200));
+                }
+                events.sort_by_key(|&(_, pts, _)| pts);
+                for &(idx, pts, len) in &events {
+                    let mut p = Packet::new(idx, TimeBase::new(1, 90_000), vec![idx as u8; len])
+                        .with_pts(pts);
+                    if idx == 0 {
+                        p.flags.keyframe = true;
+                    }
+                    mx.write_packet(&p).unwrap();
+                }
+                mx.write_trailer().unwrap();
+            }
+            sink.into_bytes()
+        };
+        let tstd_config = || {
+            crate::tstd::TStdConfig::single_program(
+                FIRST_ES_PID,
+                DEFAULT_PMT_PID,
+                vec![
+                    (
+                        FIRST_ES_PID,
+                        crate::tstd::TStdStreamModel::video_low_main_level(
+                            4_000_000, 131_072, 262_144,
+                        ),
+                    ),
+                    (FIRST_ES_PID + 1, crate::tstd::TStdStreamModel::audio()),
+                ],
+            )
+        };
+
+        // Unhinted: the video TBn overflows under the 20 Mbit/s burst.
+        let bytes = mux_with_hint(None);
+        let tstd = crate::tstd::analyze_tstd(&bytes, &tstd_config()).expect("tstd");
+        assert!(
+            tstd.violations.iter().any(|v| matches!(
+                v,
+                crate::tstd::TStdViolation::TbOverflow { pid, .. } if *pid == FIRST_ES_PID
+            )),
+            "expected a video TB overflow without the Rmax hint: {:?}",
+            tstd.violations
+        );
+
+        // Hinted at the model's Rmax: zero violations, still
+        // packet-level conformant, and the frames all arrive.
+        let bytes = mux_with_hint(Some(4_000_000));
+        let report = crate::validate::validate_ts(&bytes);
+        assert!(report.is_conformant(), "{report:?}");
+        let tstd = crate::tstd::analyze_tstd(&bytes, &tstd_config()).expect("tstd");
+        assert!(tstd.is_conformant(), "{:?}", tstd.violations);
+        let video_stats = tstd.chains.iter().find(|c| c.pid == FIRST_ES_PID).unwrap();
+        assert_eq!(video_stats.access_units, 50);
+        assert!(
+            video_stats.peak_tb_bytes <= 512,
+            "video TB peak {}",
+            video_stats.peak_tb_bytes
+        );
+
+        // The hint is validated: unknown stream, non-video stream,
+        // zero rate.
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let output: Box<dyn oxideav_core::WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+        assert!(mx.set_video_max_bitrate(7, Some(4_000_000)).is_err());
+        assert!(mx.set_video_max_bitrate(1, Some(4_000_000)).is_err());
+        assert!(mx.set_video_max_bitrate(0, Some(0)).is_err());
+        assert!(mx.set_video_max_bitrate(0, Some(4_000_000)).is_ok());
+        assert!(mx.set_video_max_bitrate(0, None).is_ok());
     }
 
     /// CBR mode errors out when the configured rate cannot deliver a

@@ -11,6 +11,25 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **Video transport-buffer pacing closes the last mux-side T-STD
+  hole.** `MpegTsMuxer::set_video_max_bitrate(stream_index, rmax)`
+  declares a video stream's §2.4.2.3 `Rmax`; in CBR mode that PID's
+  TS packets are then spaced against the 512-byte `TBn` at the
+  spec-formula drain `Rxn = 1.2 × Rmax` — exactly the pacing the
+  audio and pooled-system branches already get. Without the
+  declaration a mux rate above the stream's `Rxn` overflows `TBn` on
+  any back-to-back PES envelope (pinned: 8 KB frames on a 20 Mbit/s
+  wire against an `Rmax`-4-Mbit/s chain model peak at 600+ bytes);
+  with it the same plan is zero-violation under `analyze_tstd` with
+  the video TB peak ≤ 512. PCR-only packets on a paced PCR PID
+  (video-hinted or audio) are now paced and booked against the same
+  TB account — they are whole TS packets entering `TBn` like any
+  payload packet, and leaving them unbooked let the analyzer read
+  ~2 packets more backlog than the pacer budgeted. The hint
+  validates its target (video-only, non-zero, known index); an
+  `Rmax` below the stream's true rate surfaces as the existing
+  cannot-deliver-in-time error rather than silent violations.
+
 - **The Table 2-39 descriptor set is closed out.** The `descriptor`
   module decodes the last ten program / program-element descriptors
   the staged ISO/IEC 13818-1 edition defines — the §2.6.28–§2.6.53
