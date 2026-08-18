@@ -4230,6 +4230,189 @@ mod tests {
         assert!(last.second >= 1, "~4 s elapsed past midnight: {last:?}");
     }
 
+    /// Count TS packets on `pid` whose adaptation field sets the
+    /// §2.4.3.5 `random_access_indicator`.
+    fn count_rai(bytes: &[u8], pid: u16) -> usize {
+        crate::packet::iter_packets(bytes)
+            .filter_map(|p| p.ok())
+            .filter(|p| {
+                p.pid == pid
+                    && p.adaptation_field
+                        .as_ref()
+                        .is_some_and(|af| af.random_access_indicator)
+            })
+            .count()
+    }
+
+    /// Count TS packets on `pid` whose adaptation field sets the
+    /// §2.4.3.5 `discontinuity_indicator`.
+    fn count_di(bytes: &[u8], pid: u16) -> usize {
+        crate::packet::iter_packets(bytes)
+            .filter_map(|p| p.ok())
+            .filter(|p| {
+                p.pid == pid
+                    && p.adaptation_field
+                        .as_ref()
+                        .is_some_and(|af| af.discontinuity_indicator)
+            })
+            .count()
+    }
+
+    /// Demux a whole stream into per-packet
+    /// `(stream_index, pts, payload, keyframe)` records, in demux
+    /// order.
+    fn demux_all(bytes: Vec<u8>) -> Vec<(u32, i64, Vec<u8>, bool)> {
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut out = Vec::new();
+        while let Ok(p) = dmx.next_packet() {
+            out.push((p.stream_index, p.pts.unwrap(), p.data, p.flags.keyframe));
+        }
+        out
+    }
+
+    /// The §2.4.3.5 random-access grid must survive a full remux
+    /// generation: gen-1 mux → demux (RAI folds into the keyframe
+    /// flag) → gen-2 mux (the flag re-emits RAI) → demux, with both
+    /// generations validator-conformant, identical wire RAI counts,
+    /// and identical per-stream (pts, payload, keyframe) sequences.
+    #[test]
+    fn two_generation_remux_preserves_rai_grid() {
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            let mut events: Vec<(u32, i64, usize, bool)> = Vec::new();
+            for k in 0..30i64 {
+                events.push((0, 90_000 + k * 3_600, 600 + k as usize, k % 5 == 0));
+            }
+            for k in 0..40i64 {
+                events.push((1, 90_000 + k * 2_700, 120, false));
+            }
+            events.sort_by_key(|&(_, pts, _, _)| pts);
+            for &(idx, pts, len, kf) in &events {
+                let mut p =
+                    Packet::new(idx, TimeBase::new(1, 90_000), vec![idx as u8; len]).with_pts(pts);
+                p.flags.keyframe = kf;
+                mx.write_packet(&p).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let gen1 = sink.into_bytes();
+        assert!(crate::validate::validate_ts(&gen1).is_conformant());
+        let rai_gen1 = count_rai(&gen1, FIRST_ES_PID);
+        assert_eq!(rai_gen1, 6, "6 keyframes → 6 RAI packets");
+
+        let demuxed1 = demux_all(gen1);
+        assert_eq!(
+            demuxed1.iter().filter(|r| r.3).count(),
+            6,
+            "RAI must fold back into 6 keyframe flags"
+        );
+
+        // Generation 2: remux exactly what the demuxer produced.
+        let sink2 = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink2.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open2");
+            mx.write_header().expect("hdr2");
+            for (idx, pts, data, kf) in &demuxed1 {
+                let mut p =
+                    Packet::new(*idx, TimeBase::new(1, 90_000), data.clone()).with_pts(*pts);
+                p.flags.keyframe = *kf;
+                mx.write_packet(&p).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        let gen2 = sink2.into_bytes();
+        assert!(crate::validate::validate_ts(&gen2).is_conformant());
+        assert_eq!(count_rai(&gen2, FIRST_ES_PID), rai_gen1);
+
+        let demuxed2 = demux_all(gen2);
+        // Per-stream sequences are byte- and flag-identical across the
+        // remux generation (global order may interleave differently).
+        for s in [0u32, 1] {
+            let a: Vec<_> = demuxed1.iter().filter(|r| r.0 == s).collect();
+            let b: Vec<_> = demuxed2.iter().filter(|r| r.0 == s).collect();
+            assert_eq!(a, b, "stream {s} diverged across the remux generation");
+        }
+    }
+
+    /// A §2.7.6 time-base discontinuity must survive a remux
+    /// generation: both generations carry exactly one
+    /// `discontinuity_indicator` PCR packet, both stay
+    /// validator-conformant across the backward base jump, and the
+    /// demuxed timeline is identical.
+    #[test]
+    fn two_generation_remux_carries_time_base_discontinuity() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let mux_two_bases = |packets: &[(i64, Vec<u8>, bool)], break_at: usize| -> Vec<u8> {
+            let sink = SharedSink::new();
+            {
+                let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+                let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+                mx.write_header().expect("hdr");
+                for (k, (pts, data, kf)) in packets.iter().enumerate() {
+                    if k == break_at {
+                        mx.signal_time_base_discontinuity(DEFAULT_PROGRAM_NUMBER)
+                            .unwrap();
+                    }
+                    let mut p =
+                        Packet::new(0, TimeBase::new(1, 90_000), data.clone()).with_pts(*pts);
+                    p.flags.keyframe = *kf;
+                    mx.write_packet(&p).unwrap();
+                }
+                mx.write_trailer().unwrap();
+            }
+            sink.into_bytes()
+        };
+
+        // 20 frames on base A, then a backward jump onto base B.
+        let mut source: Vec<(i64, Vec<u8>, bool)> = Vec::new();
+        for k in 0..20i64 {
+            source.push((900_000 + k * 3_600, vec![0xA0; 400], k % 5 == 0));
+        }
+        for k in 0..20i64 {
+            source.push((3_000 + k * 3_600, vec![0xB0; 400], k % 5 == 0));
+        }
+        let gen1 = mux_two_bases(&source, 20);
+        let report1 = crate::validate::validate_ts(&gen1);
+        assert!(report1.is_conformant(), "{report1:?}");
+        assert_eq!(
+            count_di(&gen1, FIRST_ES_PID),
+            1,
+            "exactly one signalled discontinuity"
+        );
+
+        let demuxed1 = demux_all(gen1);
+        assert_eq!(demuxed1.len(), 40);
+
+        // Generation 2: remux the demuxed timeline, re-signalling the
+        // break where the demuxer reported it (the backward PTS step).
+        let break_at = demuxed1
+            .iter()
+            .zip(demuxed1.iter().skip(1))
+            .position(|(a, b)| b.1 < a.1)
+            .expect("backward step visible in demuxed timeline")
+            + 1;
+        let source2: Vec<(i64, Vec<u8>, bool)> = demuxed1
+            .iter()
+            .map(|(_, pts, data, kf)| (*pts, data.clone(), *kf))
+            .collect();
+        let gen2 = mux_two_bases(&source2, break_at);
+        let report2 = crate::validate::validate_ts(&gen2);
+        assert!(report2.is_conformant(), "{report2:?}");
+        assert_eq!(count_di(&gen2, FIRST_ES_PID), 1);
+        let demuxed2 = demux_all(gen2);
+        assert_eq!(
+            demuxed1, demuxed2,
+            "timeline diverged across the remux generation"
+        );
+    }
+
     /// CBR mode with a CAT: PID 0x0001 is a §2.4.2.3 system PID, so
     /// the CAT packets must ride the pooled TBsys/Bsys accounts and
     /// the output must stay T-STD- and validator-conformant.

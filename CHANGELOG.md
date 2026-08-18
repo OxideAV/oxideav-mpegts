@@ -39,6 +39,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   advisory, event/channel ETMs, both caption-service forms, and
   CRC / truncation rejection.
 
+- **Two-generation remux gates for §2.4.3.5 / §2.7.6 signalling.**
+  New round-trip tests pin that a full remux generation (mux → demux
+  → mux → demux) preserves the random-access grid — the wire RAI
+  count stays exactly the keyframe count in both generations, the
+  demuxer folds every RAI back into a keyframe flag, and per-stream
+  `(pts, payload, keyframe)` sequences are identical across the
+  generation — and carries a time-base discontinuity through: both
+  generations stay validator-conformant across the backward base
+  jump with exactly one `discontinuity_indicator` PCR packet, and
+  the re-signalled break lands where the demuxed timeline steps
+  backward. Black-box cross-check: a 6 s CBR remux of a
+  tool-generated MPEG-2 elementary stream (SDT + advancing TDT
+  aboard) read back through an independent validator binary with all
+  100 frames decoded, zero container errors, and the reconstructed
+  transport rate within 0,25 % of the configured 2 Mbit/s.
+
 - **The ATSC PSIP surface rides the hostile batteries.** The
   deterministic hostile-input sweep gains a PSIP leg: well-formed
   STT / MGT / TVCT / EIT seed sections under seeded byte mutations
