@@ -11,6 +11,16 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- **A/65 Table 6.25 descriptor coverage completes.** The PSIP
+  descriptor walker types the `ATSC_private_information_descriptor`
+  (tag `0xAD`, A/53 Part 3 §5.8.2 Table 6.1) — the SMPTE-RA
+  `format_identifier` (the §2.6.8 registration code space) plus the
+  opaque `private_data_byte` run, with a short body falling back to
+  `Raw` — and recognises the `E-AC-3_audio_stream_descriptor` (tag
+  `0xCC`, §6.9.1.2) with its A/52-annex-G body surfaced raw exactly
+  like the AC-3 form. Every descriptor A/65 Table 6.25 places in a
+  PSIP loop now has a typed or tag-recognised decode.
+
 - **Video transport-buffer pacing closes the last mux-side T-STD
   hole.** `MpegTsMuxer::set_video_max_bitrate(stream_index, rmax)`
   declares a video stream's §2.4.2.3 `Rmax`; in CBR mode that PID's

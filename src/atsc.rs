@@ -45,13 +45,14 @@
 //! escape-to-uncompressed and ≥128-raw-follow rules.
 //!
 //! PSIP descriptors use tags in the MPEG-2 *user private* range
-//! (`0x80`–`0xAB`), which collides with how other systems (e.g. DVB)
+//! (`0x80`–`0xCC`), which collides with how other systems (e.g. DVB)
 //! assign that space — so PSIP descriptor decoding is deliberately kept
 //! separate from [`crate::descriptor`]: [`iter_atsc_descriptors`] walks
 //! a PSIP descriptor loop into typed [`AtscDescriptorBody`] records
 //! (caption service, content advisory, extended channel name, service
 //! location, time-shifted service, component name, DCC requests,
-//! redistribution control, genre) per A/65 §6.9 Table 6.25.
+//! redistribution control, genre, ATSC private information) per A/65
+//! §6.9 Table 6.25 and A/53 Part 3 §5.8.2.
 
 use crate::error::TsError;
 use crate::psi::parse_section_header;
@@ -499,6 +500,22 @@ pub enum AtscDescriptorBody {
     /// `genre_descriptor` (tag `0xAB`, §6.9.13) — Table 6.20
     /// categorical genre code attributes.
     Genre(Vec<u8>),
+    /// `ATSC_private_information_descriptor` (tag `0xAD`, A/53 Part 3
+    /// §5.8.2 Table 6.1) — labelled private data. Legal in every PSIP
+    /// descriptor loop (A/65 Table 6.25), possibly several per loop.
+    PrivateInformation {
+        /// 32-bit `format_identifier` — the same SMPTE-RA-registered
+        /// code space as the ISO/IEC 13818-1 §2.6.8
+        /// `registration_descriptor`; scopes only this descriptor's
+        /// private data.
+        format_identifier: [u8; 4],
+        /// The `private_data_byte` run — semantics belong to the
+        /// `format_identifier` assignee.
+        private_data: Vec<u8>,
+    },
+    /// `E-AC-3_audio_stream_descriptor` (tag `0xCC`, §6.9.1.2) — body
+    /// defined in ATSC A/52 Annex G; surfaced raw like the AC-3 form.
+    EAc3AudioStream(Vec<u8>),
     /// Any other tag — payload preserved verbatim.
     Raw,
 }
@@ -737,6 +754,19 @@ fn decode_atsc_descriptor(tag: u8, data: &[u8]) -> AtscDescriptorBody {
         0xA8 => decode_dcc_request(data, true).unwrap_or(AtscDescriptorBody::Raw),
         0xA9 => decode_dcc_request(data, false).unwrap_or(AtscDescriptorBody::Raw),
         0xAA => AtscDescriptorBody::RedistributionControl(data.to_vec()),
+        0xAD => {
+            // A/53 Part 3 §5.8.2 Table 6.1: format_identifier (32),
+            // then private_data_bytes.
+            if data.len() < 4 {
+                AtscDescriptorBody::Raw
+            } else {
+                AtscDescriptorBody::PrivateInformation {
+                    format_identifier: [data[0], data[1], data[2], data[3]],
+                    private_data: data[4..].to_vec(),
+                }
+            }
+        }
+        0xCC => AtscDescriptorBody::EAc3AudioStream(data.to_vec()),
         0xAB => {
             // §6.9.13 Table 6.38: reserved (3) | attribute_count (5),
             // then attribute bytes.
@@ -2809,6 +2839,29 @@ mod tests {
         assert_eq!(
             decode_atsc_descriptor(0x81, &[0x10, 0x20]),
             AtscDescriptorBody::Ac3AudioStream(vec![0x10, 0x20])
+        );
+        // ATSC_private_information (A/53 Part 3 §5.8.2 Table 6.1):
+        // registration-style format_identifier + opaque bytes; a body
+        // too short for the identifier falls back to Raw.
+        match decode_atsc_descriptor(0xAD, &[b'G', b'A', b'9', b'4', 0xDE, 0xAD]) {
+            AtscDescriptorBody::PrivateInformation {
+                format_identifier,
+                private_data,
+            } => {
+                assert_eq!(&format_identifier, b"GA94");
+                assert_eq!(private_data, vec![0xDE, 0xAD]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            decode_atsc_descriptor(0xAD, &[1, 2, 3]),
+            AtscDescriptorBody::Raw
+        );
+        // E-AC-3 audio (§6.9.1.2, body per A/52 annex G) surfaces raw
+        // but tag-recognised, like the AC-3 form.
+        assert_eq!(
+            decode_atsc_descriptor(0xCC, &[0x99]),
+            AtscDescriptorBody::EAc3AudioStream(vec![0x99])
         );
         assert_eq!(
             decode_atsc_descriptor(0x42, &[1, 2]),
