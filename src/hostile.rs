@@ -215,6 +215,151 @@ fn oversized_section_length_is_bounded() {
     // calls above simply must not panic or grow unboundedly.
 }
 
+/// Feed one byte buffer through every ATSC PSIP parse surface (the
+/// table parsers dispatch on `table_id`, so most calls error fast —
+/// the contract under test is panic-freedom and bounded work).
+fn exercise_atsc(bytes: &[u8]) {
+    use crate::atsc;
+    if let Ok(stt) = atsc::SystemTimeTable::parse(bytes) {
+        let _ = stt.unix_time();
+        for d in stt.iter_descriptors() {
+            let _ = d;
+        }
+    }
+    if let Ok(mgt) = atsc::MasterGuideTable::parse(bytes) {
+        for e in &mgt.tables {
+            let _ = (e.eit_index(), e.event_ett_index(), e.rrt_rating_region());
+            for d in e.iter_descriptors() {
+                let _ = d;
+            }
+        }
+    }
+    if let Ok(vct) = atsc::VirtualChannelTable::parse(bytes) {
+        for c in &vct.channels {
+            let _ = c.short_name_text();
+            let _ = c.one_part_number();
+            for d in c.iter_descriptors() {
+                let _ = d;
+            }
+        }
+    }
+    if let Ok(rrt) = atsc::RatingRegionTable::parse(bytes) {
+        let _ = rrt.rating_region_name.first_text();
+        for dim in &rrt.dimensions {
+            for v in &dim.values {
+                let _ = v.abbrev_rating_value.first_text();
+            }
+        }
+    }
+    if let Ok(eit) = atsc::AtscEventInformationTable::parse(bytes) {
+        for e in &eit.events {
+            let _ = e.title.first_text();
+            for d in e.iter_descriptors() {
+                let _ = d;
+            }
+        }
+    }
+    if let Ok(ett) = atsc::ExtendedTextTable::parse(bytes) {
+        let _ = ett.message.first_text();
+    }
+    if let Ok((mss, _)) = atsc::MultipleStringStructure::parse(bytes) {
+        for s in &mss.strings {
+            let _ = s.decode();
+        }
+    }
+    for d in atsc::iter_atsc_descriptors(bytes) {
+        let _ = d;
+    }
+}
+
+/// Build one well-formed PSIP section set (STT + MGT + TVCT + EIT)
+/// through the same §4.1 framing the atsc tests pin, so mutations hit
+/// deep parser states rather than dying on the table_id check.
+fn seed_psip_sections() -> Vec<Vec<u8>> {
+    fn psip_section(table_id: u8, tid_ext: u16, body: &[u8]) -> Vec<u8> {
+        let section_length = 5 + 1 + body.len() + 4;
+        let mut s = Vec::with_capacity(3 + section_length);
+        s.push(table_id);
+        s.push(0b1111_0000 | ((section_length >> 8) & 0x0F) as u8);
+        s.push((section_length & 0xFF) as u8);
+        s.extend_from_slice(&tid_ext.to_be_bytes());
+        s.push(0b1100_0001);
+        s.push(0);
+        s.push(0);
+        s.push(0); // protocol_version
+        s.extend_from_slice(body);
+        let crc = crate::psi::mpeg2_crc32(&s);
+        s.extend_from_slice(&crc.to_be_bytes());
+        s
+    }
+    let stt_body: &[u8] = &[0x3B, 0x9A, 0xCA, 0x00, 18, 0xFF, 0x02];
+    let mut mgt_body = vec![0x00, 0x01];
+    mgt_body.extend_from_slice(&[0x01, 0x00, 0xFD, 0x00, 0xE3]); // EIT-0 on 0x1D00, v3
+    mgt_body.extend_from_slice(&1024u32.to_be_bytes());
+    mgt_body.extend_from_slice(&[0xF0, 0x00, 0xF0, 0x00]);
+    let mut vct_body = vec![1u8];
+    for u in "WOXA".encode_utf16().chain(std::iter::repeat(0).take(3)) {
+        vct_body.extend_from_slice(&u.to_be_bytes());
+    }
+    vct_body.extend_from_slice(&[0xF0, 0x30, 0x01, 0x04]); // major 12 minor 1, 8-VSB
+    vct_body.extend_from_slice(&0u32.to_be_bytes());
+    vct_body.extend_from_slice(&[0x0F, 0x01, 0x00, 0x03, 0x41, 0xC2, 0x10, 0x01, 0xFC, 0x00]);
+    vct_body.extend_from_slice(&[0xFC, 0x00]);
+    let mut eit_body = vec![1u8, 0xC1, 0x55];
+    eit_body.extend_from_slice(&987_654_321u32.to_be_bytes());
+    eit_body.extend_from_slice(&[0xD0, 0x07, 0x08]); // ETM 01, 1800 s
+    let title = [
+        1u8, b'e', b'n', b'g', 1, 0x00, 0x00, 4, b'N', b'e', b'w', b's',
+    ];
+    eit_body.push(title.len() as u8);
+    eit_body.extend_from_slice(&title);
+    eit_body.extend_from_slice(&[0xF0, 0x00]);
+    vec![
+        psip_section(0xCD, 0x0000, stt_body),
+        psip_section(0xC7, 0x0000, &mgt_body),
+        psip_section(0xC8, 0x0F01, &vct_body),
+        psip_section(0xCB, 0x1001, &eit_body),
+    ]
+}
+
+#[test]
+fn mutated_psip_sections_never_panic() {
+    let seeds = seed_psip_sections();
+    // The clean seeds must actually parse — otherwise the mutation
+    // sweep would only exercise the early-error paths.
+    assert!(crate::atsc::SystemTimeTable::parse(&seeds[0]).is_ok());
+    assert!(crate::atsc::MasterGuideTable::parse(&seeds[1]).is_ok());
+    assert!(crate::atsc::VirtualChannelTable::parse(&seeds[2]).is_ok());
+    assert!(crate::atsc::AtscEventInformationTable::parse(&seeds[3]).is_ok());
+    let mut rng = Lcg::new(0xA65_2013_0448);
+    for round in 0..400 {
+        let seed = &seeds[round % seeds.len()];
+        let mut bytes = seed.clone();
+        for _ in 0..(1 + rng.below(6)) {
+            let at = rng.below(bytes.len());
+            bytes[at] = rng.byte();
+        }
+        if round % 7 == 0 {
+            bytes.truncate(rng.below(bytes.len()));
+        } else if round % 2 == 0 && bytes.len() > 4 {
+            // Re-stamp the CRC so body mutations get past the CRC gate
+            // and reach the deep loop parsers.
+            let crc_pos = bytes.len() - 4;
+            let crc = crate::psi::mpeg2_crc32(&bytes[..crc_pos]);
+            bytes[crc_pos..].copy_from_slice(&crc.to_be_bytes());
+        }
+        exercise_atsc(&bytes);
+    }
+    // Pure noise through the same surface.
+    for size in [0usize, 1, 9, 64, 1024] {
+        let mut bytes = vec![0u8; size];
+        for b in &mut bytes {
+            *b = rng.byte();
+        }
+        exercise_atsc(&bytes);
+    }
+}
+
 #[cfg(feature = "registry")]
 #[test]
 fn demuxer_survives_mutations_with_bounded_reads() {

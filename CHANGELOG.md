@@ -39,6 +39,15 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   advisory, event/channel ETMs, both caption-service forms, and
   CRC / truncation rejection.
 
+- **The ATSC PSIP surface rides the hostile batteries.** The
+  deterministic hostile-input sweep gains a PSIP leg: well-formed
+  STT / MGT / TVCT / EIT seed sections under seeded byte mutations
+  (with the CRC re-stamped on half the rounds so mutations reach the
+  deep loop parsers), truncations, and pure noise — panic-free,
+  bounded work. The `parse_units` fuzz target now also drives every
+  A/65 table parser, the multiple string structure with full text
+  decode, and the PSIP descriptor walk.
+
 - **CAT + TDT/TOT emission on the mux side.**
   `MpegTsMuxConfig.ca_descriptors` (raw §2.6.16 `CA_descriptor` TLVs,
   built with `build::ca_descriptor`) makes the muxer emit a

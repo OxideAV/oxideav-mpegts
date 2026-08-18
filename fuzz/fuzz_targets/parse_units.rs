@@ -9,6 +9,9 @@
 //!   * every PSI / DVB SI table parser on the raw bytes as a section
 //!     (PAT / PMT / CAT / TSDT / SDT / BAT / NIT / EIT / RST / TDT /
 //!     TOT / ST / DIT / SIT), with every descriptor loop walked;
+//!   * every ATSC PSIP table parser (A/65 STT / MGT / TVCT / CVCT /
+//!     RRT / EIT / ETT), the multiple string structure with full text
+//!     decode, and the PSIP descriptor walk;
 //!   * the flat descriptor walk (§2.6 + EN 300 468 §6 TLVs);
 //!   * `PesPacket::parse` (Table 2-17 optional-header ladder);
 //!   * `TsPacket::parse` on the first 188 bytes (§2.4.3.4 adaptation
@@ -88,6 +91,67 @@ fn parse_all_tables(data: &[u8]) {
             walk!(s.iter_descriptors());
         }
     }
+    parse_all_atsc(data);
+}
+
+/// ATSC PSIP surface (A/65): every table parser, the multiple string
+/// structure with full text decode, and the PSIP descriptor walk.
+fn parse_all_atsc(data: &[u8]) {
+    use oxideav_mpegts::atsc;
+    macro_rules! walk {
+        ($d:expr) => {
+            for d in $d {
+                let _ = d;
+            }
+        };
+    }
+    if let Ok(stt) = atsc::SystemTimeTable::parse(data) {
+        let _ = stt.unix_time();
+        let _ = (stt.ds_status(), stt.ds_day_of_month(), stt.ds_hour());
+        walk!(stt.iter_descriptors());
+    }
+    if let Ok(mgt) = atsc::MasterGuideTable::parse(data) {
+        for e in &mgt.tables {
+            let _ = (e.eit_index(), e.event_ett_index(), e.rrt_rating_region());
+            walk!(e.iter_descriptors());
+        }
+        walk!(mgt.iter_descriptors());
+    }
+    if let Ok(vct) = atsc::VirtualChannelTable::parse(data) {
+        for c in &vct.channels {
+            let _ = c.short_name_text();
+            let _ = c.one_part_number();
+            walk!(c.iter_descriptors());
+        }
+        walk!(vct.iter_additional_descriptors());
+    }
+    if let Ok(rrt) = atsc::RatingRegionTable::parse(data) {
+        let _ = rrt.rating_region_name.first_text();
+        for d in &rrt.dimensions {
+            let _ = d.dimension_name.first_text();
+            for v in &d.values {
+                let _ = v.abbrev_rating_value.first_text();
+                let _ = v.rating_value.first_text();
+            }
+        }
+        walk!(rrt.iter_descriptors());
+    }
+    if let Ok(eit) = atsc::AtscEventInformationTable::parse(data) {
+        for e in &eit.events {
+            let _ = e.title.first_text();
+            walk!(e.iter_descriptors());
+        }
+    }
+    if let Ok(ett) = atsc::ExtendedTextTable::parse(data) {
+        let _ = ett.message.first_text();
+        let _ = (ett.source_id(), ett.is_event_etm(), ett.event_id());
+    }
+    if let Ok((mss, _)) = atsc::MultipleStringStructure::parse(data) {
+        for s in &mss.strings {
+            let _ = s.decode();
+        }
+    }
+    walk!(atsc::iter_atsc_descriptors(data));
 }
 
 fuzz_target!(|data: &[u8]| {
