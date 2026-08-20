@@ -870,10 +870,22 @@ mod tests {
             let af = AdaptationFieldSpec::with_pcr(base, ext)
                 .encode(Some(TS_PACKET_LEN - 4 - pes.len()))
                 .unwrap();
-            out.extend_from_slice(&ts_packet(0x0101, true, i as u8, 0b11, Some(&af), pes, false));
+            out.extend_from_slice(&ts_packet(
+                0x0101,
+                true,
+                i as u8,
+                0b11,
+                Some(&af),
+                pes,
+                false,
+            ));
         }
         let report = validate_ts(&out);
-        let pcr = report.pcr.iter().find(|p| p.pid == 0x0101).expect("pcr pid tracked");
+        let pcr = report
+            .pcr
+            .iter()
+            .find(|p| p.pid == 0x0101)
+            .expect("pcr pid tracked");
         assert_eq!(pcr.samples, 2);
     }
 
@@ -1015,4 +1027,3 @@ mod tests {
         assert_eq!(report.pcr[0].samples, 4);
     }
 }
-
