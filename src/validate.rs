@@ -471,7 +471,13 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
                     state.pending_discontinuity = true;
                 }
                 if let (Some(base), ext_val) = (af.pcr_base, af.pcr_extension.unwrap_or(0)) {
-                    let ticks = base * 300 + u64::from(ext_val);
+                    // §2.4.3.4 bounds program_clock_reference_extension to
+                    // 0..=299, but the 9-bit wire field can carry up to 511;
+                    // a hostile extension pushes `ticks` past the modulus and
+                    // a later in-range PCR would underflow the wrap delta.
+                    // Fold into range so the interval math stays total — the
+                    // stream is nonconforming either way.
+                    let ticks = (base * 300 + u64::from(ext_val)) % crate::PCR_MODULUS_27MHZ;
                     state.samples += 1;
                     if state.pending_discontinuity || state.last.is_none() {
                         // New time base (or first sample): re-anchor,
@@ -838,6 +844,40 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_pcr_extension_then_small_pcr_stays_total() {
+        // §2.4.3.4 bounds pcr_extension to 0..=299, but the 9-bit wire
+        // field carries up to 511. A max-base + ext=511 sample used to
+        // push `ticks` past the modulus, and the next in-range PCR
+        // underflowed the wrap-delta subtraction. Validation must stay
+        // total and keep counting on such nonconforming input.
+        let mut out = Vec::new();
+        let pat = build::build_pat(1, 0, &[(1, 0x0100)]);
+        out.extend_from_slice(&ts_packet(0x0000, true, 0, 0b01, None, &pat, true));
+        let pmt = build::build_pmt(
+            1,
+            0,
+            0x0101,
+            &[],
+            &[build::PmtStreamEntry {
+                stream_type: 0x1B,
+                elementary_pid: 0x0101,
+                es_info: Vec::new(),
+            }],
+        );
+        out.extend_from_slice(&ts_packet(0x0100, true, 0, 0b01, None, &pmt, true));
+        let pes: &[u8] = &[0x00, 0x00, 0x01, 0xE0, 0x00, 0x04, 0b1000_0000, 0, 0, 0x42];
+        for (i, (base, ext)) in [((1u64 << 33) - 1, 511u16), (0, 0)].into_iter().enumerate() {
+            let af = AdaptationFieldSpec::with_pcr(base, ext)
+                .encode(Some(TS_PACKET_LEN - 4 - pes.len()))
+                .unwrap();
+            out.extend_from_slice(&ts_packet(0x0101, true, i as u8, 0b11, Some(&af), pes, false));
+        }
+        let report = validate_ts(&out);
+        let pcr = report.pcr.iter().find(|p| p.pid == 0x0101).expect("pcr pid tracked");
+        assert_eq!(pcr.samples, 2);
+    }
+
+    #[test]
     fn af_pairing_violations_flagged() {
         let mut out = clean_stream(2);
 
@@ -975,3 +1015,4 @@ mod tests {
         assert_eq!(report.pcr[0].samples, 4);
     }
 }
+
