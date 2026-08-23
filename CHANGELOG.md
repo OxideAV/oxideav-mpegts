@@ -11,6 +11,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `ViolationCounts::pcr_extension_out_of_range`: typed tally for PCR
+  samples whose 9-bit `program_clock_reference_extension` wire value
+  exceeds the §2.4.3.4 bound of 299. The validator has folded such
+  values into the modulus since the daily-fuzz underflow fix; the
+  nonconformance is now surfaced as its own counter instead of
+  passing silently.
+- Muxer `stream_type` coverage for the remaining codec ids the
+  demuxer emits, so demux → remux round-trips: `mp1`/`mp2`/`mp3`
+  (ISO/IEC 11172-3 audio, 0x03), `aac` (ADTS, 0x0F), `mpeg1video`
+  (0x01), `mpeg4` (0x10), `jpeg2000` (0x21).
+
+### Added
+
 - **A/65 Table 6.25 descriptor coverage completes.** The PSIP
   descriptor walker types the `ATSC_private_information_descriptor`
   (tag `0xAD`, A/53 Part 3 §5.8.2 Table 6.1) — the SMPTE-RA

@@ -98,6 +98,12 @@ pub struct ViolationCounts {
     /// §2.4.3.5: `splice_type` shall be `'0000'` when the PID's PMT
     /// `stream_type` classifies it as audio.
     pub nonzero_splice_type_on_audio: u64,
+    /// §2.4.3.4 bounds `program_clock_reference_extension` to
+    /// 0..=299, but the 9-bit wire field can carry up to 511. Each
+    /// PCR sample whose extension exceeds 299 is tallied here (the
+    /// validator folds the value into the modulus so the interval
+    /// math stays total).
+    pub pcr_extension_out_of_range: u64,
 }
 
 impl ViolationCounts {
@@ -477,6 +483,9 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
                     // a later in-range PCR would underflow the wrap delta.
                     // Fold into range so the interval math stays total — the
                     // stream is nonconforming either way.
+                    if ext_val > 299 {
+                        report.violations.pcr_extension_out_of_range += 1;
+                    }
                     let ticks = (base * 300 + u64::from(ext_val)) % crate::PCR_MODULUS_27MHZ;
                     state.samples += 1;
                     if state.pending_discontinuity || state.last.is_none() {
@@ -887,6 +896,10 @@ mod tests {
             .find(|p| p.pid == 0x0101)
             .expect("pcr pid tracked");
         assert_eq!(pcr.samples, 2);
+        // The hostile extension (511 > 299) is tallied exactly once;
+        // the in-range second sample adds nothing.
+        assert_eq!(report.violations.pcr_extension_out_of_range, 1);
+        assert!(!report.violations.is_clean());
     }
 
     #[test]

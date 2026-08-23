@@ -2030,10 +2030,20 @@ fn build_es_descriptors(track: &TrackState) -> Vec<u8> {
 ///   (private_stream_1) per BD-ROM AV §5.6 / ATSC convention.
 fn stream_type_for_codec(codec_id: &str) -> Option<(u8, u8, bool)> {
     Some(match codec_id {
+        "mpeg1video" => (0x01, 0xE0, true),
         "mpeg2video" => (0x02, 0xE0, true),
+        "mpeg4" => (0x10, 0xE0, true),
+        "jpeg2000" => (0x21, 0xE0, true),
         "h264" => (0x1B, 0xE0, true),
         "hevc" => (0x24, 0xE0, true),
         "vc1" => (0xEA, 0xE0, true),
+        // ISO/IEC 11172-3 audio (layers I-III, stream_type 0x03). The
+        // demuxer maps 0x03 and 0x04 to "mp2"; accept all three MPEG
+        // audio codec ids on the way back out so demux -> remux
+        // round-trips.
+        "mp1" | "mp2" | "mp3" => (0x03, 0xC0, false),
+        // ISO/IEC 13818-7 ADTS AAC.
+        "aac" => (0x0F, 0xC0, false),
         "pcm_s16be" => (0x80, 0xBD, false),
         "ac3" => (0x81, 0xBD, false),
         "dts" => (0x82, 0xBD, false),
@@ -2140,6 +2150,56 @@ mod tests {
         let mut pts_set = vec![p1.pts.unwrap(), p2.pts.unwrap()];
         pts_set.sort();
         assert_eq!(pts_set, vec![12345, 22222]);
+    }
+
+    /// MPEG audio (mp1/mp2/mp3) and the other newly mapped codec ids
+    /// mux and round-trip: the demuxer resolves stream_type 0x03 back
+    /// to "mp2" per its residual MPEG-audio mapping.
+    #[test]
+    fn mux_then_demux_round_trip_mpeg_audio() {
+        assert_eq!(stream_type_for_codec("mp1"), Some((0x03, 0xC0, false)));
+        assert_eq!(stream_type_for_codec("mp2"), Some((0x03, 0xC0, false)));
+        assert_eq!(stream_type_for_codec("mp3"), Some((0x03, 0xC0, false)));
+        assert_eq!(stream_type_for_codec("aac"), Some((0x0F, 0xC0, false)));
+        assert_eq!(
+            stream_type_for_codec("mpeg1video"),
+            Some((0x01, 0xE0, true))
+        );
+        assert_eq!(stream_type_for_codec("mpeg4"), Some((0x10, 0xE0, true)));
+        assert_eq!(stream_type_for_codec("jpeg2000"), Some((0x21, 0xE0, true)));
+
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "mp2", false)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().expect("hdr");
+            let video_pkt = Packet::new(0, TimeBase::new(1, 90_000), vec![0xDE, 0xAD, 0xBE, 0xEF])
+                .with_pts(1000);
+            let audio_pkt = Packet::new(1, TimeBase::new(1, 90_000), vec![0xFF, 0xFD, 0x90, 0x00])
+                .with_pts(2000);
+            mx.write_packet(&video_pkt).unwrap();
+            mx.write_packet(&audio_pkt).unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let bytes = sink.into_bytes();
+        assert!(bytes.len() % TS_PACKET_LEN == 0);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let resolver = oxideav_core::NullCodecResolver;
+        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let codecs: Vec<&str> = dmx
+            .streams()
+            .iter()
+            .map(|s| s.params.codec_id.as_str())
+            .collect();
+        assert!(codecs.contains(&"h264"));
+        assert!(codecs.contains(&"mp2"), "stream_type 0x03 resolves to mp2");
+        let p1 = dmx.next_packet().expect("p1");
+        let p2 = dmx.next_packet().expect("p2");
+        let mut pts_set = vec![p1.pts.unwrap(), p2.pts.unwrap()];
+        pts_set.sort();
+        assert_eq!(pts_set, vec![1000, 2000]);
     }
 
     /// Two independent programs, each with its own PMT PID + PCR PID,
