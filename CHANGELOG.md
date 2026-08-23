@@ -9,6 +9,91 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.2...v0.0.3) - 2026-08-23
+
+### Other
+
+- typed pcr_extension_out_of_range tally; mux: complete the demuxer's stream_type map
+- rustfmt reflow for the PCR-extension regression test
+- fold hostile PCR extensions into the modulus — the wrap delta stayed total only for conforming wires
+- type 0xAD private-information + recognise 0xCC E-AC-3 — Table 6.25 complete
+- restore the curated 11-seed mux_roundtrip corpus
+- mux_roundtrip plans exercise the declared-Rmax video TB pacing
+- §2.4.2.3 video TB pacing — declared Rmax closes the mux-side T-STD hole
+- ISO/IEC 14496 carriage set closes out Table 2-39
+- DCCT + DCCSCT close out the A/65 table set
+- annex-C Huffman text decompression — Table C4/C6 transcribed, MSS compression types 0x01/0x02 decode
+- two-generation remux gates — RAI grid + time-base discontinuity survive a full remux
+- ATSC PSIP joins the hostile batteries
+- CAT + advancing TDT/TOT emission (2.4.4.6, EN 300 468 5.2.5/5.2.6)
+- PSIP table family (A/65:2013) — STT/MGT/TVCT/CVCT/RRT/EIT/ETT + MSS + core descriptors
+- write-side completeness — CAT/TSDT/BAT/SIT + short-form TDT/TOT/RST/ST/DIT sections, 8 new descriptor builders
+- structure-aware cargo-fuzz harness + daily workflow; fix 8 findings
+- time-base discontinuity signalling (§2.4.3.5/§2.7.6) + tstd hostile-sweep coverage
+- splice / PES-split / T-STD / CBR surface — README rows, crate docs, muxer module docs
+- per-class CBR delivery leads — 40 ms audio hold-back queue
+- §2.4.3.5 splice-signalling coherence — countdown progression, seamless-run continuity, audio splice_type
+- CBR pacing on the §2.4.2 arrival clock + §2.4.3.3 PCR-only CC fix
+- T-STD buffer model — §2.4.2 arrival clock, TB/Bn/MBn/EBn chains, conformance report
+- split oversize bounded frames across PES envelopes (§2.4.3.7)
+- splice-point API — splice_countdown + seamless-splice signalling (§2.4.3.5, Annex K)
+- seek over 192-byte framing + mid-PES PCR landing resync semantics
+- promote extend_near to public API; standalone build stays warning-free
+- seek surface — crate docs, README rows, CHANGELOG; zero rustdoc warnings
+- self-muxed round-trip seek accuracy — CBR sweep, VBR, multi-program, PCR degradation
+- keyframe-aware seek_to — tiered access points, windowed scan, index fallback
+- wrap-aware PCR seek — extended-timeline bisection + seeded landings
+- PtsTracker::seed — wrap-epoch re-entry for post-seek timeline continuity
+- PES header builder rows in README + crate docs
+- deterministic hostile-input sweeps across the parse surface
+- write-side PES header builder (§2.4.3.7 Table 2-17)
+- README + crate docs for the r415 surface; zero rustdoc warnings
+- TS conformance report (§2.4.3.3/§2.4.3.5/§2.7.2/§2.4.4)
+- tolerate 192-byte prefixed and 204-byte trailer packet framings
+- byte_char_slices clippy-1.97 drift fix (country_codes literals)
+- typed DSM trick-mode decode + encode (§2.4.3.7 Tables 2-20..2-22)
+- random-access index + keyframe-accurate seek (§2.4.3.5)
+- keyframe <-> random_access_indicator round trip (§2.4.3.5)
+- write-side adaptation-field builder (§2.4.3.4 Table 2-6)
+- untrack Cargo.lock, add anchored .gitignore
+- end-to-end multi-program SI + PES-timing round-trip harness
+- richer PMT ES_info descriptors (stream_identifier + injectable)
+- DVB NIT + EIT present/following emission on the mux side
+- PSI repetition intervals (mid-stream PAT/PMT/SDT re-emission)
+- multi-program muxer + DVB SDT emission
+- add write-side build module (descriptor + PSI section builders)
+- add CI / crates.io / docs.rs / MIT-license badges
+- decode DVB data_broadcast_descriptor (0x64) + mixed-loop test
+- decode DVB extension_descriptor envelope + supplementary_audio (EN 300 468 §6.2.16/§6.4.11)
+- re-export all public descriptor body types from the crate root
+- decode 6 more PMT/EIT DVB descriptors (EN 300 468)
+- decode DVB NIT delivery-system descriptors (EN 300 468 §6.2.13/.17)
+- decode 7 more DVB SI descriptors (EN 300 468 §6.2)
+- document duration + seek; harden over sparse PCRs
+- PCR-anchored time-based seek_to (§2.4.2.2)
+- report container duration from the PCR span (§2.4.2.2)
+- document ST/DIT/SIT in the crate-level SI-table scope note
+- partial_transport_stream (0x63) + stuffing (0x42)
+- DVB Selection Information Table (SIT, EN 300 468 §7.1.2)
+- DVB Stuffing Table (ST) + Discontinuity Information Table (DIT)
+- parse DVB Running Status Table (RST, EN 300 468 §5.2.7)
+- parse DVB Bouquet Association Table (BAT, EN 300 468 §5.2.2)
+- reconstruct PCR clock + unwrap PTS/DTS on the demux path (§2.4.3.7)
+- enumerate PAT programs + select by program_number (§2.4.4.5)
+- intro line — demuxer and single-program muxer
+- document the muxer module — multi-packet PSI, PMT language descriptors, periodic PCR
+- bound inter-PCR interval with periodic PCR-only packets (§2.7.2)
+- emit ISO_639_language_descriptor in PMT ES loops (§2.6.18)
+- split long PSI sections across multiple TS packets (§2.4.4)
+- end-to-end test for DVB ES descriptors through PMT parse + README
+- add PtsTracker — per-PID 33-bit PTS/DTS unwrapping
+- complete ISO/IEC 13818-1 Table 2-29 base assignments
+- decode DVB PMT ES descriptors — stream_identifier/teletext/subtitling + AC-3/E-AC-3/DTS
+- decode DVB content_descriptor (tag 0x54, EN 300 468 §6.2.9)
+- decode DVB extended_event_descriptor (tag 0x4E, EN 300 468 §6.2.15)
+- parse DVB Time and Date / Time Offset tables (TDT + TOT, EN 300 468 §5.2.5/§5.2.6)
+- parse DVB Network Information Table (NIT, EN 300 468 §5.2.1)
+
 ### Added
 
 - `ViolationCounts::pcr_extension_out_of_range`: typed tally for PCR
