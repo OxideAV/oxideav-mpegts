@@ -42,8 +42,8 @@ use oxideav_core::{
 };
 
 use crate::{
-    Pcr, PcrTracker, PesPacket, PesReassembler, ProgramAssociationTable, ProgramMapTable,
-    PsiSectionAssembler, PtsTracker, StreamType, TsPacket, PAT_PID, TS_PACKET_LEN, TS_SYNC_BYTE,
+    PAT_PID, Pcr, PcrTracker, PesPacket, PesReassembler, ProgramAssociationTable, ProgramMapTable,
+    PsiSectionAssembler, PtsTracker, StreamType, TS_PACKET_LEN, TS_SYNC_BYTE, TsPacket,
 };
 
 /// PID value the PMT's `PCR_PID` field carries when no PCR is
@@ -281,7 +281,7 @@ impl MpegTsDemuxer {
                 None => {
                     return Err(CoreError::invalid(
                         "mpegts: stream ended before a PAT was seen",
-                    ))
+                    ));
                 }
             };
             let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
@@ -350,7 +350,7 @@ impl MpegTsDemuxer {
                 None => {
                     return Err(CoreError::invalid(
                         "mpegts: stream ended before the PMT was seen",
-                    ))
+                    ));
                 }
             };
             let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
@@ -392,10 +392,10 @@ impl MpegTsDemuxer {
             // remux path keeps each track's audio/subtitle language.
             // The first language entry wins (multi-language audio is
             // rare and a single tag is what the core surface holds).
-            if params.language.is_none() {
-                if let Some(code) = first_iso639_language(pmt_stream) {
-                    params = params.with_language(code);
-                }
+            if params.language.is_none()
+                && let Some(code) = first_iso639_language(pmt_stream)
+            {
+                params = params.with_language(code);
             }
             let idx = streams.len() as u32;
             streams.push(StreamInfo {
@@ -732,50 +732,50 @@ impl MpegTsDemuxer {
             // A stray mid-stream corruption shouldn't abort the index;
             // skip unparseable packets (the streaming path has its own
             // resync story).
-            if let Ok(pkt) = TsPacket::parse(self.layout.window(&buf)) {
-                if let Some(&stream_index) = self.pid_to_stream.get(&pkt.pid) {
-                    let rai = pkt
-                        .adaptation_field
-                        .as_ref()
-                        .is_some_and(|af| af.random_access_indicator);
-                    if rai {
-                        unresolved.entry(pkt.pid).or_default().push(out.len());
+            if let Ok(pkt) = TsPacket::parse(self.layout.window(&buf))
+                && let Some(&stream_index) = self.pid_to_stream.get(&pkt.pid)
+            {
+                let rai = pkt
+                    .adaptation_field
+                    .as_ref()
+                    .is_some_and(|af| af.random_access_indicator);
+                if rai {
+                    unresolved.entry(pkt.pid).or_default().push(out.len());
+                    out.push(RandomAccessPoint {
+                        byte_offset: off,
+                        pid: pkt.pid,
+                        stream_index,
+                        pts_90k: None,
+                        kind: AccessPointKind::RandomAccessIndicator,
+                    });
+                }
+                if pkt.payload_unit_start {
+                    let pes = PesPacket::parse(pkt.payload).ok();
+                    let pts = pes.as_ref().and_then(|p| p.pts_90k).map(|raw| {
+                        let ext = match pts_ref.get(&pkt.pid) {
+                            Some(&r) => crate::clock::extend_near(raw, r),
+                            None => raw,
+                        };
+                        pts_ref.insert(pkt.pid, ext);
+                        ext
+                    });
+                    if let Some(pending) = unresolved.remove(&pkt.pid) {
+                        // This PES start is the one the pending
+                        // indicator(s) announced; lift its PTS.
+                        for i in pending {
+                            out[i].pts_90k = pts;
+                        }
+                    } else if pes.is_some_and(|p| p.data_alignment_indicator) && pts.is_some() {
+                        // No indicator announced this PES, but its
+                        // payload starts data-aligned (§2.4.3.7) —
+                        // the fallback access-point tier.
                         out.push(RandomAccessPoint {
                             byte_offset: off,
                             pid: pkt.pid,
                             stream_index,
-                            pts_90k: None,
-                            kind: AccessPointKind::RandomAccessIndicator,
+                            pts_90k: pts,
+                            kind: AccessPointKind::DataAligned,
                         });
-                    }
-                    if pkt.payload_unit_start {
-                        let pes = PesPacket::parse(pkt.payload).ok();
-                        let pts = pes.as_ref().and_then(|p| p.pts_90k).map(|raw| {
-                            let ext = match pts_ref.get(&pkt.pid) {
-                                Some(&r) => crate::clock::extend_near(raw, r),
-                                None => raw,
-                            };
-                            pts_ref.insert(pkt.pid, ext);
-                            ext
-                        });
-                        if let Some(pending) = unresolved.remove(&pkt.pid) {
-                            // This PES start is the one the pending
-                            // indicator(s) announced; lift its PTS.
-                            for i in pending {
-                                out[i].pts_90k = pts;
-                            }
-                        } else if pes.is_some_and(|p| p.data_alignment_indicator) && pts.is_some() {
-                            // No indicator announced this PES, but its
-                            // payload starts data-aligned (§2.4.3.7) —
-                            // the fallback access-point tier.
-                            out.push(RandomAccessPoint {
-                                byte_offset: off,
-                                pid: pkt.pid,
-                                stream_index,
-                                pts_90k: pts,
-                                kind: AccessPointKind::DataAligned,
-                            });
-                        }
                     }
                 }
             }
@@ -1195,10 +1195,10 @@ impl MpegTsDemuxer {
                 // PTS so both fields stay on the same 64-bit axis
                 // (found by the mux_roundtrip fuzz target on a
                 // wrap-crossing timeline).
-                if t.extended().is_none() {
-                    if let Some(hint) = pts_ext {
-                        t.seed(hint);
-                    }
+                if t.extended().is_none()
+                    && let Some(hint) = pts_ext
+                {
+                    t.seed(hint);
                 }
                 t.observe(raw);
                 t.extended().unwrap_or(raw)
@@ -1540,7 +1540,7 @@ fn read_exact_packet(input: &mut Box<dyn ReadSeek>, buf: &mut [u8]) -> std::io::
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "mpegts: short read during PCR probe",
-                ))
+                ));
             }
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1598,18 +1598,18 @@ fn pcr_span_27mhz(first: Pcr, first_off: u64, last: Pcr, last_off: u64) -> Optio
 /// carries no language descriptor or the code is empty.
 fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
     for d in pmt_stream.iter_descriptors().flatten() {
-        if let crate::DescriptorBody::Iso639Language(langs) = &d.body {
-            if let Some(first) = langs.first() {
-                let s: String = first
-                    .language
-                    .iter()
-                    .map(|&b| b as char)
-                    .collect::<String>()
-                    .trim_end_matches([' ', '\0'])
-                    .to_string();
-                if !s.is_empty() {
-                    return Some(s);
-                }
+        if let crate::DescriptorBody::Iso639Language(langs) = &d.body
+            && let Some(first) = langs.first()
+        {
+            let s: String = first
+                .language
+                .iter()
+                .map(|&b| b as char)
+                .collect::<String>()
+                .trim_end_matches([' ', '\0'])
+                .to_string();
+            if !s.is_empty() {
+                return Some(s);
             }
         }
     }
@@ -1905,7 +1905,7 @@ mod tests {
         // overflows a single 184-byte TS payload.
         let descr: Vec<u8> = {
             let mut d = vec![0xC0u8, 200u8]; // tag + length
-            d.extend(std::iter::repeat(0xAA).take(200));
+            d.extend(std::iter::repeat_n(0xAA, 200));
             d
         };
         let es_info_len = descr.len() as u16; // = 202

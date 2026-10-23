@@ -997,12 +997,12 @@ impl PesHeaderSpec {
                 what: "PES_scrambling_control exceeds 2 bits",
             });
         }
-        if let Some(pts) = self.pts_90k {
-            if pts > 0x1_FFFF_FFFF {
-                return Err(TsError::InvalidField {
-                    what: "PTS exceeds 33 bits",
-                });
-            }
+        if let Some(pts) = self.pts_90k
+            && pts > 0x1_FFFF_FFFF
+        {
+            return Err(TsError::InvalidField {
+                what: "PTS exceeds 33 bits",
+            });
         }
         if let Some(dts) = self.dts_90k {
             if dts > 0x1_FFFF_FFFF {
@@ -1014,7 +1014,7 @@ impl PesHeaderSpec {
                 None => {
                     return Err(TsError::InvalidField {
                         what: "DTS without PTS",
-                    })
+                    });
                 }
                 Some(pts) if pts == dts => {
                     // §2.7.5: a DTS shall appear only when the
@@ -1027,12 +1027,12 @@ impl PesHeaderSpec {
                 Some(_) => {}
             }
         }
-        if let Some(escr) = self.escr_27mhz {
-            if escr / 300 > 0x1_FFFF_FFFF {
-                return Err(TsError::InvalidField {
-                    what: "ESCR base exceeds 33 bits",
-                });
-            }
+        if let Some(escr) = self.escr_27mhz
+            && escr / 300 > 0x1_FFFF_FFFF
+        {
+            return Err(TsError::InvalidField {
+                what: "ESCR base exceeds 33 bits",
+            });
         }
         if let Some(rate) = self.es_rate_50bps {
             if rate == 0 {
@@ -1046,12 +1046,12 @@ impl PesHeaderSpec {
                 });
             }
         }
-        if let Some(aci) = self.additional_copy_info {
-            if aci > 0x7F {
-                return Err(TsError::InvalidField {
-                    what: "additional_copy_info exceeds 7 bits",
-                });
-            }
+        if let Some(aci) = self.additional_copy_info
+            && aci > 0x7F
+        {
+            return Err(TsError::InvalidField {
+                what: "additional_copy_info exceeds 7 bits",
+            });
         }
 
         // ---- Optional header body. ----
@@ -1190,26 +1190,26 @@ fn encode_pes_extension(ext: &PesExtension, out: &mut Vec<u8>) -> Result<(), TsE
             });
         }
     }
-    if let Some(p_std) = &ext.p_std_buffer {
-        if p_std.size > 0x1FFF {
-            return Err(TsError::InvalidField {
-                what: "P-STD_buffer_size exceeds 13 bits",
-            });
-        }
+    if let Some(p_std) = &ext.p_std_buffer
+        && p_std.size > 0x1FFF
+    {
+        return Err(TsError::InvalidField {
+            what: "P-STD_buffer_size exceeds 13 bits",
+        });
     }
-    if let Some(pack) = &ext.pack_header {
-        if pack.len() > 255 {
-            return Err(TsError::InvalidField {
-                what: "pack_header exceeds pack_field_length",
-            });
-        }
+    if let Some(pack) = &ext.pack_header
+        && pack.len() > 255
+    {
+        return Err(TsError::InvalidField {
+            what: "pack_header exceeds pack_field_length",
+        });
     }
-    if let Some(f2) = &ext.extension_field_2 {
-        if f2.len() > 0x7F {
-            return Err(TsError::InvalidField {
-                what: "PES_extension_field_2 exceeds 7 bits of length",
-            });
-        }
+    if let Some(f2) = &ext.extension_field_2
+        && f2.len() > 0x7F
+    {
+        return Err(TsError::InvalidField {
+            what: "PES_extension_field_2 exceeds 7 bits of length",
+        });
     }
     out.push(
         (u8::from(ext.private_data.is_some()) << 7)
@@ -1325,7 +1325,7 @@ mod tests {
                 // the rest as 0xFF stuffing.
                 if af_total >= 2 {
                     pkt.push(0); // flags = none
-                    pkt.extend(std::iter::repeat(0xFF).take(af_total - 2));
+                    pkt.extend(std::iter::repeat_n(0xFF, af_total - 2));
                 }
                 // af_total == 1 ⇒ only the length byte (length=0,
                 // see above), already emitted.
@@ -1707,7 +1707,7 @@ mod tests {
         let af_total = TS_PACKET_LEN - 4 - pes2.len();
         ts2.push((af_total - 1) as u8);
         ts2.push(0b0100_0000); // random_access_indicator
-        ts2.extend(std::iter::repeat(0xFF).take(af_total - 2));
+        ts2.extend(std::iter::repeat_n(0xFF, af_total - 2));
         ts2.extend_from_slice(&pes2);
         assert_eq!(ts2.len(), TS_PACKET_LEN);
 
@@ -1745,7 +1745,7 @@ mod tests {
             183,         // adaptation_field_length spans the packet
             0b0100_0000, // random_access_indicator
         ];
-        carrier.extend(std::iter::repeat(0xFF).take(TS_PACKET_LEN - carrier.len()));
+        carrier.extend(std::iter::repeat_n(0xFF, TS_PACKET_LEN - carrier.len()));
 
         let start = pes_into_ts(pid, &pes, 184);
 

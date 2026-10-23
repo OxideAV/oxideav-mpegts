@@ -163,22 +163,22 @@ pub mod muxer;
 pub mod registry;
 
 pub use build::{
-    aac_descriptor, ac3_descriptor, bouquet_name_descriptor, build_eit_pf, build_nit, build_pat,
-    build_pmt, build_sdt, dts_descriptor, enhanced_ac3_descriptor, iso639_language_descriptor,
-    network_name_descriptor, registration_descriptor, service_descriptor, service_list_descriptor,
-    short_event_descriptor, stream_identifier_descriptor, subtitling_descriptor,
-    teletext_descriptor, EitEventEntry, NitTsEntry, PmtStreamEntry, SdtServiceEntry,
+    EitEventEntry, NitTsEntry, PmtStreamEntry, SdtServiceEntry, aac_descriptor, ac3_descriptor,
+    bouquet_name_descriptor, build_eit_pf, build_nit, build_pat, build_pmt, build_sdt,
+    dts_descriptor, enhanced_ac3_descriptor, iso639_language_descriptor, network_name_descriptor,
+    registration_descriptor, service_descriptor, service_list_descriptor, short_event_descriptor,
+    stream_identifier_descriptor, subtitling_descriptor, teletext_descriptor,
 };
 pub use clock::{
-    extend_near, ContinuityEvent, ContinuityTracker, DiscontinuityReason, Pcr, PcrEvent,
-    PcrTracker, PtsTracker, TimestampEvent, PCR_MODULUS_27MHZ, PCR_TOLERANCE_27MHZ,
-    TIMESTAMP_MODULUS_90KHZ,
+    ContinuityEvent, ContinuityTracker, DiscontinuityReason, PCR_MODULUS_27MHZ,
+    PCR_TOLERANCE_27MHZ, Pcr, PcrEvent, PcrTracker, PtsTracker, TIMESTAMP_MODULUS_90KHZ,
+    TimestampEvent, extend_near,
 };
 pub use descriptor::{
-    iter_descriptors, parse_descriptors, AacDescriptor, Ac3Descriptor, AncillaryDataDescriptor,
-    AudioStreamDescriptor, AvcVideoDescriptor, BouquetNameDescriptor, CaDescriptor,
-    CaIdentifierDescriptor, CableDeliverySystemDescriptor, ComponentDescriptor, ContentDescriptor,
-    ContentNibble, CopyrightDescriptor, CountryAvailabilityDescriptor, DataBroadcastDescriptor,
+    AacDescriptor, Ac3Descriptor, AncillaryDataDescriptor, AudioStreamDescriptor,
+    AvcVideoDescriptor, BouquetNameDescriptor, CaDescriptor, CaIdentifierDescriptor,
+    CableDeliverySystemDescriptor, ComponentDescriptor, ContentDescriptor, ContentNibble,
+    CopyrightDescriptor, CountryAvailabilityDescriptor, DataBroadcastDescriptor,
     DataBroadcastIdDescriptor, DataStreamAlignmentDescriptor, Descriptor, DescriptorBody,
     DescriptorIter, DtsDescriptor, EnhancedAc3Descriptor, ExtendedEventDescriptor,
     ExtendedEventItem, ExtensionBody, ExtensionDescriptor, FrequencyListDescriptor,
@@ -192,50 +192,50 @@ pub use descriptor::{
     StreamIdentifierDescriptor, StuffingDescriptor, SubtitlingDescriptor, SubtitlingEntry,
     SupplementaryAudioDescriptor, SystemClockDescriptor, TargetBackgroundGridDescriptor,
     TeletextDescriptor, TeletextEntry, TerrestrialDeliverySystemDescriptor, VideoStreamDescriptor,
-    VideoWindowDescriptor,
+    VideoWindowDescriptor, iter_descriptors, parse_descriptors,
 };
 pub use error::TsError;
 pub use packet::{
-    detect_packet_layout, encode_clock_reference, iter_packets, AdaptationField,
-    AdaptationFieldExtension, AdaptationFieldExtensionSpec, AdaptationFieldSpec, TsPacket,
-    TsPacketIter, TsPacketLayout, MAX_ADAPTATION_FIELD_LEN, TS_PACKET_LEN, TS_SYNC_BYTE,
+    AdaptationField, AdaptationFieldExtension, AdaptationFieldExtensionSpec, AdaptationFieldSpec,
+    MAX_ADAPTATION_FIELD_LEN, TS_PACKET_LEN, TS_SYNC_BYTE, TsPacket, TsPacketIter, TsPacketLayout,
+    detect_packet_layout, encode_clock_reference, iter_packets,
 };
 pub use pes::{
     CoefficientSelection, DsmTrickMode, FieldId, PStdBuffer, PesExtension, PesHeaderSpec,
     PesPacket, PesReassembler, ProgramPacketSequenceCounter,
 };
 pub use psi::{
-    decode_utc_time, iter_sections, mpeg2_crc32, BatTransportStream, BouquetAssociationTable,
-    ConditionalAccessTable, DiscontinuityInformationTable, EitDateTime, EitDuration, EitEvent,
-    EventInformationTable, NetworkInformationTable, NitTransportStream, PmtStream,
-    ProgramAssociationTable, ProgramMapTable, PsiSectionAssembler, RstEntry, RunningStatus,
-    RunningStatusTable, SdtService, SectionIter, SelectionInformationTable,
-    ServiceDescriptionTable, SitService, StuffingTable, TimeDateTable, TimeOffsetTable,
-    TransportStreamDescriptionTable, BAT_PID, BAT_TABLE_ID, CAT_PID, CAT_TABLE_ID, DIT_PID,
-    DIT_TABLE_ID, EIT_ACTUAL_PF_TABLE_ID, EIT_ACTUAL_SCHEDULE_FIRST, EIT_ACTUAL_SCHEDULE_LAST,
-    EIT_OTHER_PF_TABLE_ID, EIT_OTHER_SCHEDULE_FIRST, EIT_OTHER_SCHEDULE_LAST, EIT_PID,
-    MAX_PSI_SECTION_LEN, NIT_ACTUAL_TABLE_ID, NIT_OTHER_TABLE_ID, NIT_PID, PAT_PID, PAT_TABLE_ID,
-    PMT_TABLE_ID, RST_PID, RST_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SDT_PID, SIT_PID,
-    SIT_TABLE_ID, ST_TABLE_ID, TDT_TABLE_ID, TDT_TOT_PID, TOT_TABLE_ID, TSDT_PID, TSDT_TABLE_ID,
+    BAT_PID, BAT_TABLE_ID, BatTransportStream, BouquetAssociationTable, CAT_PID, CAT_TABLE_ID,
+    ConditionalAccessTable, DIT_PID, DIT_TABLE_ID, DiscontinuityInformationTable,
+    EIT_ACTUAL_PF_TABLE_ID, EIT_ACTUAL_SCHEDULE_FIRST, EIT_ACTUAL_SCHEDULE_LAST,
+    EIT_OTHER_PF_TABLE_ID, EIT_OTHER_SCHEDULE_FIRST, EIT_OTHER_SCHEDULE_LAST, EIT_PID, EitDateTime,
+    EitDuration, EitEvent, EventInformationTable, MAX_PSI_SECTION_LEN, NIT_ACTUAL_TABLE_ID,
+    NIT_OTHER_TABLE_ID, NIT_PID, NetworkInformationTable, NitTransportStream, PAT_PID,
+    PAT_TABLE_ID, PMT_TABLE_ID, PmtStream, ProgramAssociationTable, ProgramMapTable,
+    PsiSectionAssembler, RST_PID, RST_TABLE_ID, RstEntry, RunningStatus, RunningStatusTable,
+    SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SDT_PID, SIT_PID, SIT_TABLE_ID, ST_TABLE_ID,
+    SdtService, SectionIter, SelectionInformationTable, ServiceDescriptionTable, SitService,
+    StuffingTable, TDT_TABLE_ID, TDT_TOT_PID, TOT_TABLE_ID, TSDT_PID, TSDT_TABLE_ID, TimeDateTable,
+    TimeOffsetTable, TransportStreamDescriptionTable, decode_utc_time, iter_sections, mpeg2_crc32,
 };
 pub use stream_type::StreamType;
 pub use tstd::{
-    analyze_tstd, TStdBranch, TStdChainStats, TStdConfig, TStdReport, TStdStreamModel,
-    TStdViolation, AUDIO_MAIN_BUFFER_SIZE, AUDIO_RX_BPS, BSYS_SIZE, MAX_TSTD_DELAY_SECONDS,
-    RSYS_MIN_BPS, RXSYS_BPS, TB_SIZE,
+    AUDIO_MAIN_BUFFER_SIZE, AUDIO_RX_BPS, BSYS_SIZE, MAX_TSTD_DELAY_SECONDS, RSYS_MIN_BPS,
+    RXSYS_BPS, TB_SIZE, TStdBranch, TStdChainStats, TStdConfig, TStdReport, TStdStreamModel,
+    TStdViolation, analyze_tstd,
 };
 pub use validate::{
-    validate_ts, PcrReport, PidReport, TsValidationReport, ViolationCounts, MAX_PCR_INTERVAL_27MHZ,
+    MAX_PCR_INTERVAL_27MHZ, PcrReport, PidReport, TsValidationReport, ViolationCounts, validate_ts,
 };
 
 #[cfg(feature = "registry")]
 pub use demuxer::{
-    open as open_demuxer, probe as probe_mpegts, AccessPointKind, MpegTsDemuxer, RandomAccessPoint,
-    TsProgram,
+    AccessPointKind, MpegTsDemuxer, RandomAccessPoint, TsProgram, open as open_demuxer,
+    probe as probe_mpegts,
 };
 
 #[cfg(feature = "registry")]
-pub use muxer::{open as open_muxer, MpegTsMuxer, SeamlessSpliceSpec, SpliceSpec};
+pub use muxer::{MpegTsMuxer, SeamlessSpliceSpec, SpliceSpec, open as open_muxer};
 
 #[cfg(feature = "registry")]
 pub use registry::{register, register_containers};

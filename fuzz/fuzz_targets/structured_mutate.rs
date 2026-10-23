@@ -32,7 +32,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use oxideav_mpegts_fuzz::{exercise_hostile, mutate, MuxPlan, Recipe};
+use oxideav_mpegts_fuzz::{MuxPlan, Recipe, exercise_hostile, mutate};
 
 fuzz_target!(|data: &[u8]| {
     let mut r = Recipe::new(data);

@@ -156,12 +156,14 @@ impl MssSegment {
         }
         if self.mode == 0x3F {
             // UTF-16, big-endian 16-bit code units (uimsbf).
-            if self.bytes.len() % 2 != 0 {
+            if !self.bytes.len().is_multiple_of(2) {
                 return None;
             }
             let units: Vec<u16> = self
                 .bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             return String::from_utf16(&units).ok();
@@ -1173,7 +1175,7 @@ impl VirtualChannelTable {
             _ => {
                 return Err(TsError::Unsupported(
                     "PSI table_id does not match expected value",
-                ))
+                ));
             }
         };
         let (hdr, body) = parse_psip_section(section, table_id)?;
@@ -2703,10 +2705,12 @@ mod tests {
         // Zero events is legal (§6.5: an instance with no events in
         // the slot carries num_events_in_section = 0).
         let s = psip_section(ATSC_EIT_TABLE_ID, 0x1002, 0, &[0]);
-        assert!(AtscEventInformationTable::parse(&s)
-            .unwrap()
-            .events
-            .is_empty());
+        assert!(
+            AtscEventInformationTable::parse(&s)
+                .unwrap()
+                .events
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2919,9 +2923,11 @@ mod tests {
         ] {
             // Sorted by (prior, symbol), one context per possible
             // prior character.
-            assert!(table
-                .windows(2)
-                .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+            assert!(
+                table
+                    .windows(2)
+                    .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1))
+            );
             for prior in 0u8..128 {
                 let ctx = huffman_context(table, prior);
                 assert!(!ctx.is_empty(), "context {prior} missing");

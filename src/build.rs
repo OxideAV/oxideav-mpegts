@@ -34,10 +34,10 @@
 
 use crate::descriptor::{SubtitlingEntry, TeletextEntry};
 use crate::psi::{
-    mpeg2_crc32, EitDateTime, EitDuration, RstEntry, RunningStatus, BAT_TABLE_ID, CAT_TABLE_ID,
-    DIT_TABLE_ID, NIT_ACTUAL_TABLE_ID, NIT_OTHER_TABLE_ID, PAT_TABLE_ID, PMT_TABLE_ID,
-    RST_TABLE_ID, SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SIT_TABLE_ID, ST_TABLE_ID, TDT_TABLE_ID,
-    TOT_TABLE_ID, TSDT_TABLE_ID,
+    BAT_TABLE_ID, CAT_TABLE_ID, DIT_TABLE_ID, EitDateTime, EitDuration, NIT_ACTUAL_TABLE_ID,
+    NIT_OTHER_TABLE_ID, PAT_TABLE_ID, PMT_TABLE_ID, RST_TABLE_ID, RstEntry, RunningStatus,
+    SDT_ACTUAL_TABLE_ID, SDT_OTHER_TABLE_ID, SIT_TABLE_ID, ST_TABLE_ID, TDT_TABLE_ID, TOT_TABLE_ID,
+    TSDT_TABLE_ID, mpeg2_crc32,
 };
 
 /// DVB present/following EIT `table_id` for the actual TS (`0x4E`).
@@ -912,7 +912,7 @@ fn encode_utc_time(dt: Option<EitDateTime>) -> [u8; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::{iter_descriptors, DescriptorBody};
+    use crate::descriptor::{DescriptorBody, iter_descriptors};
     use crate::psi::{
         EventInformationTable, NetworkInformationTable, ProgramAssociationTable, ProgramMapTable,
         ServiceDescriptionTable,
@@ -1503,10 +1503,12 @@ mod tests {
         assert_eq!((u.year, u.month, u.day), (1993, 10, 13));
         assert_eq!((u.hour, u.minute, u.second), (12, 45, 0));
         // The all-ones sentinel round-trips to None.
-        assert!(crate::psi::TimeDateTable::parse(&build_tdt(None))
-            .unwrap()
-            .utc_time
-            .is_none());
+        assert!(
+            crate::psi::TimeDateTable::parse(&build_tdt(None))
+                .unwrap()
+                .utc_time
+                .is_none()
+        );
     }
 
     #[test]

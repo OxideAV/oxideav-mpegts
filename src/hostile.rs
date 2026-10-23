@@ -9,7 +9,7 @@
 //! The generator is seeded with fixed constants so failures reproduce
 //! exactly.
 
-use crate::packet::{AdaptationFieldSpec, TsPacket, TS_PACKET_LEN, TS_SYNC_BYTE};
+use crate::packet::{AdaptationFieldSpec, TS_PACKET_LEN, TS_SYNC_BYTE, TsPacket};
 use crate::pes::{PesHeaderSpec, PesReassembler};
 use crate::psi::{ProgramAssociationTable, PsiSectionAssembler};
 use crate::validate::validate_ts;
@@ -104,13 +104,13 @@ fn exercise(bytes: &[u8]) {
             Ok(p) => p,
             Err(_) => break, // iterator halts after the first bad sync
         };
-        if pkt.pid == 0 && !pkt.payload.is_empty() {
-            if let Ok(sections) =
+        if pkt.pid == 0
+            && !pkt.payload.is_empty()
+            && let Ok(sections) =
                 pat_asm.feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
-            {
-                for s in &sections {
-                    let _ = ProgramAssociationTable::parse(s);
-                }
+        {
+            for s in &sections {
+                let _ = ProgramAssociationTable::parse(s);
             }
         }
         if pkt.pid == 0x0101 {
@@ -327,7 +327,7 @@ fn seed_psip_sections() -> Vec<Vec<u8>> {
     mgt_body.extend_from_slice(&1024u32.to_be_bytes());
     mgt_body.extend_from_slice(&[0xF0, 0x00, 0xF0, 0x00]);
     let mut vct_body = vec![1u8];
-    for u in "WOXA".encode_utf16().chain(std::iter::repeat(0).take(3)) {
+    for u in "WOXA".encode_utf16().chain(std::iter::repeat_n(0, 3)) {
         vct_body.extend_from_slice(&u.to_be_bytes());
     }
     vct_body.extend_from_slice(&[0xF0, 0x30, 0x01, 0x04]); // major 12 minor 1, 8-VSB
@@ -356,7 +356,7 @@ fn seed_psip_sections() -> Vec<Vec<u8>> {
     dcct_body.extend_from_slice(&[0xFC, 0x00]); // term descriptors
     dcct_body.extend_from_slice(&[0xFC, 0x00]); // test descriptors
     dcct_body.extend_from_slice(&[0xFC, 0x00]); // additional descriptors
-                                                // DCCSCT: one new_genre_category update.
+    // DCCSCT: one new_genre_category update.
     let name = [
         1u8, b'e', b'n', b'g', 1, 0x00, 0x00, 4, b'N', b'e', b'w', b's',
     ];

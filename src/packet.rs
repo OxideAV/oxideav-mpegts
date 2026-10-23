@@ -721,12 +721,12 @@ impl AdaptationFieldSpec {
     /// the encoded field would exceed
     /// [`MAX_ADAPTATION_FIELD_LEN`] bytes.
     pub fn encode(&self, min_total_len: Option<usize>) -> Result<Vec<u8>, TsError> {
-        if let Some(want) = min_total_len {
-            if want > MAX_ADAPTATION_FIELD_LEN {
-                return Err(TsError::InvalidField {
-                    what: "adaptation field padding beyond 184 bytes",
-                });
-            }
+        if let Some(want) = min_total_len
+            && want > MAX_ADAPTATION_FIELD_LEN
+        {
+            return Err(TsError::InvalidField {
+                what: "adaptation field padding beyond 184 bytes",
+            });
         }
         let want = min_total_len.unwrap_or(0);
         if self.is_empty() && want <= 1 {
@@ -766,27 +766,27 @@ impl AdaptationFieldSpec {
                 });
             }
         }
-        if let Some(data) = &self.transport_private_data {
-            if data.len() > 255 {
-                return Err(TsError::InvalidField {
-                    what: "transport_private_data exceeds 255 bytes",
-                });
-            }
+        if let Some(data) = &self.transport_private_data
+            && data.len() > 255
+        {
+            return Err(TsError::InvalidField {
+                what: "transport_private_data exceeds 255 bytes",
+            });
         }
         if let Some(ext) = &self.extension {
-            if let Some((_, offset)) = ext.ltw {
-                if offset > 0x7FFF {
-                    return Err(TsError::InvalidField {
-                        what: "ltw_offset exceeds 15 bits",
-                    });
-                }
+            if let Some((_, offset)) = ext.ltw
+                && offset > 0x7FFF
+            {
+                return Err(TsError::InvalidField {
+                    what: "ltw_offset exceeds 15 bits",
+                });
             }
-            if let Some(rate) = ext.piecewise_rate {
-                if rate > 0x3F_FFFF {
-                    return Err(TsError::InvalidField {
-                        what: "piecewise_rate exceeds 22 bits",
-                    });
-                }
+            if let Some(rate) = ext.piecewise_rate
+                && rate > 0x3F_FFFF
+            {
+                return Err(TsError::InvalidField {
+                    what: "piecewise_rate exceeds 22 bits",
+                });
             }
             if let Some((splice_type, dts)) = ext.seamless_splice {
                 if splice_type > 0xF {
@@ -1041,7 +1041,7 @@ mod tests {
         let mut tail = Vec::new();
         tail.push(183);
         tail.push(0);
-        tail.extend(std::iter::repeat(0xFF).take(182));
+        tail.extend(std::iter::repeat_n(0xFF, 182));
         let bytes = make_packet(header, &tail);
         let pkt = TsPacket::parse(&bytes).unwrap();
         assert!(pkt.adaptation_field.is_some());

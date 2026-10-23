@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-mpegts"
 version = "0.0.3"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust clean-room MPEG-TS (ISO/IEC 13818-1) demuxer — 188-byte TS packet parser, PAT/PMT discovery, PES reassembly. Built to ingest Blu-ray .m2ts bytes for remux pipelines."

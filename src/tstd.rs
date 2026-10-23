@@ -47,8 +47,8 @@
 
 use std::collections::VecDeque;
 
-use crate::packet::{detect_packet_layout, TsPacket};
 use crate::TsError;
+use crate::packet::{TsPacket, detect_packet_layout};
 
 /// §2.4.2.3: "The transport buffer size is fixed at 512 bytes."
 pub const TB_SIZE: usize = 512;
@@ -1214,21 +1214,20 @@ pub fn analyze_tstd(bytes: &[u8], config: &TStdConfig) -> Result<TStdReport, TsE
     let mut pending_discontinuity = false;
     for chunk in bytes.chunks_exact(psize) {
         let window = layout.window(chunk);
-        if let Ok(pkt) = TsPacket::parse(window) {
-            if pkt.pid == config.pcr_pid {
-                if let Some(af) = &pkt.adaptation_field {
-                    if af.discontinuity_indicator {
-                        pending_discontinuity = true;
-                    }
-                    if let (Some(base), ext) = (af.pcr_base, af.pcr_extension.unwrap_or(0)) {
-                        // Byte index of the last bit of PCR_base:
-                        // 4-byte TS header + AF length/flags bytes +
-                        // the fifth PCR byte.
-                        let pos = logical_pos + 4 + 2 + 4;
-                        samples.push((pos, base * 300 + ext as u64, pending_discontinuity));
-                        pending_discontinuity = false;
-                    }
-                }
+        if let Ok(pkt) = TsPacket::parse(window)
+            && pkt.pid == config.pcr_pid
+            && let Some(af) = &pkt.adaptation_field
+        {
+            if af.discontinuity_indicator {
+                pending_discontinuity = true;
+            }
+            if let (Some(base), ext) = (af.pcr_base, af.pcr_extension.unwrap_or(0)) {
+                // Byte index of the last bit of PCR_base:
+                // 4-byte TS header + AF length/flags bytes +
+                // the fifth PCR byte.
+                let pos = logical_pos + 4 + 2 + 4;
+                samples.push((pos, base * 300 + ext as u64, pending_discontinuity));
+                pending_discontinuity = false;
             }
         }
         logical_pos += crate::TS_PACKET_LEN as u64;
@@ -1347,13 +1346,13 @@ pub fn analyze_tstd(bytes: &[u8], config: &TStdConfig) -> Result<TStdReport, TsE
                     }
                 }
             }
-        } else if config.system_pids.contains(&pkt.pid) {
-            if let Some((tb, bsys)) = &mut tbsys {
-                let (es, ee) = tb.push(t0, t1, crate::TS_PACKET_LEN as f64);
-                let rate = clock.rate_at(logical_pos);
-                let rsys = ((rate * 8.0) / 500.0).max(RSYS_MIN_BPS as f64) / 8.0;
-                bsys.push(es, ee, crate::TS_PACKET_LEN as f64, rsys, &mut report);
-            }
+        } else if config.system_pids.contains(&pkt.pid)
+            && let Some((tb, bsys)) = &mut tbsys
+        {
+            let (es, ee) = tb.push(t0, t1, crate::TS_PACKET_LEN as f64);
+            let rate = clock.rate_at(logical_pos);
+            let rsys = ((rate * 8.0) / 500.0).max(RSYS_MIN_BPS as f64) / 8.0;
+            bsys.push(es, ee, crate::TS_PACKET_LEN as f64, rsys, &mut report);
         }
         logical_pos += crate::TS_PACKET_LEN as u64;
     }
@@ -1548,7 +1547,7 @@ mod tests {
     #[test]
     fn conformant_audio_stream_passes() {
         let pcr0 = 27_000_000; // t = 1 s on the PCR time base
-                               // PTS ≈ 0.2 s after the head of the stream.
+        // PTS ≈ 0.2 s after the head of the stream.
         let pts = pcr0 / 300 + 18_000;
         let mut cc = 0;
         let mut middle = pes_to_ts(AUDIO_PID, &mut cc, &audio_pes(pts, 350));
@@ -1579,10 +1578,12 @@ mod tests {
         assert_eq!(middle.len(), 4);
         let ts = assemble(&middle, pcr0, TICKS_1MBIT / 40);
         let report = analyze_tstd(&ts, &audio_config()).expect("analyze");
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| matches!(v, TStdViolation::TbOverflow { pid, .. } if *pid == AUDIO_PID)));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| matches!(v, TStdViolation::TbOverflow { pid, .. } if *pid == AUDIO_PID))
+        );
     }
 
     /// A PTS earlier than the data's arrival is a Bn underflow.
@@ -1595,10 +1596,11 @@ mod tests {
         let middle = pes_to_ts(AUDIO_PID, &mut cc, &audio_pes(pts, 350));
         let ts = assemble(&middle, pcr0, TICKS_1MBIT);
         let report = analyze_tstd(&ts, &audio_config()).expect("analyze");
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| matches!(v, TStdViolation::MainUnderflow { pid, .. } if *pid == AUDIO_PID)));
+        assert!(
+            report.violations.iter().any(
+                |v| matches!(v, TStdViolation::MainUnderflow { pid, .. } if *pid == AUDIO_PID)
+            )
+        );
     }
 
     /// More buffered audio than BSn = 3584 bytes is a Bn overflow.
@@ -1618,10 +1620,12 @@ mod tests {
         }
         let ts = assemble(&middle, pcr0, TICKS_1MBIT);
         let report = analyze_tstd(&ts, &audio_config()).expect("analyze");
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| matches!(v, TStdViolation::MainOverflow { pid, .. } if *pid == AUDIO_PID)));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| matches!(v, TStdViolation::MainOverflow { pid, .. } if *pid == AUDIO_PID))
+        );
     }
 
     /// A decode time more than one second after arrival breaks the
@@ -1659,10 +1663,12 @@ mod tests {
             system_pids: Vec::new(),
         };
         let report = analyze_tstd(&ts, &config).expect("analyze");
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| matches!(v, TStdViolation::EbUnderflow { pid, .. } if *pid == VIDEO_PID)));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| matches!(v, TStdViolation::EbUnderflow { pid, .. } if *pid == VIDEO_PID))
+        );
     }
 
     /// A modestly-paced video stream with per-frame PES passes the

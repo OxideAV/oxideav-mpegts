@@ -814,7 +814,7 @@ impl MpegTsMuxer {
                 if let Some(p) = q.front() {
                     let d27 = p.dts.or(p.pts).unwrap_or(0).saturating_mul(300);
                     let due = d27 - CBR_AUDIO_LEAD_27MHZ;
-                    if best.map_or(true, |(_, b)| due < b) {
+                    if best.is_none_or(|(_, b)| due < b) {
                         best = Some((ti, due));
                     }
                 }
@@ -1585,10 +1585,10 @@ impl MpegTsMuxer {
             // double-emit.
             packet.pts
         } else {
-            if let Some(p) = packet.pts {
-                if !cbr_active {
-                    self.maybe_emit_periodic_pcr(prog_idx, p)?;
-                }
+            if let Some(p) = packet.pts
+                && !cbr_active
+            {
+                self.maybe_emit_periodic_pcr(prog_idx, p)?;
             }
             None
         };
@@ -1596,10 +1596,11 @@ impl MpegTsMuxer {
         // backfill the chain first when the stream's cadence (or a
         // sibling-driven chain state) left more than one interval to
         // cover. CBR mode keeps the cadence on the byte clock instead.
-        if track.pid == pcr_pid && self.cbr.is_none() {
-            if let Some(p) = packet.pts {
-                self.backfill_pcr_chain(prog_idx, p.saturating_sub(900).max(0))?;
-            }
+        if track.pid == pcr_pid
+            && self.cbr.is_none()
+            && let Some(p) = packet.pts
+        {
+            self.backfill_pcr_chain(prog_idx, p.saturating_sub(900).max(0))?;
         }
         let pes = build_pes(track.stream_id, packet)?;
         let pcr = pcr_on_this_pes.map(|p| {
@@ -1824,10 +1825,10 @@ impl MpegTsMuxer {
         // The splicing point is now behind us; arm the §2.4.3.5
         // negative countdown for the following payload packets when
         // requested.
-        if let Some(s) = splice {
-            if s.post_splice_packets > 0 {
-                self.tracks[track_idx].post_splice = Some((1, s.post_splice_packets));
-            }
+        if let Some(s) = splice
+            && s.post_splice_packets > 0
+        {
+            self.tracks[track_idx].post_splice = Some((1, s.post_splice_packets));
         }
         Ok(())
     }
@@ -1872,12 +1873,14 @@ impl Muxer for MpegTsMuxer {
         // CBR: hold non-video frames until CBR_AUDIO_LEAD before
         // their decode time — the §2.4.2.3 audio main buffer is far
         // too small for the video delivery lead.
-        if let Some(cbr) = &self.cbr {
-            if cbr.anchor.is_some() && !self.tracks[track_idx].is_video && packet.pts.is_some() {
-                self.cbr.as_mut().expect("checked").held[track_idx].push_back(packet.clone());
-                let now = self.cbr_now().expect("anchored");
-                return self.cbr_flush_due(now);
-            }
+        if let Some(cbr) = &self.cbr
+            && cbr.anchor.is_some()
+            && !self.tracks[track_idx].is_video
+            && packet.pts.is_some()
+        {
+            self.cbr.as_mut().expect("checked").held[track_idx].push_back(packet.clone());
+            let now = self.cbr_now().expect("anchored");
+            return self.cbr_flush_due(now);
         }
         self.write_pes_packet(track_idx, packet)
     }
@@ -1978,9 +1981,11 @@ fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<Vec<u8>>> {
     if packet.data.len() <= first_max {
         return Ok(vec![first_spec.encode(&packet.data).map_err(map_err)?]);
     }
-    let mut out = vec![first_spec
-        .encode(&packet.data[..first_max])
-        .map_err(map_err)?];
+    let mut out = vec![
+        first_spec
+            .encode(&packet.data[..first_max])
+            .map_err(map_err)?,
+    ];
     let cont_spec = crate::pes::PesHeaderSpec {
         stream_id,
         ..Default::default()
@@ -2132,7 +2137,7 @@ mod tests {
             mx.write_trailer().unwrap();
         }
         let bytes = sink.into_bytes();
-        assert!(bytes.len() % TS_PACKET_LEN == 0);
+        assert!(bytes.len().is_multiple_of(TS_PACKET_LEN));
 
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
         let resolver = oxideav_core::NullCodecResolver;
@@ -2183,7 +2188,7 @@ mod tests {
             mx.write_trailer().unwrap();
         }
         let bytes = sink.into_bytes();
-        assert!(bytes.len() % TS_PACKET_LEN == 0);
+        assert!(bytes.len().is_multiple_of(TS_PACKET_LEN));
 
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
         let resolver = oxideav_core::NullCodecResolver;
@@ -2284,7 +2289,7 @@ mod tests {
     /// PID 0x0011 that reassembles + parses back to the same service.
     #[test]
     fn sdt_service_round_trips_through_mux() {
-        use crate::psi::{iter_sections, ServiceDescriptionTable, SDT_PID};
+        use crate::psi::{SDT_PID, ServiceDescriptionTable, iter_sections};
         let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
         let config = MpegTsMuxConfig {
             transport_stream_id: 0x0007,
@@ -2317,7 +2322,7 @@ mod tests {
         let bytes = sink.into_bytes();
         // Find the first SDT_PID packet with PUSI and parse its section.
         let mut found = None;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
             let pusi = chunk[1] & 0x40 != 0;
             if pid == SDT_PID && pusi {
@@ -2357,7 +2362,7 @@ mod tests {
         parse: impl Fn(&[u8]) -> Result<T, crate::TsError>,
     ) -> Option<T> {
         use crate::psi::iter_sections;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let p = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
             let pusi = chunk[1] & 0x40 != 0;
             if p == pid && pusi {
@@ -2375,7 +2380,7 @@ mod tests {
     /// reassembles + parses back to the same network + TS entry.
     #[test]
     fn nit_round_trips_through_mux() {
-        use crate::psi::{NetworkInformationTable, NIT_PID};
+        use crate::psi::{NIT_PID, NetworkInformationTable};
         let streams = vec![stream_info(0, "h264", true)];
         let config = MpegTsMuxConfig {
             transport_stream_id: 0x0007,
@@ -2426,7 +2431,7 @@ mod tests {
     /// including its short_event_descriptor.
     #[test]
     fn eit_pf_round_trips_through_mux() {
-        use crate::psi::{EitDateTime, EitDuration, EventInformationTable, RunningStatus, EIT_PID};
+        use crate::psi::{EIT_PID, EitDateTime, EitDuration, EventInformationTable, RunningStatus};
         let streams = vec![stream_info(0, "h264", true)];
         let ev = EventSpec {
             event_id: 0x0001,
@@ -2500,8 +2505,8 @@ mod tests {
     fn full_multiprogram_si_round_trip_harness() {
         use crate::descriptor::DescriptorBody;
         use crate::psi::{
-            EitDateTime, EitDuration, EventInformationTable, NetworkInformationTable,
-            RunningStatus, ServiceDescriptionTable, EIT_PID, NIT_PID, SDT_PID,
+            EIT_PID, EitDateTime, EitDuration, EventInformationTable, NIT_PID,
+            NetworkInformationTable, RunningStatus, SDT_PID, ServiceDescriptionTable,
         };
         use oxideav_core::Demuxer as _;
 
@@ -2681,7 +2686,9 @@ mod tests {
         let streams = vec![stream_info(0, "h264", true)];
         let count_pat = |bytes: &[u8]| -> usize {
             bytes
-                .chunks_exact(TS_PACKET_LEN)
+                .as_chunks::<TS_PACKET_LEN>()
+                .0
+                .iter()
                 .filter(|c| {
                     let pid = (((c[1] & 0x1F) as u16) << 8) | c[2] as u16;
                     let pusi = c[1] & 0x40 != 0;
@@ -2781,7 +2788,7 @@ mod tests {
         // Reassemble through the demuxer-side assembler.
         let mut asm = PsiSectionAssembler::new();
         let mut recovered: Option<Vec<u8>> = None;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pusi = chunk[1] & 0x40 != 0;
             let cc = chunk[3] & 0x0F;
             // afc = payload only (0b01) → payload starts at byte 4.
@@ -2797,7 +2804,7 @@ mod tests {
         // payloads ourselves.
         let mut flat = Vec::new();
         let mut first = true;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let start = if first { 5 } else { 4 };
             flat.extend_from_slice(&chunk[start..]);
             first = false;
@@ -2867,7 +2874,7 @@ mod tests {
     #[test]
     fn es_descriptors_component_tag_and_injected_round_trip() {
         use crate::descriptor::DescriptorBody;
-        use crate::psi::{iter_sections, ProgramMapTable};
+        use crate::psi::{ProgramMapTable, iter_sections};
         let streams = vec![stream_info(0, "h264", true), stream_info(1, "ac3", false)];
         let teletext = crate::build::teletext_descriptor(&[crate::descriptor::TeletextEntry {
             language_code: *b"eng",
@@ -2902,7 +2909,7 @@ mod tests {
         let bytes = sink.into_bytes();
         // Reassemble the PMT from PID 0x0100.
         let mut pmt = None;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
             let pusi = chunk[1] & 0x40 != 0;
             if pid == 0x0100 && pusi {
@@ -2976,16 +2983,16 @@ mod tests {
         let mut rai_with_pcr = 0usize;
         for pkt in crate::iter_packets(&bytes) {
             let pkt = pkt.expect("well-formed muxer output");
-            if let Some(af) = &pkt.adaptation_field {
-                if af.random_access_indicator {
-                    *rai_by_pid.entry(pkt.pid).or_default() += 1;
-                    assert!(
-                        pkt.payload_unit_start,
-                        "muxer sets RAI only on PES-start packets"
-                    );
-                    if af.pcr_flag {
-                        rai_with_pcr += 1;
-                    }
+            if let Some(af) = &pkt.adaptation_field
+                && af.random_access_indicator
+            {
+                *rai_by_pid.entry(pkt.pid).or_default() += 1;
+                assert!(
+                    pkt.payload_unit_start,
+                    "muxer sets RAI only on PES-start packets"
+                );
+                if af.pcr_flag {
+                    rai_with_pcr += 1;
                 }
             }
         }
@@ -3320,7 +3327,7 @@ mod tests {
         let bytes = sink.into_bytes();
         // Count packets on the PCR PID that carry a PCR_flag.
         let mut pcr_count = 0;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
             if pid != pcr_pid {
                 continue;
@@ -3385,9 +3392,11 @@ mod tests {
         // Every PES on the wire must respect the 16-bit length bound:
         // count the PUSI starts on the ES PID.
         let pusi_count = bytes
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
             .filter(|c| {
-                let pkt = crate::TsPacket::parse(c).unwrap();
+                let pkt = crate::TsPacket::parse(c.as_slice()).unwrap();
                 pkt.pid == FIRST_ES_PID && pkt.payload_unit_start
             })
             .count();
@@ -3431,9 +3440,11 @@ mod tests {
         }
         let bytes = sink.into_bytes();
         let pusi_count = bytes
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
             .filter(|c| {
-                let pkt = crate::TsPacket::parse(c).unwrap();
+                let pkt = crate::TsPacket::parse(c.as_slice()).unwrap();
                 pkt.pid == FIRST_ES_PID && pkt.payload_unit_start
             })
             .count();
@@ -3470,7 +3481,7 @@ mod tests {
         let mut last_pusi_at = None;
         let mut annotated = Vec::new();
         let mut es_index = 0usize;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pkt = crate::TsPacket::parse(chunk).unwrap();
             if pkt.pid != FIRST_ES_PID {
                 continue;
@@ -3524,9 +3535,11 @@ mod tests {
         let bytes = sink.into_bytes();
         // Standalone PCR packets exist…
         let pcr_only = bytes
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
             .filter(|c| {
-                let pkt = crate::TsPacket::parse(c).unwrap();
+                let pkt = crate::TsPacket::parse(c.as_slice()).unwrap();
                 pkt.pid == FIRST_ES_PID
                     && pkt.payload.is_empty()
                     && pkt
@@ -3763,7 +3776,9 @@ mod tests {
         assert_eq!(bytes.len() % TS_PACKET_LEN, 0);
         // Null filler must be present — that's what shapes the rate.
         let nulls = bytes
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
             .filter(|c| {
                 let pid = (((c[1] & 0x1F) as u16) << 8) | c[2] as u16;
                 pid == 0x1FFF
@@ -3979,15 +3994,15 @@ mod tests {
         // after the four old-base PES.
         let mut flagged = Vec::new();
         let mut pes_starts_before_flag = 0usize;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pkt = crate::TsPacket::parse(chunk).unwrap();
             if pkt.pid != FIRST_ES_PID {
                 continue;
             }
-            if let Some(af) = &pkt.adaptation_field {
-                if af.discontinuity_indicator {
-                    flagged.push(af.pcr_base.is_some());
-                }
+            if let Some(af) = &pkt.adaptation_field
+                && af.discontinuity_indicator
+            {
+                flagged.push(af.pcr_base.is_some());
             }
             if flagged.is_empty() && pkt.payload_unit_start {
                 pes_starts_before_flag += 1;
@@ -4057,7 +4072,7 @@ mod tests {
     /// stream order.
     fn splice_annotations(bytes: &[u8], pid: u16) -> Vec<SpliceAnnotation> {
         let mut out = Vec::new();
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pkt = crate::TsPacket::parse(chunk).expect("well-formed packet");
             if pkt.pid != pid {
                 continue;
@@ -4141,7 +4156,7 @@ mod tests {
         // The countdown-zero packet's payload must end the PES: the
         // next payload packet on the PID starts a new PES (PUSI).
         let mut after_zero = false;
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pkt = crate::TsPacket::parse(chunk).unwrap();
             if pkt.pid != FIRST_ES_PID {
                 continue;
@@ -4231,9 +4246,11 @@ mod tests {
         // The unannotated leading packets must outnumber zero (the PES
         // is longer than the annotated window).
         let total_payload_packets = bytes
-            .chunks_exact(TS_PACKET_LEN)
+            .as_chunks::<TS_PACKET_LEN>()
+            .0
+            .iter()
             .filter(|c| {
-                let pkt = crate::TsPacket::parse(c).unwrap();
+                let pkt = crate::TsPacket::parse(c.as_slice()).unwrap();
                 pkt.pid == FIRST_ES_PID && !pkt.payload.is_empty()
             })
             .count();
@@ -4251,8 +4268,8 @@ mod tests {
         // Unknown stream.
         assert!(mx.signal_splice_after(9, SpliceSpec::default()).is_err());
         // Non-zero splice_type on audio.
-        assert!(mx
-            .signal_splice_after(
+        assert!(
+            mx.signal_splice_after(
                 1,
                 SpliceSpec {
                     seamless: Some(SeamlessSpliceSpec {
@@ -4262,10 +4279,11 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .is_err());
+            .is_err()
+        );
         // Zero splice_type on audio is fine.
-        assert!(mx
-            .signal_splice_after(
+        assert!(
+            mx.signal_splice_after(
                 1,
                 SpliceSpec {
                     seamless: Some(SeamlessSpliceSpec {
@@ -4275,10 +4293,11 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .is_ok());
+            .is_ok()
+        );
         // Width overflows.
-        assert!(mx
-            .signal_splice_after(
+        assert!(
+            mx.signal_splice_after(
                 0,
                 SpliceSpec {
                     seamless: Some(SeamlessSpliceSpec {
@@ -4288,9 +4307,10 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .is_err());
-        assert!(mx
-            .signal_splice_after(
+            .is_err()
+        );
+        assert!(
+            mx.signal_splice_after(
                 0,
                 SpliceSpec {
                     seamless: Some(SeamlessSpliceSpec {
@@ -4300,7 +4320,8 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     /// A configured CA descriptor loop and wall-clock anchor must come
@@ -4310,7 +4331,7 @@ mod tests {
     #[test]
     fn cat_and_time_tables_round_trip_through_mux() {
         use crate::psi::{
-            ConditionalAccessTable, TimeDateTable, TimeOffsetTable, CAT_PID, TDT_TOT_PID,
+            CAT_PID, ConditionalAccessTable, TDT_TOT_PID, TimeDateTable, TimeOffsetTable,
         };
         let streams = vec![stream_info(0, "h264", true)];
         let anchor = crate::psi::EitDateTime {
@@ -4397,7 +4418,7 @@ mod tests {
     /// the TDT tracks the delivery schedule like a live transmission.
     #[test]
     fn tdt_advances_with_stream_time_across_midnight() {
-        use crate::psi::{iter_sections, TimeDateTable, TDT_TOT_PID};
+        use crate::psi::{TDT_TOT_PID, TimeDateTable, iter_sections};
         let streams = vec![stream_info(0, "h264", true)];
         let config = MpegTsMuxConfig {
             transport_stream_id: 1,
@@ -4446,7 +4467,7 @@ mod tests {
         }
         let bytes = sink.into_bytes();
         let mut times = Vec::new();
-        for chunk in bytes.chunks_exact(TS_PACKET_LEN) {
+        for chunk in bytes.as_chunks::<TS_PACKET_LEN>().0 {
             let pid = (((chunk[1] & 0x1F) as u16) << 8) | chunk[2] as u16;
             let pusi = chunk[1] & 0x40 != 0;
             if pid == TDT_TOT_PID && pusi {

@@ -9,6 +9,10 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.2...v0.0.3) - 2026-08-23
 
 ### Other

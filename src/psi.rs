@@ -25,8 +25,8 @@
 //! `section_length` counts the bytes AFTER the section_length field
 //! itself, INCLUDING the CRC trailer.
 
-use crate::descriptor::{iter_descriptors, DescriptorIter};
 use crate::TsError;
+use crate::descriptor::{DescriptorIter, iter_descriptors};
 
 /// PAT table_id per §2.4.4.3.
 pub const PAT_TABLE_ID: u8 = 0x00;
@@ -481,7 +481,7 @@ impl NetworkInformationTable {
             _ => {
                 return Err(TsError::Unsupported(
                     "PSI table_id does not match expected value",
-                ))
+                ));
             }
         };
         let (hdr, body) = parse_section_header(section, table_id)?;
@@ -1238,7 +1238,7 @@ impl ServiceDescriptionTable {
             _ => {
                 return Err(TsError::Unsupported(
                     "PSI table_id does not match expected value",
-                ))
+                ));
             }
         };
         let (hdr, body) = parse_section_header(section, table_id)?;
@@ -1391,7 +1391,7 @@ pub fn decode_utc_time(bytes: [u8; 5]) -> Option<EitDateTime> {
     let mjd_i = mjd as i64;
     let yp = ((mjd_i - 15078) * 100 - 20) / 36525; // int((MJD − 15078,2)/365,25)
     let yp_days = (yp * 36525) / 100; // int(Y' × 365,25)
-                                      // int((MJD − 14956,1 − yp_days)/30,6001)
+    // int((MJD − 14956,1 − yp_days)/30,6001)
     let mp = ((mjd_i - 14956 - yp_days) * 10000 - 1) / 306001;
     let mp_days = (mp * 306001) / 10000; // int(M' × 30,6001)
     let d = mjd_i - 14956 - yp_days - mp_days;
@@ -2352,7 +2352,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.push(0u8); // pointer_field
         payload.extend_from_slice(&section);
-        payload.extend(std::iter::repeat(0xFF).take(10));
+        payload.extend(std::iter::repeat_n(0xFF, 10));
         let mut it = iter_sections(&payload);
         let s = it.next().expect("section");
         assert_eq!(s, section);
@@ -3054,7 +3054,7 @@ mod tests {
         s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
         s.push(0); // section_number
         s.push(0); // last_section_number
-                   // reserved_future_use (4) | network_descriptors_length (12).
+        // reserved_future_use (4) | network_descriptors_length (12).
         let nd_len = net_descriptors.len() as u16;
         s.push(0b1111_0000 | ((nd_len >> 8) & 0x0F) as u8);
         s.push((nd_len & 0xFF) as u8);
@@ -3180,7 +3180,7 @@ mod tests {
         s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
         s.push(0); // section_number
         s.push(0); // last_section_number
-                   // reserved_future_use (4) | bouquet_descriptors_length (12).
+        // reserved_future_use (4) | bouquet_descriptors_length (12).
         let bd_len = bouquet_descriptors.len() as u16;
         s.push(0b1111_0000 | ((bd_len >> 8) & 0x0F) as u8);
         s.push((bd_len & 0xFF) as u8);
@@ -3922,7 +3922,7 @@ mod tests {
         s.push(0b1100_0001 | ((version & 0b1_1111) << 1));
         s.push(0); // section_number (fixed 0x00)
         s.push(0); // last_section_number (fixed 0x00)
-                   // reserved_future_use (4) | transmission_info_descriptors_length (12).
+        // reserved_future_use (4) | transmission_info_descriptors_length (12).
         let ti = transmission_descriptors.len() as u16;
         s.push(0xF0 | ((ti >> 8) & 0x0F) as u8);
         s.push((ti & 0xFF) as u8);

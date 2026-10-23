@@ -2201,11 +2201,11 @@ fn decode_fmc(data: &[u8]) -> Option<DescriptorBody<'_>> {
     // §2.6.44 — a flat array of 3-byte records: ES_ID (16),
     // FlexMuxChannel (8).
     const ENTRY_LEN: usize = 3;
-    if data.len() % ENTRY_LEN != 0 {
+    if !data.len().is_multiple_of(ENTRY_LEN) {
         return None;
     }
     let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
-    for chunk in data.chunks_exact(ENTRY_LEN) {
+    for chunk in data.as_chunks::<ENTRY_LEN>().0 {
         entries.push(FmcEntry {
             es_id: u16::from_be_bytes([chunk[0], chunk[1]]),
             flex_mux_channel: chunk[2],
@@ -2268,11 +2268,11 @@ fn decode_service_list(data: &[u8]) -> Option<DescriptorBody<'_>> {
     //   service_id   (16)
     //   service_type (8)
     const ENTRY_LEN: usize = 3;
-    if data.len() % ENTRY_LEN != 0 {
+    if !data.len().is_multiple_of(ENTRY_LEN) {
         return None;
     }
     let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
-    for chunk in data.chunks_exact(ENTRY_LEN) {
+    for chunk in data.as_chunks::<ENTRY_LEN>().0 {
         entries.push(ServiceListEntry {
             service_id: u16::from_be_bytes([chunk[0], chunk[1]]),
             service_type: chunk[2],
@@ -2292,11 +2292,11 @@ fn decode_country_availability(data: &[u8]) -> Option<DescriptorBody<'_>> {
     }
     let country_availability = (data[0] & 0b1000_0000) != 0;
     let rest = &data[1..];
-    if rest.len() % 3 != 0 {
+    if !rest.len().is_multiple_of(3) {
         return None;
     }
     let mut country_codes = Vec::with_capacity(rest.len() / 3);
-    for chunk in rest.chunks_exact(3) {
+    for chunk in rest.as_chunks::<3>().0 {
         country_codes.push([chunk[0], chunk[1], chunk[2]]);
     }
     Some(DescriptorBody::CountryAvailability(
@@ -2348,11 +2348,11 @@ fn decode_component(data: &[u8]) -> Option<DescriptorBody<'_>> {
 
 fn decode_ca_identifier(data: &[u8]) -> Option<DescriptorBody<'_>> {
     // ETSI EN 300 468 §6.2.5 Table 22 — N × CA_system_id (16).
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return None;
     }
     let mut ca_system_ids = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
+    for chunk in data.as_chunks::<2>().0 {
         ca_system_ids.push(u16::from_be_bytes([chunk[0], chunk[1]]));
     }
     Some(DescriptorBody::CaIdentifier(CaIdentifierDescriptor {
@@ -2365,11 +2365,11 @@ fn decode_parental_rating(data: &[u8]) -> Option<DescriptorBody<'_>> {
     //   country_code (24)
     //   rating       (8)
     const ENTRY_LEN: usize = 4;
-    if data.len() % ENTRY_LEN != 0 {
+    if !data.len().is_multiple_of(ENTRY_LEN) {
         return None;
     }
     let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
-    for chunk in data.chunks_exact(ENTRY_LEN) {
+    for chunk in data.as_chunks::<ENTRY_LEN>().0 {
         entries.push(ParentalRatingEntry {
             country_code: [chunk[0], chunk[1], chunk[2]],
             rating: chunk[3],
@@ -2707,11 +2707,11 @@ fn decode_frequency_list(data: &[u8]) -> Option<DescriptorBody<'_>> {
     }
     let coding_type = data[0] & 0b11;
     let rest = &data[1..];
-    if rest.len() % 4 != 0 {
+    if !rest.len().is_multiple_of(4) {
         return None;
     }
     let mut centre_frequencies = Vec::with_capacity(rest.len() / 4);
-    for chunk in rest.chunks_exact(4) {
+    for chunk in rest.as_chunks::<4>().0 {
         centre_frequencies.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Some(DescriptorBody::FrequencyList(FrequencyListDescriptor {
@@ -2730,11 +2730,11 @@ fn decode_local_time_offset(data: &[u8]) -> Option<DescriptorBody<'_>> {
     //   time_of_change             (40)  MJD + BCD time
     //   next_time_offset           (16)  BCD HHMM
     const ENTRY_LEN: usize = 13;
-    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(ENTRY_LEN) {
         return None;
     }
     let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
-    for chunk in data.chunks_exact(ENTRY_LEN) {
+    for chunk in data.as_chunks::<ENTRY_LEN>().0 {
         let country_code = [chunk[0], chunk[1], chunk[2]];
         let b3 = chunk[3];
         let country_region_id = b3 >> 2;
@@ -2777,11 +2777,11 @@ fn decode_subtitling(data: &[u8]) -> Option<DescriptorBody<'_>> {
     //   composition_page_id   (16)
     //   ancillary_page_id     (16)
     const ENTRY_LEN: usize = 8;
-    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(ENTRY_LEN) {
         return None;
     }
     let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
-    for chunk in data.chunks_exact(ENTRY_LEN) {
+    for chunk in data.as_chunks::<ENTRY_LEN>().0 {
         entries.push(SubtitlingEntry {
             language_code: [chunk[0], chunk[1], chunk[2]],
             subtitling_type: chunk[3],
@@ -2799,11 +2799,11 @@ fn decode_teletext(data: &[u8]) -> Option<DescriptorBody<'_>> {
     //   teletext_magazine_number (3)
     //   teletext_page_number     (8)
     const ENTRY_LEN: usize = 5;
-    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(ENTRY_LEN) {
         return None;
     }
     let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
-    for chunk in data.chunks_exact(ENTRY_LEN) {
+    for chunk in data.as_chunks::<ENTRY_LEN>().0 {
         entries.push(TeletextEntry {
             language_code: [chunk[0], chunk[1], chunk[2]],
             teletext_type: chunk[3] >> 3,
@@ -2960,11 +2960,11 @@ fn decode_content(data: &[u8]) -> Option<DescriptorBody<'_>> {
     //   content_nibble_level_2 (4)
     //   user_byte              (8)
     const ENTRY_LEN: usize = 2;
-    if data.is_empty() || data.len() % ENTRY_LEN != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(ENTRY_LEN) {
         return None;
     }
     let mut entries = Vec::with_capacity(data.len() / ENTRY_LEN);
-    for chunk in data.chunks_exact(ENTRY_LEN) {
+    for chunk in data.as_chunks::<ENTRY_LEN>().0 {
         entries.push(ContentNibble {
             level_1: chunk[0] >> 4,
             level_2: chunk[0] & 0x0F,
@@ -3222,11 +3222,11 @@ fn decode_ca(data: &[u8]) -> Option<DescriptorBody<'_>> {
 }
 
 fn decode_iso639_language(data: &[u8]) -> Option<DescriptorBody<'_>> {
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
         return None;
     }
     let mut langs = Vec::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
+    for chunk in data.as_chunks::<4>().0 {
         let mut language = [0u8; 3];
         language.copy_from_slice(&chunk[..3]);
         langs.push(Iso639Language {

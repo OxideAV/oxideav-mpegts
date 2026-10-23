@@ -27,14 +27,14 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use oxideav_mpegts::packet::{AdaptationFieldSpec, TsPacket, TS_PACKET_LEN, TS_SYNC_BYTE};
+use oxideav_mpegts::packet::{AdaptationFieldSpec, TS_PACKET_LEN, TS_SYNC_BYTE, TsPacket};
 use oxideav_mpegts::pes::{PesHeaderSpec, PesPacket};
 use oxideav_mpegts::psi::*;
 use oxideav_mpegts_fuzz::Recipe;
 
 fn parse_all_tables(data: &[u8]) {
     macro_rules! walk {
-        ($d:expr) => {
+        ($d:expr_2021) => {
             for d in $d {
                 let _ = d;
             }
@@ -99,7 +99,7 @@ fn parse_all_tables(data: &[u8]) {
 fn parse_all_atsc(data: &[u8]) {
     use oxideav_mpegts::atsc;
     macro_rules! walk {
-        ($d:expr) => {
+        ($d:expr_2021) => {
             for d in $d {
                 let _ = d;
             }

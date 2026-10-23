@@ -37,8 +37,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::clock::{ContinuityEvent, ContinuityTracker};
-use crate::packet::{detect_packet_layout, TsPacket, TsPacketLayout};
-use crate::psi::{ProgramAssociationTable, ProgramMapTable, PsiSectionAssembler, PAT_PID};
+use crate::packet::{TsPacket, TsPacketLayout, detect_packet_layout};
+use crate::psi::{PAT_PID, ProgramAssociationTable, ProgramMapTable, PsiSectionAssembler};
 
 /// The §2.7.2 upper bound on the interval between consecutive PCRs of
 /// one program's PCR PID: 0,1 s = 2 700 000 ticks of the 27 MHz clock.
@@ -378,10 +378,8 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
         {
             let run = splice_runs.entry(pkt.pid).or_default();
             let counts = has_payload && cc_event != ContinuityEvent::Duplicate;
-            if counts {
-                if let Some((_, since)) = &mut run.last {
-                    *since += 1;
-                }
+            if counts && let Some((_, since)) = &mut run.last {
+                *since += 1;
             }
             let countdown = pkt
                 .adaptation_field
@@ -420,10 +418,11 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
                     (None, Some(pair)) if c > 0 => run.seamless = Some(pair),
                     _ => {}
                 }
-                if let Some((splice_type, _)) = seamless_pair {
-                    if splice_type != 0 && audio_pids.contains(&pkt.pid) {
-                        report.violations.nonzero_splice_type_on_audio += 1;
-                    }
+                if let Some((splice_type, _)) = seamless_pair
+                    && splice_type != 0
+                    && audio_pids.contains(&pkt.pid)
+                {
+                    report.violations.nonzero_splice_type_on_audio += 1;
                 }
                 if c <= 0 {
                     // The splicing point is reached (or behind us) —
@@ -462,10 +461,11 @@ pub fn validate_ts(bytes: &[u8]) -> TsValidationReport {
                 report.violations.opcr_without_pcr += 1;
             }
             // §2.4.3.5 seamless-splice pairing.
-            if let Some(ext) = &af.adaptation_field_extension {
-                if ext.seamless_splice_flag && !af.splicing_point_flag {
-                    report.violations.seamless_splice_without_splicing_point += 1;
-                }
+            if let Some(ext) = &af.adaptation_field_extension
+                && ext.seamless_splice_flag
+                && !af.splicing_point_flag
+            {
+                report.violations.seamless_splice_without_splicing_point += 1;
             }
             // §2.4.3.5 RAI-on-PCR-PID pairing + §2.7.2 PCR cadence.
             if let Some(state) = pcr_states.iter_mut().find(|s| s.pid == pkt.pid) {
@@ -910,7 +910,7 @@ mod tests {
         let mut af = vec![0u8; 9];
         af[0] = 8; // adaptation_field_length
         af[1] = 0b0000_1000; // OPCR_flag only
-                             // 6 OPCR bytes (any) + trailing stuffing byte already zeroed.
+        // 6 OPCR bytes (any) + trailing stuffing byte already zeroed.
         out.extend_from_slice(&ts_packet(
             0x0101,
             false,
