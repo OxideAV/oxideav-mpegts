@@ -368,6 +368,39 @@ pub fn exercise_hostile(bytes: &[u8]) {
     // Raw walk: PSI + PES + clocks.
     let first_program = walk_packets(bytes);
 
+    // Audio access-unit framing over arbitrary payload cuts: every
+    // emitted frame is a header-sized-or-longer slice of the input.
+    for syntax in [
+        oxideav_mpegts::AudioSyntax::Ac3,
+        oxideav_mpegts::AudioSyntax::MpegAudio,
+        oxideav_mpegts::AudioSyntax::AacAdts,
+    ] {
+        let mut sp = oxideav_mpegts::AudioFrameSplitter::new(syntax);
+        let mut total = 0usize;
+        for chunk in bytes.chunks(bytes.len().max(1).div_ceil(3)) {
+            for f in sp.push(chunk, Some(0)) {
+                assert_eq!(f.data.len(), f.info.frame_len);
+                total += f.data.len();
+            }
+        }
+        if let Some(f) = sp.flush() {
+            total += f.data.len();
+        }
+        assert!(total <= bytes.len());
+    }
+
+    // MPEG-2 program-stream demuxer: open + bounded drain.
+    if let Ok(mut ps) = oxideav_mpegts::ps::open(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        &oxideav_core::NullCodecResolver,
+    ) {
+        for _ in 0..4096 {
+            if ps.next_packet().is_err() {
+                break;
+            }
+        }
+    }
+
     // T-STD replay over the default muxer PID layout: any input must
     // produce an error or a finite, violation-capped report.
     let config = TStdConfig::single_program(

@@ -11,6 +11,20 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- `ps` module: MPEG-2 program-stream demuxer (ISO/IEC 13818-1 §2.5 —
+  pack header, system header, PES layer, program stream map, end
+  code), registered as container `"mpegps"` with a pack-header probe
+  and the `mpg` / `mpeg` / `vob` / `m2p` / `ps` extensions. Codecs come
+  from the program stream map or, without one, from the first payload
+  (MPEG-1/2 sequence header, H.264 SPS / AUD, MPEG audio, ADTS);
+  DVD private_stream_1 sub-streams (AC-3, DTS, 16-bit LPCM,
+  sub-pictures) are routed per the staged DVD-Video references.
+  Packets are access units: one audio syncframe each, MPEG-1/2 and
+  H.264 video re-framed at picture / access-unit boundaries with
+  I-picture / IDR keyframe flags; duration from the SCR span.
+  ISO/IEC 11172-1 (MPEG-1 Systems) streams are refused with an
+  explicit error — that syntax is not staged.
+
 - `audio_frame` module: AC-3 / E-AC-3 (ATSC A/52 Table 5.1/5.2/5.18,
   Annex E Table E1.2), MPEG-1/2 audio (ISO/IEC 11172-3 §2.4.1.3,
   13818-3 §2.4.2.3 / §2.4.3.2) and AAC ADTS (13818-7 Tables 8/9/35/42)

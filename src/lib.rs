@@ -104,6 +104,9 @@
 //!   null-packet fill, per-class delivery leads, transport-buffer
 //!   spacing.
 //!
+//! - MPEG-2 program streams ([`ps::MpegPsDemuxer`], §2.5) — the
+//!   `.mpg` / `.vob` multiplex, registered as `"mpegps"`.
+//!
 //! The crate ships **no decoders** — every payload byte stays as a
 //! `&[u8]` slice. A downstream pipeline (e.g. `oxideav-cli`'s
 //! `remux bluray:// …` path) iterates packets, drives a reassembler
@@ -165,6 +168,8 @@ mod audio_split_roundtrip;
 pub mod demuxer;
 #[cfg(feature = "registry")]
 pub mod muxer;
+#[cfg(feature = "registry")]
+pub mod ps;
 #[cfg(feature = "registry")]
 pub mod registry;
 
@@ -243,6 +248,9 @@ pub use demuxer::{
     AccessPointKind, MpegTsDemuxer, RandomAccessPoint, TsProgram, open as open_demuxer,
     probe as probe_mpegts,
 };
+
+#[cfg(feature = "registry")]
+pub use ps::{MpegPsDemuxer, open as open_ps_demuxer, probe as probe_mpegps};
 
 #[cfg(feature = "registry")]
 pub use muxer::{MpegTsMuxer, SeamlessSpliceSpec, SpliceSpec, open as open_muxer};

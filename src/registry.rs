@@ -20,6 +20,12 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_extension("ts", "mpegts");
     reg.register_extension("m2ts", "mpegts");
     reg.register_extension("mts", "mpegts");
+    // MPEG-2 program streams (ISO/IEC 13818-1 §2.5).
+    reg.register_demuxer("mpegps", crate::ps::open);
+    reg.register_probe("mpegps", crate::ps::probe);
+    for ext in ["mpg", "mpeg", "vob", "m2p", "ps"] {
+        reg.register_extension(ext, "mpegps");
+    }
 }
 
 /// Install the MPEG-TS container into a [`RuntimeContext`].

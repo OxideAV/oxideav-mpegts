@@ -288,6 +288,17 @@ pub(crate) fn h264_params(es: &[u8]) -> Option<VideoEsParams> {
     None
 }
 
+/// `true` when the Annex-B stream carries an H.264 SPS or access unit
+/// delimiter (H.264 Table 7-1 types 7 / 9 with `forbidden_zero_bit`
+/// clear) — the sniff the program-stream demuxer uses for a video
+/// `stream_id` no program stream map describes.
+pub(crate) fn looks_like_h264(es: &[u8]) -> bool {
+    start_code_units(es).any(|n| {
+        n.first()
+            .is_some_and(|h| h & 0x80 == 0 && matches!(h & 0x1F, 7 | 9))
+    })
+}
+
 /// H.262 Table 6-4 frame_rate_value (also ISO/IEC 11172-2 picture_rate).
 const FRAME_RATES: [(u32, u32); 9] = [
     (0, 0),

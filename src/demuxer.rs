@@ -1865,7 +1865,7 @@ fn apply_descriptor_params(params: &mut CodecParameters, pmt_stream: &crate::Pmt
 /// Map an MPEG-TS `stream_type` byte to a [`CodecParameters`] the
 /// muxer registry understands. `None` means "drop this stream" —
 /// interactive graphics, DSM-CC sections, vendor-private codes, etc.
-fn codec_params_for_stream_type(st: u8) -> Option<CodecParameters> {
+pub(crate) fn codec_params_for_stream_type(st: u8) -> Option<CodecParameters> {
     let s = StreamType::from_raw(st);
     // (codec_id, is_video, is_subtitle); audio is the residual class.
     let (cid, is_video, is_subtitle): (&'static str, bool, bool) = match s {
