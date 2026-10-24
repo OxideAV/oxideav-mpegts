@@ -9,6 +9,14 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.3...v0.0.4) - 2026-10-24
+
+### Other
+
+- MPEG-2 program-stream demuxer ("mpegps") with access-unit packets
+- one packet per audio syncframe + stream params from the elementary stream
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `ps` module: MPEG-2 program-stream demuxer (ISO/IEC 13818-1 §2.5 —
