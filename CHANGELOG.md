@@ -9,6 +9,36 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `audio_frame` module: AC-3 / E-AC-3 (ATSC A/52 Table 5.1/5.2/5.18,
+  Annex E Table E1.2), MPEG-1/2 audio (ISO/IEC 11172-3 §2.4.1.3,
+  13818-3 §2.4.2.3 / §2.4.3.2) and AAC ADTS (13818-7 Tables 8/9/35/42)
+  frame-header parsers plus `AudioFrameSplitter`, which cuts PES
+  payloads into one access unit each, carries partial frames across
+  PES boundaries and interpolates per-frame PTS from the PES PTS
+  (§2.4.3.7 / §2.7.5).
+- Stream parameters from the elementary stream: the demuxer looks
+  ahead (≤ 8 MiB) at open and fills width / height / frame rate /
+  pixel format from the H.264 SPS (H.264 §7.3.2.1.1 + VUI timing) or
+  the MPEG-1/2 sequence header + sequence extension (H.262 §6.2.2), and
+  sample rate / channels / bit rate from the first audio frame header
+  (refining `mp1`/`mp2`/`mp3` and `ac3`/`eac3`). PMT descriptors fill
+  what they carry: `video_stream_descriptor` frame rate, the ATSC
+  `AC-3_audio_stream_descriptor` sample rate.
+- `stream_type` 0x06 streams are mapped to `ac3` / `eac3` through the
+  DVB AC-3 / enhanced AC-3 descriptors or an "AC-3" registration
+  descriptor.
+
+### Fixed
+
+- An audio PES carrying several syncframes left the demuxer as one
+  packet, so decoders played only its first frame (AC-3 in M2TS:
+  32 256 of 96 768 samples; MP2 in TS: 48 384 of 96 768). Each frame is
+  now its own packet with its own PTS and duration. Streams whose
+  payload never starts on a frame header are passed through whole, as
+  before.
+
 ### Changed
 
 - edition 2024, MSRV 1.95

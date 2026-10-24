@@ -102,6 +102,12 @@ pub struct MpegTsDemuxer {
     /// `elementary_pid` → 33-bit DTS unwrapper — DTS advances
     /// independently of PTS so it needs its own ring tracker.
     dts_trackers: HashMap<u16, PtsTracker>,
+    /// `elementary_pid` → audio access-unit splitter for streams whose
+    /// framing is staged (AC-3 / E-AC-3, MPEG-1/2 audio, AAC ADTS): a
+    /// PES payload carrying several syncframes leaves as one packet
+    /// per frame (§2.4.3.7 / §2.7.5 timestamp interpolation, see
+    /// [`crate::audio_frame`]).
+    splitters: HashMap<u16, crate::AudioFrameSplitter>,
     /// Already-reassembled packets waiting to be handed out.
     pending: VecDeque<Packet>,
     /// `true` once `read_one_packet` has returned `Eof` and every
@@ -382,11 +388,26 @@ impl MpegTsDemuxer {
         let mut reassemblers: HashMap<u16, PesReassembler> = HashMap::new();
         let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
+        let mut splitters: HashMap<u16, crate::AudioFrameSplitter> = HashMap::new();
         for pmt_stream in &pmt.streams {
-            let mut params = match codec_params_for_stream_type(pmt_stream.stream_type) {
+            let mut params = match codec_params_for_stream_type(pmt_stream.stream_type)
+                .or_else(|| codec_params_for_private_pes(pmt_stream))
+            {
                 Some(p) => p,
                 None => continue,
             };
+            apply_descriptor_params(&mut params, pmt_stream);
+            let syntax = if StreamType::from_raw(pmt_stream.stream_type) == StreamType::AacAdts {
+                Some(crate::AudioSyntax::AacAdts)
+            } else {
+                crate::es_params::audio_syntax_for(params.codec_id.as_str())
+            };
+            if let Some(syn) = syntax {
+                splitters.insert(
+                    pmt_stream.elementary_pid,
+                    crate::AudioFrameSplitter::new(syn),
+                );
+            }
             // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
             // §2.6.18) into the per-stream language tag so a demux →
             // remux path keeps each track's audio/subtitle language.
@@ -428,6 +449,7 @@ impl MpegTsDemuxer {
             reassemblers,
             pts_trackers,
             dts_trackers,
+            splitters,
             pending: VecDeque::new(),
             eof_reached: false,
             bytes_read: probe_bytes,
@@ -445,6 +467,7 @@ impl MpegTsDemuxer {
         // resumes exactly where the header scan stopped. A
         // non-seekable source (or one too short to carry two PCRs)
         // leaves `duration_micros` at `None`.
+        demuxer.probe_stream_params();
         demuxer.duration_micros = demuxer.compute_duration_micros();
         let _ = demuxer
             .input
@@ -1102,6 +1125,9 @@ impl MpegTsDemuxer {
         for r in self.reassemblers.values_mut() {
             *r = PesReassembler::new();
         }
+        for s in self.splitters.values_mut() {
+            s.reset();
+        }
         let hint = time_hint_90k.and_then(|t| u64::try_from(t).ok());
         for t in self
             .pts_trackers
@@ -1162,9 +1188,65 @@ impl MpegTsDemuxer {
     /// monotonic 64-bit extended PTS/DTS (§2.4.3.7) rather than the raw
     /// 33-bit ring value, and record the stream's `start_time` on its
     /// first timestamped packet.
-    fn finish_pes(&mut self, pid: u16, stream_idx: u32, pes: PesPacket) -> Packet {
+    /// Turn a reassembled PES into output packets on `self.pending`:
+    /// one per PES, or — for a stream with an [`crate::AudioFrameSplitter`]
+    /// — one per audio access unit the payload completes. Returns the
+    /// number of packets queued.
+    fn emit_pes(&mut self, pid: u16, stream_idx: u32, mut pes: PesPacket) -> usize {
+        if !self.splitters.contains_key(&pid) {
+            let pkt = self.finish_pes(pid, stream_idx, pes);
+            self.pending.push_back(pkt);
+            return 1;
+        }
+        let payload = std::mem::take(&mut pes.payload);
+        let random_access = pes.random_access;
+        // Timestamps through the same unwrap path as whole-PES packets.
+        let head = self.finish_pes(pid, stream_idx, pes);
+        let splitter = self.splitters.get_mut(&pid).expect("checked above");
+        let was_locked = splitter.is_locked();
+        let frames = splitter.push(&payload, head.pts);
+        if frames.is_empty() && !was_locked {
+            splitter.unlock();
+            // Nothing in this payload framed as an access unit (a
+            // stream that is not what its stream_type claims, or a
+            // tail fragment after a seek): hand the PES through whole
+            // rather than drop it, as before splitting existed.
+            let mut head = head;
+            head.data = payload;
+            self.pending.push_back(head);
+            return 1;
+        }
+        let n = frames.len();
+        for (k, f) in frames.into_iter().enumerate() {
+            let pkt = self.audio_frame_packet(stream_idx, f, k == 0 && random_access);
+            self.pending.push_back(pkt);
+        }
+        n
+    }
+
+    /// Wrap one split audio access unit as a core packet. Every audio
+    /// frame is independently decodable at the container level, but the
+    /// keyframe flag stays tied to the §2.4.3.5 indicator so seeking
+    /// semantics are unchanged.
+    fn audio_frame_packet(&self, stream_idx: u32, f: crate::AudioFrame, rai: bool) -> Packet {
         let tb = TimeBase::new(1, 90_000);
-        let mut pkt = Packet::new(stream_idx, tb, pes.payload);
+        let dur = f.info.duration_90k() as i64;
+        let mut pkt = Packet::new(stream_idx, tb, f.data);
+        if let Some(p) = f.pts {
+            pkt = pkt.with_pts(p).with_dts(p);
+        }
+        if dur > 0 {
+            pkt = pkt.with_duration(dur);
+        }
+        if rai {
+            pkt = pkt.with_keyframe(true);
+        }
+        pkt
+    }
+
+    fn finish_pes(&mut self, pid: u16, stream_idx: u32, mut pes: PesPacket) -> Packet {
+        let tb = TimeBase::new(1, 90_000);
+        let mut pkt = Packet::new(stream_idx, tb, std::mem::take(&mut pes.payload));
         // A TS-level random_access_indicator (§2.4.3.5) announced this
         // PES as beginning at an elementary-stream access point — the
         // container-level keyframe signal.
@@ -1210,6 +1292,83 @@ impl MpegTsDemuxer {
         pkt
     }
 
+    /// Open-time look-ahead that fills each stream's picture / audio
+    /// parameters from its first access unit when the PMT descriptors
+    /// did not (ISO/IEC 13818-1 §2.6 carries no picture size or channel
+    /// count for the common stream types): H.264 SPS / MPEG-1/2
+    /// sequence header for video, the first syncframe header for audio
+    /// (which also refines MPEG-audio layer and AC-3 vs E-AC-3).
+    ///
+    /// Reads at most [`PARAM_PROBE_BYTES`] past the PMT, then restores
+    /// the streaming cursor (input position and resync put-back) so the
+    /// first `next_packet` resumes exactly where the header scan
+    /// stopped.
+    fn probe_stream_params(&mut self) {
+        use std::collections::HashSet;
+        let Ok(resume) = self.input.stream_position() else {
+            return;
+        };
+        let saved_putback = self.putback.clone();
+        let mut need: HashSet<u16> = HashSet::new();
+        for (&pid, &idx) in &self.pid_to_stream {
+            let id = self.streams[idx as usize].params.codec_id.as_str();
+            if self.splitters.contains_key(&pid)
+                || matches!(id, "h264" | "mpeg1video" | "mpeg2video")
+            {
+                need.insert(pid);
+            }
+        }
+        let mut asm: HashMap<u16, PesReassembler> =
+            need.iter().map(|&p| (p, PesReassembler::new())).collect();
+        let mut video_bytes: HashMap<u16, Vec<u8>> = HashMap::new();
+        let psize = self.layout.packet_size as u64;
+        let start = self.bytes_read;
+        let mut off = start;
+        while !need.is_empty() && off - start < PARAM_PROBE_BYTES {
+            let buf = match read_one_packet(&mut self.input, &mut self.putback, off, self.layout) {
+                Ok(Some(b)) => b,
+                _ => break,
+            };
+            off += psize;
+            let Ok(pkt) = TsPacket::parse(&buf) else {
+                continue;
+            };
+            if !need.contains(&pkt.pid) {
+                continue;
+            }
+            let Some(r) = asm.get_mut(&pkt.pid) else {
+                continue;
+            };
+            let Ok(Some(pes)) = r.feed(&pkt) else {
+                continue;
+            };
+            let idx = self.pid_to_stream[&pkt.pid] as usize;
+            if let Some(sp) = self.splitters.get(&pkt.pid) {
+                let mut probe = crate::AudioFrameSplitter::new(sp.syntax());
+                if let Some(f) = probe.push(&pes.payload, None).first() {
+                    crate::es_params::apply_audio(&mut self.streams[idx].params, &f.info);
+                    need.remove(&pkt.pid);
+                }
+                continue;
+            }
+            let acc = video_bytes.entry(pkt.pid).or_default();
+            acc.extend_from_slice(&pes.payload);
+            let params = &mut self.streams[idx].params;
+            let found = match params.codec_id.as_str() {
+                "h264" => crate::es_params::h264_params(acc),
+                _ => crate::es_params::mpeg12_params(acc),
+            };
+            if let Some(v) = found {
+                crate::es_params::apply_video(params, &v);
+                need.remove(&pkt.pid);
+            } else if acc.len() > PARAM_PROBE_VIDEO_BYTES {
+                need.remove(&pkt.pid);
+            }
+        }
+        let _ = self.input.seek(std::io::SeekFrom::Start(resume));
+        self.putback = saved_putback;
+    }
+
     /// Feed a TS packet's adaptation field into the PCR clock recovery
     /// when it lands on the selected program's `PCR_PID`.
     fn observe_pcr(&mut self, pkt: &TsPacket<'_>, byte_offset: u64) {
@@ -1249,12 +1408,9 @@ impl MpegTsDemuxer {
             .get_mut(&pkt.pid)
             .expect("pid_to_stream and reassemblers are kept in sync");
         let emitted = reassembler.feed(&pkt).map_err(map_ts_err)?;
-        let pushed = if let Some(pes) = emitted {
-            let packet = self.finish_pes(pkt.pid, stream_idx, pes);
-            self.pending.push_back(packet);
-            1
-        } else {
-            0
+        let pushed = match emitted {
+            Some(pes) => self.emit_pes(pkt.pid, stream_idx, pes),
+            None => 0,
         };
         Ok(pushed)
     }
@@ -1263,7 +1419,8 @@ impl MpegTsDemuxer {
     /// dry. Pushes a final `Packet` per stream that had a buffered
     /// in-flight PES at end-of-stream.
     fn flush_reassemblers(&mut self) {
-        let pids: Vec<u16> = self.reassemblers.keys().copied().collect();
+        let mut pids: Vec<u16> = self.reassemblers.keys().copied().collect();
+        pids.sort_unstable();
         for pid in pids {
             let stream_idx = self.pid_to_stream[&pid];
             let flushed = self
@@ -1271,8 +1428,13 @@ impl MpegTsDemuxer {
                 .get_mut(&pid)
                 .and_then(|r| r.flush().ok().flatten());
             if let Some(pes) = flushed {
-                let packet = self.finish_pes(pid, stream_idx, pes);
-                self.pending.push_back(packet);
+                self.emit_pes(pid, stream_idx, pes);
+            }
+            // A trailing partial audio frame (truncated stream) still
+            // reaches the decoder, which decides whether it is usable.
+            if let Some(f) = self.splitters.get_mut(&pid).and_then(|s| s.flush()) {
+                let pkt = self.audio_frame_packet(stream_idx, f, false);
+                self.pending.push_back(pkt);
             }
         }
     }
@@ -1350,8 +1512,7 @@ impl Demuxer for MpegTsDemuxer {
                                 .transpose()
                                 .map_err(map_ts_err)?;
                             if let Some(pes) = emitted {
-                                let packet = self.finish_pes(pkt.pid, stream_idx, pes);
-                                self.pending.push_back(packet);
+                                self.emit_pes(pkt.pid, stream_idx, pes);
                             }
                         }
                     }
@@ -1360,6 +1521,14 @@ impl Demuxer for MpegTsDemuxer {
         }
     }
 }
+
+/// Input bytes the open-time parameter probe reads past the PMT
+/// before giving up on streams whose first access unit never arrived.
+const PARAM_PROBE_BYTES: u64 = 8 << 20;
+
+/// Elementary-stream bytes accumulated per video PID while hunting for
+/// a sequence parameter set / sequence header.
+const PARAM_PROBE_VIDEO_BYTES: usize = 2 << 20;
 
 /// Maximum packet-sized chunks we'll skip while resyncing after a bad
 /// sync byte. We've observed real BD M2TS streams with ~2 AACS units
@@ -1614,6 +1783,83 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
         }
     }
     None
+}
+
+/// `stream_type` 0x06 (PES private data, Table 2-29) names its codec
+/// only through descriptors: the DVB `AC-3_descriptor` (0x6A) /
+/// `enhanced_AC-3_descriptor` (0x7A) (ATSC A/52 Annex A §5 / EN 300 468
+/// Annex D) or a `registration_descriptor` (§2.6.8) whose
+/// `format_identifier` is "AC-3" (A/52 Annex A §3).
+fn codec_params_for_private_pes(pmt_stream: &crate::PmtStream) -> Option<CodecParameters> {
+    if pmt_stream.stream_type != 0x06 {
+        return None;
+    }
+    for d in pmt_stream.iter_descriptors().flatten() {
+        let id = match (&d.body, d.tag) {
+            (_, 0x6A) => "ac3",
+            (_, 0x7A) => "eac3",
+            (
+                crate::DescriptorBody::Registration {
+                    format_identifier: [b'A', b'C', b'-', b'3'],
+                    ..
+                },
+                _,
+            ) => "ac3",
+            _ => continue,
+        };
+        return Some(CodecParameters::audio(CodecId::new(id)));
+    }
+    None
+}
+
+/// Lift the numeric facts the PMT ES_info descriptors carry into the
+/// stream's parameters:
+///
+/// * `video_stream_descriptor` (tag 0x02, §2.6.2 / §2.6.3) — a single
+///   `frame_rate_code` (`multiple_frame_rate_flag = 0`) per H.262
+///   Table 6-4.
+/// * ATSC `AC-3_audio_stream_descriptor` (tag 0x81, A/52 Annex A §4.3
+///   Table A4.1) on an AC-3 stream — an exact `sample_rate_code`
+///   (Table A4.2 codes '000'..'010'; the "or" sets are not a rate).
+fn apply_descriptor_params(params: &mut CodecParameters, pmt_stream: &crate::PmtStream) {
+    const FRAME_RATES: [(i64, i64); 9] = [
+        (0, 0),
+        (24_000, 1001),
+        (24, 1),
+        (25, 1),
+        (30_000, 1001),
+        (30, 1),
+        (50, 1),
+        (60_000, 1001),
+        (60, 1),
+    ];
+    for d in pmt_stream.iter_descriptors().flatten() {
+        match &d.body {
+            crate::DescriptorBody::VideoStream(v) if !v.multiple_frame_rate_flag => {
+                if let Some(&(n, den)) = FRAME_RATES.get(v.frame_rate_code as usize)
+                    && den != 0
+                    && params.frame_rate.is_none()
+                {
+                    params.frame_rate = Some(oxideav_core::Rational::new(n, den));
+                }
+            }
+            _ if d.tag == 0x81
+                && matches!(params.codec_id.as_str(), "ac3" | "eac3")
+                && !d.data.is_empty() =>
+            {
+                let rate = match d.data[0] >> 5 {
+                    0 => Some(48_000),
+                    1 => Some(44_100),
+                    2 => Some(32_000),
+                    _ => None,
+                };
+                if params.sample_rate.is_none() {
+                    params.sample_rate = rate;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Map an MPEG-TS `stream_type` byte to a [`CodecParameters`] the

@@ -138,10 +138,13 @@
 
 pub mod atsc;
 mod atsc_huffman;
+pub mod audio_frame;
 pub mod build;
 pub mod clock;
 pub mod descriptor;
 pub mod error;
+#[cfg(feature = "registry")]
+mod es_params;
 pub mod packet;
 pub mod pes;
 pub mod psi;
@@ -155,6 +158,9 @@ mod hostile;
 #[cfg(all(test, feature = "registry"))]
 mod seek_roundtrip;
 
+#[cfg(all(test, feature = "registry"))]
+mod audio_split_roundtrip;
+
 #[cfg(feature = "registry")]
 pub mod demuxer;
 #[cfg(feature = "registry")]
@@ -162,6 +168,10 @@ pub mod muxer;
 #[cfg(feature = "registry")]
 pub mod registry;
 
+pub use audio_frame::{
+    AudioFrame, AudioFrameInfo, AudioFrameKind, AudioFrameSplitter, AudioSyntax, parse_ac3_frame,
+    parse_adts_header, parse_mpeg_audio_header,
+};
 pub use build::{
     EitEventEntry, NitTsEntry, PmtStreamEntry, SdtServiceEntry, aac_descriptor, ac3_descriptor,
     bouquet_name_descriptor, build_eit_pf, build_nit, build_pat, build_pmt, build_sdt,
