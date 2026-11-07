@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Errors raised by the MPEG-TS parsers.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TsError {
     /// The slice handed to a parser is shorter than the spec-fixed
     /// record size.

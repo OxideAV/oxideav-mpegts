@@ -139,6 +139,7 @@ pub const MAX_PSI_SECTION_LEN: usize = 3 + 0x3FD;
 
 /// Parsed Program Association Table.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct ProgramAssociationTable {
     /// `transport_stream_id` carried in `table_id_extension`.
     pub transport_stream_id: u16,
@@ -185,6 +186,7 @@ impl ProgramAssociationTable {
 
 /// One elementary-stream descriptor inside a PMT.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PmtStream {
     /// Per ISO/IEC 13818-1 Table 2-29 (`stream_type`).
     pub stream_type: u8,
@@ -205,6 +207,7 @@ impl PmtStream {
 
 /// Parsed Program Map Table for one program.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct ProgramMapTable {
     /// Program number this PMT serves (from `table_id_extension`).
     pub program_number: u16,
@@ -307,6 +310,7 @@ impl ProgramMapTable {
 /// across multiple sections, all of which share `table_id_extension`
 /// (reserved; not used to identify a CAT).
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct ConditionalAccessTable {
     /// 5-bit `version_number`.
     pub version_number: u8,
@@ -357,6 +361,7 @@ impl ConditionalAccessTable {
 /// parse. Sections may be segmented across the [`TSDT_PID`] stream and
 /// reassembled with [`PsiSectionAssembler`] before parsing.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct TransportStreamDescriptionTable {
     /// 5-bit `version_number`.
     pub version_number: u8,
@@ -403,6 +408,7 @@ impl TransportStreamDescriptionTable {
 /// the raw descriptor block so callers walk it with
 /// [`Self::iter_descriptors`].
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct NitTransportStream {
     /// 16-bit `transport_stream_id` — labels this TS within the
     /// delivery system.
@@ -441,6 +447,7 @@ impl NitTransportStream {
 /// the [`NIT_PID`] stream and reassembled with [`PsiSectionAssembler`]
 /// before parsing.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct NetworkInformationTable {
     /// `network_id` (from `table_id_extension`).
     pub network_id: u16,
@@ -594,6 +601,7 @@ impl NetworkInformationTable {
 /// Structurally identical to a NIT TS entry: the `(transport_stream_id,
 /// original_network_id)` pair followed by a per-TS descriptor loop.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BatTransportStream {
     /// 16-bit `transport_stream_id`.
     pub transport_stream_id: u16,
@@ -629,6 +637,7 @@ impl BatTransportStream {
 /// [`BAT_PID`] stream and reassembled with [`PsiSectionAssembler`]
 /// before parsing.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct BouquetAssociationTable {
     /// `bouquet_id` (from `table_id_extension`).
     pub bouquet_id: u16,
@@ -828,6 +837,7 @@ impl RunningStatus {
 /// `program_number` in the corresponding program_map_section (except for
 /// NVOD reference services), exactly as in the SDT/EIT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RstEntry {
     /// 16-bit `transport_stream_id`.
     pub transport_stream_id: u16,
@@ -855,6 +865,7 @@ pub struct RstEntry {
 /// body is a flat run of fixed 9-byte [`RstEntry`] records that begins
 /// immediately after the 12-bit `section_length`.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct RunningStatusTable {
     /// Event status entries carried in this section.
     pub entries: Vec<RstEntry>,
@@ -918,6 +929,7 @@ impl RunningStatusTable {
 /// the body is the raw run of `data_byte`s after the 12-bit
 /// `section_length`. The maximum section length is 4 096 bytes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StuffingTable {
     /// `section_syntax_indicator` — may be `0` or `1` for the ST.
     pub section_syntax_indicator: bool,
@@ -969,6 +981,7 @@ impl StuffingTable {
 /// [`Self::transition_flag`] in its top bit followed by 7
 /// `reserved_future_use` bits.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiscontinuityInformationTable {
     /// `transition_flag` — when `true` the transition is due to a change
     /// of the **originating source** (a change of originating TS and/or
@@ -1016,6 +1029,7 @@ impl DiscontinuityInformationTable {
 /// event** in that service, and a per-service descriptor loop carrying
 /// SI-related information on the service and event.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SitService {
     /// 16-bit `service_id` — equals the corresponding PMT
     /// `program_number` for normal services (except NVOD reference
@@ -1055,6 +1069,7 @@ impl SitService {
 /// entries each with its own descriptor block. `section_number` and
 /// `last_section_number` are fixed at `0x00` per §7.1.2.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct SelectionInformationTable {
     /// 5-bit `version_number`.
     pub version_number: u8,
@@ -1160,6 +1175,7 @@ impl SelectionInformationTable {
 /// One service entry from the SDT service loop (ETSI EN 300 468
 /// §5.2.3 Table 5).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SdtService {
     /// 16-bit `service_id` — equals the corresponding PMT
     /// `program_number` for normal services.
@@ -1205,6 +1221,7 @@ impl SdtService {
 /// [`crate::descriptor::ServiceDescriptor`] — the source of a service's
 /// human-readable name and provider.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct ServiceDescriptionTable {
     /// `transport_stream_id` (from `table_id_extension`).
     pub transport_stream_id: u16,
@@ -1418,6 +1435,7 @@ pub fn decode_utc_time(bytes: [u8; 5]) -> Option<EitDateTime> {
 /// One event entry from the EIT event loop (ETSI EN 300 468 §5.2.4
 /// Table 7).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EitEvent {
     /// 16-bit `event_id`, unique within a service.
     pub event_id: u16,
@@ -1468,6 +1486,7 @@ impl EitEvent {
 /// attach human-readable event names (via the per-event
 /// `short_event_descriptor`) and time ranges to each program.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct EventInformationTable {
     /// `service_id` (from `table_id_extension`).
     pub service_id: u16,
@@ -1619,6 +1638,7 @@ impl EventInformationTable {
 /// the richer [`TimeOffsetTable`] (TOT) additionally describes the local
 /// time offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TimeDateTable {
     /// Decoded `UTC_time` — the current UTC date and wall-clock time.
     /// `None` for the all-ones "undefined" sentinel (not expected on a
@@ -1666,6 +1686,7 @@ impl TimeDateTable {
 /// (tag `0x58`) giving the country-specific local-time offset relative
 /// to the [`Self::utc_time`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TimeOffsetTable {
     /// Decoded `UTC_time` — the current UTC date and wall-clock time.
     /// `None` for the all-ones sentinel.

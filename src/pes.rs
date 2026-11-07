@@ -78,6 +78,7 @@ pub(crate) fn has_optional_pes_header(stream_id: u8) -> bool {
 /// header-less stream IDs (program_stream_map, padding_stream, …) they
 /// stay at their `None` / zero defaults.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PesPacket {
     /// `stream_id` byte from the PES header (Table 2-18).
     pub stream_id: u8,
@@ -148,6 +149,7 @@ pub struct PesPacket {
 ///
 /// Each `Option` field maps to one of the five sub-flags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct PesExtension {
     /// 16-byte `PES_private_data` (§2.4.3.7: private data that,
     /// combined with surrounding fields, must not emulate the
@@ -173,6 +175,7 @@ pub struct PesExtension {
 /// counter-like functionality across a Program Stream or ISO/IEC
 /// 11172-1 stream carried in PES packets (§2.4.3.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProgramPacketSequenceCounter {
     /// 7-bit counter; wraps to 0 past its maximum. No two consecutive
     /// PES packets in the program multiplex may carry the same value.
@@ -192,6 +195,7 @@ pub struct ProgramPacketSequenceCounter {
 /// carried in a Program Stream (§2.4.3.7): the pair sizes the P-STD
 /// input buffer BSn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PStdBuffer {
     /// `P-STD_buffer_scale` — scaling factor for `size`: `false` ⇒
     /// units of 128 bytes (required for audio stream_ids), `true` ⇒
@@ -900,6 +904,7 @@ impl PesReassembler {
 /// (start code through payload) that reads back identically through
 /// [`PesPacket::parse`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PesHeaderSpec {
     /// `stream_id` (Table 2-18). The header-less IDs
     /// (program_stream_map, padding_stream, private_stream_2, ECM,
@@ -942,6 +947,113 @@ pub struct PesHeaderSpec {
     /// video stream_ids `0xE0..=0xEF` carried in a Transport Stream
     /// (§2.4.3.7); rejected otherwise.
     pub unbounded_length: bool,
+}
+
+impl PesHeaderSpec {
+    /// Builder: set [`stream_id`](Self::stream_id).
+    #[must_use]
+    pub fn with_stream_id(mut self, v: u8) -> Self {
+        self.stream_id = v;
+        self
+    }
+
+    /// Builder: set [`pes_scrambling_control`](Self::pes_scrambling_control).
+    #[must_use]
+    pub fn with_pes_scrambling_control(mut self, v: u8) -> Self {
+        self.pes_scrambling_control = v;
+        self
+    }
+
+    /// Builder: set [`pes_priority`](Self::pes_priority).
+    #[must_use]
+    pub fn with_pes_priority(mut self, v: bool) -> Self {
+        self.pes_priority = v;
+        self
+    }
+
+    /// Builder: set [`data_alignment_indicator`](Self::data_alignment_indicator).
+    #[must_use]
+    pub fn with_data_alignment_indicator(mut self, v: bool) -> Self {
+        self.data_alignment_indicator = v;
+        self
+    }
+
+    /// Builder: set [`copyright`](Self::copyright).
+    #[must_use]
+    pub fn with_copyright(mut self, v: bool) -> Self {
+        self.copyright = v;
+        self
+    }
+
+    /// Builder: set [`original_or_copy`](Self::original_or_copy).
+    #[must_use]
+    pub fn with_original_or_copy(mut self, v: bool) -> Self {
+        self.original_or_copy = v;
+        self
+    }
+
+    /// Builder: set [`pts_90k`](Self::pts_90k).
+    #[must_use]
+    pub fn with_pts_90k(mut self, v: Option<u64>) -> Self {
+        self.pts_90k = v;
+        self
+    }
+
+    /// Builder: set [`dts_90k`](Self::dts_90k).
+    #[must_use]
+    pub fn with_dts_90k(mut self, v: Option<u64>) -> Self {
+        self.dts_90k = v;
+        self
+    }
+
+    /// Builder: set [`escr_27mhz`](Self::escr_27mhz).
+    #[must_use]
+    pub fn with_escr_27mhz(mut self, v: Option<u64>) -> Self {
+        self.escr_27mhz = v;
+        self
+    }
+
+    /// Builder: set [`es_rate_50bps`](Self::es_rate_50bps).
+    #[must_use]
+    pub fn with_es_rate_50bps(mut self, v: Option<u32>) -> Self {
+        self.es_rate_50bps = v;
+        self
+    }
+
+    /// Builder: set [`trick_mode`](Self::trick_mode).
+    #[must_use]
+    pub fn with_trick_mode(mut self, v: Option<DsmTrickMode>) -> Self {
+        self.trick_mode = v;
+        self
+    }
+
+    /// Builder: set [`additional_copy_info`](Self::additional_copy_info).
+    #[must_use]
+    pub fn with_additional_copy_info(mut self, v: Option<u8>) -> Self {
+        self.additional_copy_info = v;
+        self
+    }
+
+    /// Builder: set [`previous_pes_packet_crc`](Self::previous_pes_packet_crc).
+    #[must_use]
+    pub fn with_previous_pes_packet_crc(mut self, v: Option<u16>) -> Self {
+        self.previous_pes_packet_crc = v;
+        self
+    }
+
+    /// Builder: set [`pes_extension`](Self::pes_extension).
+    #[must_use]
+    pub fn with_pes_extension(mut self, v: Option<PesExtension>) -> Self {
+        self.pes_extension = v;
+        self
+    }
+
+    /// Builder: set [`unbounded_length`](Self::unbounded_length).
+    #[must_use]
+    pub fn with_unbounded_length(mut self, v: bool) -> Self {
+        self.unbounded_length = v;
+        self
+    }
 }
 
 impl PesHeaderSpec {

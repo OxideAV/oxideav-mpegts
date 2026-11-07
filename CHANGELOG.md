@@ -9,6 +9,40 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Constructors for the builder inputs: `ProgramSpec::new(program_number,
+  pmt_pid)`, `ServiceSpec::new`, `EventSpec::new(event_id, duration,
+  running_status, language)`, `NetworkSpec::new(network_id)`,
+  `TimeSpec::new(utc_time)`, `SeamlessSpliceSpec::new`,
+  `LocalTimeOffsetSpec::new`, `PmtStreamEntry::new`,
+  `SdtServiceEntry::new(service_id, running_status)`, `NitTsEntry::new`,
+  `EitEventEntry::new(event_id, duration, running_status)`,
+  `SitServiceEntry::new`, `TStdStreamModel::new`, `TsPacketLayout::new`,
+  plus `with_*` setters on every muxer / builder input record.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the growable enums `TsError`,
+  `StreamType`, `DescriptorBody`, `ExtensionBody`, `AtscDescriptorBody`,
+  `DccSelectionCategory`, `DccsctUpdate`, `DiscontinuityReason`,
+  `PcrEvent`, `ContinuityEvent`, `TimestampEvent`, `AccessPointKind`,
+  `TStdBranch`, `TStdViolation`; on the muxer / builder input records
+  (`MpegTsMuxConfig`, `ProgramSpec`, `ServiceSpec`, `EventSpec`,
+  `NetworkSpec`, `TimeSpec`, `SpliceSpec`, `SeamlessSpliceSpec`,
+  `LocalTimeOffsetSpec`, `PmtStreamEntry`, `SdtServiceEntry`,
+  `NitTsEntry`, `EitEventEntry`, `SitServiceEntry`,
+  `AdaptationFieldSpec`, `AdaptationFieldExtensionSpec`,
+  `PesHeaderSpec`, `TStdConfig`, `TStdStreamModel`, `TsPacketLayout`);
+  and on every parsed record (the `descriptor::*Descriptor` / entry
+  structs, the PSI / SI tables, the ATSC PSIP tables, `TsPacket`,
+  `AdaptationField(Extension)`, `PesPacket` + its sub-records,
+  `TsProgram`, `RandomAccessPoint`, the t-STD and validation reports).
+  Spec-fixed small code enums (`FieldId`, `CoefficientSelection`,
+  `DsmTrickMode`, `RunningStatus`, `HierarchyType`, `DccContext`) and the
+  value types `EitDateTime`, `EitDuration`, `Iso639Language`, `Pcr` stay
+  as they were.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.3...v0.0.4) - 2026-10-24
 
 ### Other

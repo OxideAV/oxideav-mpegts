@@ -143,6 +143,7 @@ pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> CoreResult<Bo
 /// Seamless-splice signalling carried in the adaptation-field
 /// extension across a splice countdown (§2.4.3.5 / Annex K.1.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SeamlessSpliceSpec {
     /// 4-bit `splice_type` — the Table 2-7..2-16 splice-conditions
     /// index the video elementary stream honours. Shall be `0` when
@@ -152,6 +153,30 @@ pub struct SeamlessSpliceSpec {
     /// access unit after the splicing point, on the time base valid in
     /// the packet where the countdown reaches zero (§2.4.3.5).
     pub dts_next_au: u64,
+}
+
+impl SeamlessSpliceSpec {
+    /// Build a [`SeamlessSpliceSpec`] from every field.
+    pub fn new(splice_type: u8, dts_next_au: u64) -> Self {
+        Self {
+            splice_type,
+            dts_next_au,
+        }
+    }
+
+    /// Builder: set [`splice_type`](Self::splice_type).
+    #[must_use]
+    pub fn with_splice_type(mut self, v: u8) -> Self {
+        self.splice_type = v;
+        self
+    }
+
+    /// Builder: set [`dts_next_au`](Self::dts_next_au).
+    #[must_use]
+    pub fn with_dts_next_au(mut self, v: u64) -> Self {
+        self.dts_next_au = v;
+        self
+    }
 }
 
 /// A splice-point request for one stream, applied to the **next**
@@ -171,6 +196,7 @@ pub struct SeamlessSpliceSpec {
 /// caller's contract; the container layer cannot verify codec
 /// payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SpliceSpec {
     /// Seamless-splice info (§2.4.3.5 / Annex K.1.2). When set, every
     /// countdown-annotated packet also carries the adaptation-field
@@ -185,11 +211,28 @@ pub struct SpliceSpec {
     pub post_splice_packets: u8,
 }
 
+impl SpliceSpec {
+    /// Builder: set [`seamless`](Self::seamless).
+    #[must_use]
+    pub fn with_seamless(mut self, v: Option<SeamlessSpliceSpec>) -> Self {
+        self.seamless = v;
+        self
+    }
+
+    /// Builder: set [`post_splice_packets`](Self::post_splice_packets).
+    #[must_use]
+    pub fn with_post_splice_packets(mut self, v: u8) -> Self {
+        self.post_splice_packets = v;
+        self
+    }
+}
+
 /// Human-readable service metadata carried in the DVB SDT for one
 /// program (ETSI EN 300 468 §5.2.3 / §6.2.33). When a [`ProgramSpec`]
 /// carries one, the muxer emits an SDT `service_descriptor` for the
 /// program so a receiver can label the channel.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ServiceSpec {
     /// `service_type` (Table 89) — e.g. `0x01` digital TV, `0x02` radio,
     /// `0x19` H.264 HD, `0x1F` HEVC.
@@ -200,10 +243,43 @@ pub struct ServiceSpec {
     pub service_name: Vec<u8>,
 }
 
+impl ServiceSpec {
+    /// Build a [`ServiceSpec`] from every field.
+    pub fn new(service_type: u8, provider_name: Vec<u8>, service_name: Vec<u8>) -> Self {
+        Self {
+            service_type,
+            provider_name,
+            service_name,
+        }
+    }
+
+    /// Builder: set [`service_type`](Self::service_type).
+    #[must_use]
+    pub fn with_service_type(mut self, v: u8) -> Self {
+        self.service_type = v;
+        self
+    }
+
+    /// Builder: set [`provider_name`](Self::provider_name).
+    #[must_use]
+    pub fn with_provider_name(mut self, v: Vec<u8>) -> Self {
+        self.provider_name = v;
+        self
+    }
+
+    /// Builder: set [`service_name`](Self::service_name).
+    #[must_use]
+    pub fn with_service_name(mut self, v: Vec<u8>) -> Self {
+        self.service_name = v;
+        self
+    }
+}
+
 /// A present/following event described for one program in the DVB EIT
 /// (ETSI EN 300 468 §5.2.4). The muxer emits a `short_event_descriptor`
 /// for the event when `event_name` / `text` are non-empty.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EventSpec {
     /// 16-bit `event_id`, unique within the service.
     pub event_id: u16,
@@ -223,6 +299,78 @@ pub struct EventSpec {
     pub text: Vec<u8>,
 }
 
+impl EventSpec {
+    /// Builder: set [`event_id`](Self::event_id).
+    #[must_use]
+    pub fn with_event_id(mut self, v: u16) -> Self {
+        self.event_id = v;
+        self
+    }
+
+    /// Builder: set [`start_time`](Self::start_time).
+    #[must_use]
+    pub fn with_start_time(mut self, v: Option<crate::psi::EitDateTime>) -> Self {
+        self.start_time = v;
+        self
+    }
+
+    /// Builder: set [`duration`](Self::duration).
+    #[must_use]
+    pub fn with_duration(mut self, v: crate::psi::EitDuration) -> Self {
+        self.duration = v;
+        self
+    }
+
+    /// Builder: set [`running_status`](Self::running_status).
+    #[must_use]
+    pub fn with_running_status(mut self, v: crate::psi::RunningStatus) -> Self {
+        self.running_status = v;
+        self
+    }
+
+    /// Builder: set [`language`](Self::language).
+    #[must_use]
+    pub fn with_language(mut self, v: [u8; 3]) -> Self {
+        self.language = v;
+        self
+    }
+
+    /// Builder: set [`event_name`](Self::event_name).
+    #[must_use]
+    pub fn with_event_name(mut self, v: Vec<u8>) -> Self {
+        self.event_name = v;
+        self
+    }
+
+    /// Builder: set [`text`](Self::text).
+    #[must_use]
+    pub fn with_text(mut self, v: Vec<u8>) -> Self {
+        self.text = v;
+        self
+    }
+}
+
+impl EventSpec {
+    /// An event `event_id` of `duration` in `running_status`, tagged
+    /// `language`, with no start time, name or text.
+    pub fn new(
+        event_id: u16,
+        duration: crate::psi::EitDuration,
+        running_status: crate::psi::RunningStatus,
+        language: [u8; 3],
+    ) -> Self {
+        Self {
+            event_id,
+            start_time: None,
+            duration,
+            running_status,
+            language,
+            event_name: Vec::new(),
+            text: Vec::new(),
+        }
+    }
+}
+
 /// One program of a multi-program transport stream.
 ///
 /// A program groups a set of the muxer's input streams (by their
@@ -230,6 +378,7 @@ pub struct EventSpec {
 /// its own PCR PID. The PAT gains one `(program_number, pmt_pid)` entry
 /// per spec, and each program's PMT is emitted on its own PID.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProgramSpec {
     /// `program_number` advertised in the PAT + carried in the PMT's
     /// `table_id_extension`. Must be non-zero (0 is the network PID).
@@ -258,11 +407,79 @@ pub struct ProgramSpec {
     pub es_descriptors: Vec<(u32, Vec<u8>)>,
 }
 
+impl ProgramSpec {
+    /// Builder: set [`program_number`](Self::program_number).
+    #[must_use]
+    pub fn with_program_number(mut self, v: u16) -> Self {
+        self.program_number = v;
+        self
+    }
+
+    /// Builder: set [`pmt_pid`](Self::pmt_pid).
+    #[must_use]
+    pub fn with_pmt_pid(mut self, v: u16) -> Self {
+        self.pmt_pid = v;
+        self
+    }
+
+    /// Builder: set [`pcr_pid`](Self::pcr_pid).
+    #[must_use]
+    pub fn with_pcr_pid(mut self, v: Option<u16>) -> Self {
+        self.pcr_pid = v;
+        self
+    }
+
+    /// Builder: set [`stream_indices`](Self::stream_indices).
+    #[must_use]
+    pub fn with_stream_indices(mut self, v: Vec<u32>) -> Self {
+        self.stream_indices = v;
+        self
+    }
+
+    /// Builder: set [`service`](Self::service).
+    #[must_use]
+    pub fn with_service(mut self, v: Option<ServiceSpec>) -> Self {
+        self.service = v;
+        self
+    }
+
+    /// Builder: set [`events`](Self::events).
+    #[must_use]
+    pub fn with_events(mut self, v: Vec<EventSpec>) -> Self {
+        self.events = v;
+        self
+    }
+
+    /// Builder: set [`es_descriptors`](Self::es_descriptors).
+    #[must_use]
+    pub fn with_es_descriptors(mut self, v: Vec<(u32, Vec<u8>)>) -> Self {
+        self.es_descriptors = v;
+        self
+    }
+}
+
+impl ProgramSpec {
+    /// Program `program_number` whose PMT rides `pmt_pid`, with no PCR
+    /// override, no streams, no service, no events and no ES descriptors.
+    pub fn new(program_number: u16, pmt_pid: u16) -> Self {
+        Self {
+            program_number,
+            pmt_pid,
+            pcr_pid: None,
+            stream_indices: Vec::new(),
+            service: None,
+            events: Vec::new(),
+            es_descriptors: Vec::new(),
+        }
+    }
+}
+
 /// Network metadata carried in the DVB NIT (ETSI EN 300 468 §5.2.1). When
 /// a [`MpegTsMuxConfig`] carries one, the muxer emits a NIT on PID 0x0010
 /// naming the network and listing this transport stream (optionally with
 /// delivery-system / service-list descriptors supplied verbatim).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NetworkSpec {
     /// 16-bit `network_id` (rides the NIT `table_id_extension`).
     pub network_id: u16,
@@ -277,6 +494,48 @@ pub struct NetworkSpec {
     pub transport_descriptors: Vec<u8>,
 }
 
+impl NetworkSpec {
+    /// Builder: set [`network_id`](Self::network_id).
+    #[must_use]
+    pub fn with_network_id(mut self, v: u16) -> Self {
+        self.network_id = v;
+        self
+    }
+
+    /// Builder: set [`network_name`](Self::network_name).
+    #[must_use]
+    pub fn with_network_name(mut self, v: Vec<u8>) -> Self {
+        self.network_name = v;
+        self
+    }
+
+    /// Builder: set [`network_descriptors`](Self::network_descriptors).
+    #[must_use]
+    pub fn with_network_descriptors(mut self, v: Vec<u8>) -> Self {
+        self.network_descriptors = v;
+        self
+    }
+
+    /// Builder: set [`transport_descriptors`](Self::transport_descriptors).
+    #[must_use]
+    pub fn with_transport_descriptors(mut self, v: Vec<u8>) -> Self {
+        self.transport_descriptors = v;
+        self
+    }
+}
+
+impl NetworkSpec {
+    /// Network `network_id` with an empty name and no descriptors.
+    pub fn new(network_id: u16) -> Self {
+        Self {
+            network_id,
+            network_name: Vec::new(),
+            network_descriptors: Vec::new(),
+            transport_descriptors: Vec::new(),
+        }
+    }
+}
+
 /// Wall-clock metadata carried in the DVB TDT / TOT (EN 300 468 §5.2.5
 /// / §5.2.6). When a [`MpegTsMuxConfig`] carries one, the muxer emits a
 /// Time and Date Table on PID 0x0014 at the header and — advanced by
@@ -286,6 +545,7 @@ pub struct NetworkSpec {
 /// non-empty a Time Offset Table follows each TDT, carrying the
 /// `local_time_offset_descriptor`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TimeSpec {
     /// The UTC wall-clock instant corresponding to the first written
     /// frame's PTS (the stream's capture / transmission start).
@@ -295,9 +555,36 @@ pub struct TimeSpec {
     pub offsets: Vec<crate::build::LocalTimeOffsetSpec>,
 }
 
+impl TimeSpec {
+    /// Builder: set [`utc_time`](Self::utc_time).
+    #[must_use]
+    pub fn with_utc_time(mut self, v: crate::psi::EitDateTime) -> Self {
+        self.utc_time = v;
+        self
+    }
+
+    /// Builder: set [`offsets`](Self::offsets).
+    #[must_use]
+    pub fn with_offsets(mut self, v: Vec<crate::build::LocalTimeOffsetSpec>) -> Self {
+        self.offsets = v;
+        self
+    }
+}
+
+impl TimeSpec {
+    /// A TDT / TOT at `utc_time` with no local-time offsets.
+    pub fn new(utc_time: crate::psi::EitDateTime) -> Self {
+        Self {
+            utc_time,
+            offsets: Vec::new(),
+        }
+    }
+}
+
 /// Multi-program muxer configuration passed to
 /// [`MpegTsMuxer::with_config`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MpegTsMuxConfig {
     /// `transport_stream_id` carried in the PAT (and SDT, when emitted).
     pub transport_stream_id: u16,
@@ -316,6 +603,50 @@ pub struct MpegTsMuxConfig {
     /// Optional wall-clock anchor → a TDT (and, with offsets, a TOT)
     /// on PID 0x0014.
     pub time: Option<TimeSpec>,
+}
+
+impl MpegTsMuxConfig {
+    /// Builder: set [`transport_stream_id`](Self::transport_stream_id).
+    #[must_use]
+    pub fn with_transport_stream_id(mut self, v: u16) -> Self {
+        self.transport_stream_id = v;
+        self
+    }
+
+    /// Builder: set [`original_network_id`](Self::original_network_id).
+    #[must_use]
+    pub fn with_original_network_id(mut self, v: u16) -> Self {
+        self.original_network_id = v;
+        self
+    }
+
+    /// Builder: set [`programs`](Self::programs).
+    #[must_use]
+    pub fn with_programs(mut self, v: Vec<ProgramSpec>) -> Self {
+        self.programs = v;
+        self
+    }
+
+    /// Builder: set [`network`](Self::network).
+    #[must_use]
+    pub fn with_network(mut self, v: Option<NetworkSpec>) -> Self {
+        self.network = v;
+        self
+    }
+
+    /// Builder: set [`ca_descriptors`](Self::ca_descriptors).
+    #[must_use]
+    pub fn with_ca_descriptors(mut self, v: Vec<u8>) -> Self {
+        self.ca_descriptors = v;
+        self
+    }
+
+    /// Builder: set [`time`](Self::time).
+    #[must_use]
+    pub fn with_time(mut self, v: Option<TimeSpec>) -> Self {
+        self.time = v;
+        self
+    }
 }
 
 impl Default for MpegTsMuxConfig {

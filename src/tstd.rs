@@ -72,6 +72,7 @@ const TIME_EPS: f64 = 1e-6;
 
 /// The downstream shape of one elementary stream's T-STD branch.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum TStdBranch {
     /// Audio / system-style: `TBn → Bn`, whole access units removed
     /// at their decode time (§2.4.2.3 "Buffer BSn").
@@ -92,11 +93,33 @@ pub enum TStdBranch {
 
 /// T-STD parameters for one elementary stream.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TStdStreamModel {
     /// Transport-buffer drain rate `Rxn` in bit/s.
     pub rx_bps: u64,
     /// The downstream buffer chain.
     pub branch: TStdBranch,
+}
+
+impl TStdStreamModel {
+    /// Build a [`TStdStreamModel`] from every field.
+    pub fn new(rx_bps: u64, branch: TStdBranch) -> Self {
+        Self { rx_bps, branch }
+    }
+
+    /// Builder: set [`rx_bps`](Self::rx_bps).
+    #[must_use]
+    pub fn with_rx_bps(mut self, v: u64) -> Self {
+        self.rx_bps = v;
+        self
+    }
+
+    /// Builder: set [`branch`](Self::branch).
+    #[must_use]
+    pub fn with_branch(mut self, v: TStdBranch) -> Self {
+        self.branch = v;
+        self
+    }
 }
 
 impl TStdStreamModel {
@@ -160,6 +183,7 @@ impl TStdStreamModel {
 /// Configuration for one [`analyze_tstd`] run — the T-STD decodes one
 /// program at a time (§2.4.2.2).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TStdConfig {
     /// The program's `PCR_PID` — drives the §2.4.2.2 arrival clock.
     pub pcr_pid: u16,
@@ -169,6 +193,29 @@ pub struct TStdConfig {
     /// names PID 0, PID 1, and the selected program's
     /// `program_map_PID`. The NIT PID is explicitly *not* transferred.
     pub system_pids: Vec<u16>,
+}
+
+impl TStdConfig {
+    /// Builder: set [`pcr_pid`](Self::pcr_pid).
+    #[must_use]
+    pub fn with_pcr_pid(mut self, v: u16) -> Self {
+        self.pcr_pid = v;
+        self
+    }
+
+    /// Builder: set [`streams`](Self::streams).
+    #[must_use]
+    pub fn with_streams(mut self, v: Vec<(u16, TStdStreamModel)>) -> Self {
+        self.streams = v;
+        self
+    }
+
+    /// Builder: set [`system_pids`](Self::system_pids).
+    #[must_use]
+    pub fn with_system_pids(mut self, v: Vec<u16>) -> Self {
+        self.system_pids = v;
+        self
+    }
 }
 
 impl TStdConfig {
@@ -191,6 +238,7 @@ impl TStdConfig {
 /// pair is kept (the first, with the worst figure updated in place);
 /// [`TStdReport::violation_events`] counts every occurrence.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum TStdViolation {
     /// `TBn` (or `TBsys` for `pid == None`… reported with its PID
     /// here) exceeded its fixed 512-byte size.
@@ -256,6 +304,7 @@ impl TStdViolation {
 
 /// Per-stream occupancy statistics.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TStdChainStats {
     /// The elementary PID (or the first system PID for the system
     /// chain).
@@ -275,6 +324,7 @@ pub struct TStdChainStats {
 
 /// The outcome of one [`analyze_tstd`] replay.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TStdReport {
     /// First violation per `(rule, PID)`, worst figure kept.
     pub violations: Vec<TStdViolation>,

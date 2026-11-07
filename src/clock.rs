@@ -160,6 +160,7 @@ impl Pcr {
 
 /// Why a [`PcrTracker`] reported a discontinuity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DiscontinuityReason {
     /// Stream signalled it explicitly — adaptation field carried
     /// `discontinuity_indicator = 1` on a PCR-bearing packet.
@@ -180,6 +181,7 @@ pub enum DiscontinuityReason {
 
 /// Outcome of feeding one packet to a [`PcrTracker`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum PcrEvent {
     /// Packet carried a PCR and it was within the tolerance window —
     /// `jitter_27mhz` is the signed residual against the running
@@ -405,6 +407,7 @@ fn compute_bitrate_bps(delta_pcr_27mhz: i64, delta_bytes: u64) -> u64 {
 
 /// Outcome of feeding one packet to a [`ContinuityTracker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContinuityEvent {
     /// CC differs from previous by exactly 1 mod 16 (or this is the
     /// first packet) — the expected case.
@@ -544,6 +547,7 @@ const TIMESTAMP_WRAP_THRESHOLD_90KHZ: u64 = TIMESTAMP_MODULUS_90KHZ / 2;
 /// Classification of one PTS or DTS observation on a PID, returned by
 /// [`PtsTracker::observe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TimestampEvent {
     /// The first timestamp seen on the PID — establishes the anchor.
     First,

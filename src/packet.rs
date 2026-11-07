@@ -43,6 +43,7 @@ pub const TS_SYNC_BYTE: u8 = 0x47;
 
 /// Parsed adaptation field accompanying a TS packet.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AdaptationField<'a> {
     /// Value of the `adaptation_field_length` byte. Counts the bytes
     /// that follow it within the adaptation field (so the AF occupies
@@ -93,6 +94,7 @@ pub struct AdaptationField<'a> {
 
 /// Parsed `adaptation_field_extension` body (§2.4.3.5, Table 2-6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdaptationFieldExtension {
     /// Value of the `adaptation_field_extension_length` byte (count of
     /// bytes after it, including reserved padding).
@@ -121,6 +123,7 @@ pub struct AdaptationFieldExtension {
 
 /// A parsed 188-byte TS packet.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct TsPacket<'a> {
     /// 13-bit PID identifying the packet's elementary stream / PSI
     /// section.
@@ -527,6 +530,7 @@ fn parse_extension(raw: &[u8], cursor: &mut usize) -> Result<AdaptationFieldExte
 /// [`detect_packet_layout`] recognises all three; the demuxer strips
 /// the framing and hands every consumer the plain 188-byte window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TsPacketLayout {
     /// Total bytes per physical packet: 188, 192, or 204.
     pub packet_size: usize,
@@ -534,6 +538,16 @@ pub struct TsPacketLayout {
     /// 188-byte packet) inside each physical packet: 4 for the
     /// prefixed 192-byte form, 0 otherwise.
     pub sync_offset: usize,
+}
+
+impl TsPacketLayout {
+    /// Build a [`TsPacketLayout`] from every field.
+    pub fn new(packet_size: usize, sync_offset: usize) -> Self {
+        Self {
+            packet_size,
+            sync_offset,
+        }
+    }
 }
 
 impl TsPacketLayout {
@@ -625,6 +639,7 @@ pub fn encode_clock_reference(base: u64, extension: u16) -> [u8; 6] {
 /// (§2.4.3.4 Table 2-6 / §2.4.3.5). Mirror of the parsed
 /// [`AdaptationFieldExtension`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdaptationFieldExtensionSpec {
     /// `(ltw_valid_flag, ltw_offset)` — the 15-bit legal-time-window
     /// offset in `(300/fs)`-second units; the offset value is defined
@@ -643,6 +658,29 @@ pub struct AdaptationFieldExtensionSpec {
 }
 
 impl AdaptationFieldExtensionSpec {
+    /// Builder: set [`ltw`](Self::ltw).
+    #[must_use]
+    pub fn with_ltw(mut self, v: Option<(bool, u16)>) -> Self {
+        self.ltw = v;
+        self
+    }
+
+    /// Builder: set [`piecewise_rate`](Self::piecewise_rate).
+    #[must_use]
+    pub fn with_piecewise_rate(mut self, v: Option<u32>) -> Self {
+        self.piecewise_rate = v;
+        self
+    }
+
+    /// Builder: set [`seamless_splice`](Self::seamless_splice).
+    #[must_use]
+    pub fn with_seamless_splice(mut self, v: Option<(u8, u64)>) -> Self {
+        self.seamless_splice = v;
+        self
+    }
+}
+
+impl AdaptationFieldExtensionSpec {
     /// `true` when no optional sub-field is present.
     pub fn is_empty(&self) -> bool {
         self.ltw.is_none() && self.piecewise_rate.is_none() && self.seamless_splice.is_none()
@@ -653,6 +691,7 @@ impl AdaptationFieldExtensionSpec {
 /// Table 2-6). [`Self::encode`] emits the wire bytes, which round-trip
 /// through [`TsPacket::parse`] / the [`AdaptationField`] view.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdaptationFieldSpec {
     /// `discontinuity_indicator` (§2.4.3.5 — time-base or
     /// continuity-counter discontinuity state).
@@ -678,6 +717,57 @@ pub struct AdaptationFieldSpec {
     /// Optional `adaptation_field_extension` body. A `Some` with all
     /// sub-fields `None` still emits the (legal) empty extension.
     pub extension: Option<AdaptationFieldExtensionSpec>,
+}
+
+impl AdaptationFieldSpec {
+    /// Builder: set [`discontinuity_indicator`](Self::discontinuity_indicator).
+    #[must_use]
+    pub fn with_discontinuity_indicator(mut self, v: bool) -> Self {
+        self.discontinuity_indicator = v;
+        self
+    }
+
+    /// Builder: set [`random_access_indicator`](Self::random_access_indicator).
+    #[must_use]
+    pub fn with_random_access_indicator(mut self, v: bool) -> Self {
+        self.random_access_indicator = v;
+        self
+    }
+
+    /// Builder: set [`elementary_stream_priority_indicator`](Self::elementary_stream_priority_indicator).
+    #[must_use]
+    pub fn with_elementary_stream_priority_indicator(mut self, v: bool) -> Self {
+        self.elementary_stream_priority_indicator = v;
+        self
+    }
+
+    /// Builder: set [`opcr`](Self::opcr).
+    #[must_use]
+    pub fn with_opcr(mut self, v: Option<(u64, u16)>) -> Self {
+        self.opcr = v;
+        self
+    }
+
+    /// Builder: set [`splice_countdown`](Self::splice_countdown).
+    #[must_use]
+    pub fn with_splice_countdown(mut self, v: Option<i8>) -> Self {
+        self.splice_countdown = v;
+        self
+    }
+
+    /// Builder: set [`transport_private_data`](Self::transport_private_data).
+    #[must_use]
+    pub fn with_transport_private_data(mut self, v: Option<Vec<u8>>) -> Self {
+        self.transport_private_data = v;
+        self
+    }
+
+    /// Builder: set [`extension`](Self::extension).
+    #[must_use]
+    pub fn with_extension(mut self, v: Option<AdaptationFieldExtensionSpec>) -> Self {
+        self.extension = v;
+        self
+    }
 }
 
 impl AdaptationFieldSpec {

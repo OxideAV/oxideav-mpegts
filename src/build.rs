@@ -360,6 +360,7 @@ pub fn parental_rating_descriptor(entries: &[([u8; 3], u8)]) -> Vec<u8> {
 /// mirror of [`crate::descriptor::LocalTimeOffsetEntry`], minus the raw
 /// MJD bookkeeping the parser preserves).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct LocalTimeOffsetSpec {
     /// 3-byte ISO 3166 alpha-3 country code (e.g. `b"GBR"`).
     pub country_code: [u8; 3],
@@ -375,6 +376,69 @@ pub struct LocalTimeOffsetSpec {
     pub time_of_change: Option<EitDateTime>,
     /// Offset in force after `time_of_change`, in whole minutes.
     pub next_time_offset_minutes: u16,
+}
+
+impl LocalTimeOffsetSpec {
+    /// Build a [`LocalTimeOffsetSpec`] from every field.
+    pub fn new(
+        country_code: [u8; 3],
+        country_region_id: u8,
+        offset_negative: bool,
+        local_time_offset_minutes: u16,
+        time_of_change: Option<EitDateTime>,
+        next_time_offset_minutes: u16,
+    ) -> Self {
+        Self {
+            country_code,
+            country_region_id,
+            offset_negative,
+            local_time_offset_minutes,
+            time_of_change,
+            next_time_offset_minutes,
+        }
+    }
+
+    /// Builder: set [`country_code`](Self::country_code).
+    #[must_use]
+    pub fn with_country_code(mut self, v: [u8; 3]) -> Self {
+        self.country_code = v;
+        self
+    }
+
+    /// Builder: set [`country_region_id`](Self::country_region_id).
+    #[must_use]
+    pub fn with_country_region_id(mut self, v: u8) -> Self {
+        self.country_region_id = v;
+        self
+    }
+
+    /// Builder: set [`offset_negative`](Self::offset_negative).
+    #[must_use]
+    pub fn with_offset_negative(mut self, v: bool) -> Self {
+        self.offset_negative = v;
+        self
+    }
+
+    /// Builder: set [`local_time_offset_minutes`](Self::local_time_offset_minutes).
+    #[must_use]
+    pub fn with_local_time_offset_minutes(mut self, v: u16) -> Self {
+        self.local_time_offset_minutes = v;
+        self
+    }
+
+    /// Builder: set [`time_of_change`](Self::time_of_change).
+    #[must_use]
+    pub fn with_time_of_change(mut self, v: Option<EitDateTime>) -> Self {
+        self.time_of_change = v;
+        self
+    }
+
+    /// Builder: set [`next_time_offset_minutes`](Self::next_time_offset_minutes).
+    #[must_use]
+    pub fn with_next_time_offset_minutes(mut self, v: u16) -> Self {
+        self.next_time_offset_minutes = v;
+        self
+    }
 }
 
 /// Encode a whole-minutes offset as the §6.2.20 16-bit BCD `HHMM` pair.
@@ -487,6 +551,7 @@ pub fn build_pat(transport_stream_id: u16, version: u8, programs: &[(u16, u16)])
 /// and the pre-built `ES_info` descriptor loop (concatenated descriptor
 /// TLVs — see the `*_descriptor` builders).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PmtStreamEntry {
     /// ISO/IEC 13818-1 Table 2-29 `stream_type`.
     pub stream_type: u8,
@@ -494,6 +559,38 @@ pub struct PmtStreamEntry {
     pub elementary_pid: u16,
     /// Pre-assembled `ES_info` descriptor loop bytes.
     pub es_info: Vec<u8>,
+}
+
+impl PmtStreamEntry {
+    /// Build a [`PmtStreamEntry`] from every field.
+    pub fn new(stream_type: u8, elementary_pid: u16, es_info: Vec<u8>) -> Self {
+        Self {
+            stream_type,
+            elementary_pid,
+            es_info,
+        }
+    }
+
+    /// Builder: set [`stream_type`](Self::stream_type).
+    #[must_use]
+    pub fn with_stream_type(mut self, v: u8) -> Self {
+        self.stream_type = v;
+        self
+    }
+
+    /// Builder: set [`elementary_pid`](Self::elementary_pid).
+    #[must_use]
+    pub fn with_elementary_pid(mut self, v: u16) -> Self {
+        self.elementary_pid = v;
+        self
+    }
+
+    /// Builder: set [`es_info`](Self::es_info).
+    #[must_use]
+    pub fn with_es_info(mut self, v: Vec<u8>) -> Self {
+        self.es_info = v;
+        self
+    }
 }
 
 /// Build a Program Map Table section (§2.4.4.8) for one program.
@@ -526,6 +623,7 @@ pub fn build_pmt(
 
 /// One service entry for a Service Description Table (EN 300 468 §5.2.3).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SdtServiceEntry {
     /// 16-bit `service_id` (equals the PMT `program_number`).
     pub service_id: u16,
@@ -539,6 +637,65 @@ pub struct SdtServiceEntry {
     pub free_ca_mode: bool,
     /// Per-service descriptor loop (typically a `service_descriptor`).
     pub descriptors: Vec<u8>,
+}
+
+impl SdtServiceEntry {
+    /// Builder: set [`service_id`](Self::service_id).
+    #[must_use]
+    pub fn with_service_id(mut self, v: u16) -> Self {
+        self.service_id = v;
+        self
+    }
+
+    /// Builder: set [`eit_schedule`](Self::eit_schedule).
+    #[must_use]
+    pub fn with_eit_schedule(mut self, v: bool) -> Self {
+        self.eit_schedule = v;
+        self
+    }
+
+    /// Builder: set [`eit_present_following`](Self::eit_present_following).
+    #[must_use]
+    pub fn with_eit_present_following(mut self, v: bool) -> Self {
+        self.eit_present_following = v;
+        self
+    }
+
+    /// Builder: set [`running_status`](Self::running_status).
+    #[must_use]
+    pub fn with_running_status(mut self, v: RunningStatus) -> Self {
+        self.running_status = v;
+        self
+    }
+
+    /// Builder: set [`free_ca_mode`](Self::free_ca_mode).
+    #[must_use]
+    pub fn with_free_ca_mode(mut self, v: bool) -> Self {
+        self.free_ca_mode = v;
+        self
+    }
+
+    /// Builder: set [`descriptors`](Self::descriptors).
+    #[must_use]
+    pub fn with_descriptors(mut self, v: Vec<u8>) -> Self {
+        self.descriptors = v;
+        self
+    }
+}
+
+impl SdtServiceEntry {
+    /// Service `service_id` in `running_status`, with every flag clear
+    /// and no descriptors.
+    pub fn new(service_id: u16, running_status: RunningStatus) -> Self {
+        Self {
+            service_id,
+            eit_schedule: false,
+            eit_present_following: false,
+            running_status,
+            free_ca_mode: false,
+            descriptors: Vec::new(),
+        }
+    }
 }
 
 /// Build a DVB Service Description Table section (EN 300 468 §5.2.3).
@@ -584,6 +741,7 @@ pub fn build_sdt(
 
 /// One `transport_stream_loop` entry for a NIT (EN 300 468 §5.2.1).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NitTsEntry {
     /// 16-bit `transport_stream_id`.
     pub transport_stream_id: u16,
@@ -591,6 +749,38 @@ pub struct NitTsEntry {
     pub original_network_id: u16,
     /// Per-TS descriptor loop (delivery-system / service_list, etc.).
     pub descriptors: Vec<u8>,
+}
+
+impl NitTsEntry {
+    /// Build a [`NitTsEntry`] from every field.
+    pub fn new(transport_stream_id: u16, original_network_id: u16, descriptors: Vec<u8>) -> Self {
+        Self {
+            transport_stream_id,
+            original_network_id,
+            descriptors,
+        }
+    }
+
+    /// Builder: set [`transport_stream_id`](Self::transport_stream_id).
+    #[must_use]
+    pub fn with_transport_stream_id(mut self, v: u16) -> Self {
+        self.transport_stream_id = v;
+        self
+    }
+
+    /// Builder: set [`original_network_id`](Self::original_network_id).
+    #[must_use]
+    pub fn with_original_network_id(mut self, v: u16) -> Self {
+        self.original_network_id = v;
+        self
+    }
+
+    /// Builder: set [`descriptors`](Self::descriptors).
+    #[must_use]
+    pub fn with_descriptors(mut self, v: Vec<u8>) -> Self {
+        self.descriptors = v;
+        self
+    }
 }
 
 /// Build a DVB Network Information Table section (EN 300 468 §5.2.1).
@@ -630,6 +820,7 @@ pub fn build_nit(
 
 /// One event entry for a present/following EIT (EN 300 468 §5.2.4).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EitEventEntry {
     /// 16-bit `event_id`.
     pub event_id: u16,
@@ -643,6 +834,65 @@ pub struct EitEventEntry {
     pub free_ca_mode: bool,
     /// Per-event descriptor loop (typically a `short_event_descriptor`).
     pub descriptors: Vec<u8>,
+}
+
+impl EitEventEntry {
+    /// Builder: set [`event_id`](Self::event_id).
+    #[must_use]
+    pub fn with_event_id(mut self, v: u16) -> Self {
+        self.event_id = v;
+        self
+    }
+
+    /// Builder: set [`start_time`](Self::start_time).
+    #[must_use]
+    pub fn with_start_time(mut self, v: Option<EitDateTime>) -> Self {
+        self.start_time = v;
+        self
+    }
+
+    /// Builder: set [`duration`](Self::duration).
+    #[must_use]
+    pub fn with_duration(mut self, v: EitDuration) -> Self {
+        self.duration = v;
+        self
+    }
+
+    /// Builder: set [`running_status`](Self::running_status).
+    #[must_use]
+    pub fn with_running_status(mut self, v: RunningStatus) -> Self {
+        self.running_status = v;
+        self
+    }
+
+    /// Builder: set [`free_ca_mode`](Self::free_ca_mode).
+    #[must_use]
+    pub fn with_free_ca_mode(mut self, v: bool) -> Self {
+        self.free_ca_mode = v;
+        self
+    }
+
+    /// Builder: set [`descriptors`](Self::descriptors).
+    #[must_use]
+    pub fn with_descriptors(mut self, v: Vec<u8>) -> Self {
+        self.descriptors = v;
+        self
+    }
+}
+
+impl EitEventEntry {
+    /// Event `event_id` of `duration` in `running_status`, with no start
+    /// time, `free_ca_mode` clear and no descriptors.
+    pub fn new(event_id: u16, duration: EitDuration, running_status: RunningStatus) -> Self {
+        Self {
+            event_id,
+            start_time: None,
+            duration,
+            running_status,
+            free_ca_mode: false,
+            descriptors: Vec::new(),
+        }
+    }
 }
 
 /// Build a DVB present/following Event Information Table section
@@ -736,6 +986,7 @@ pub fn build_bat(
 /// One service entry for a Selection Information Table (EN 300 468
 /// §7.1.2 Table 164).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SitServiceEntry {
     /// 16-bit `service_id` (equals the PMT `program_number`).
     pub service_id: u16,
@@ -743,6 +994,38 @@ pub struct SitServiceEntry {
     pub running_status: RunningStatus,
     /// Per-service descriptor loop.
     pub descriptors: Vec<u8>,
+}
+
+impl SitServiceEntry {
+    /// Build a [`SitServiceEntry`] from every field.
+    pub fn new(service_id: u16, running_status: RunningStatus, descriptors: Vec<u8>) -> Self {
+        Self {
+            service_id,
+            running_status,
+            descriptors,
+        }
+    }
+
+    /// Builder: set [`service_id`](Self::service_id).
+    #[must_use]
+    pub fn with_service_id(mut self, v: u16) -> Self {
+        self.service_id = v;
+        self
+    }
+
+    /// Builder: set [`running_status`](Self::running_status).
+    #[must_use]
+    pub fn with_running_status(mut self, v: RunningStatus) -> Self {
+        self.running_status = v;
+        self
+    }
+
+    /// Builder: set [`descriptors`](Self::descriptors).
+    #[must_use]
+    pub fn with_descriptors(mut self, v: Vec<u8>) -> Self {
+        self.descriptors = v;
+        self
+    }
 }
 
 /// Build a DVB Selection Information Table section (EN 300 468 §5.2.10 /

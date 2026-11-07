@@ -93,6 +93,7 @@ use crate::TsError;
 
 /// One descriptor decoded from a descriptor list.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Descriptor<'a> {
     /// 8-bit descriptor tag (Table 2-45).
     pub tag: u8,
@@ -105,6 +106,7 @@ pub struct Descriptor<'a> {
 
 /// Typed body for descriptors this module decodes.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DescriptorBody<'a> {
     /// `0x02` video_stream_descriptor (§2.6.2).
     VideoStream(VideoStreamDescriptor),
@@ -358,6 +360,7 @@ pub enum DescriptorBody<'a> {
 /// `time_of_change` instant let a player display wall-clock local time
 /// around a daylight-saving transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LocalTimeOffsetEntry {
     /// 24-bit `country_code` — three ISO 3166 alpha-3 characters, each
     /// coded as one ISO/IEC 8859-1 byte (e.g. `b"GBR"`), or the ASCII
@@ -393,6 +396,7 @@ pub struct LocalTimeOffsetEntry {
 /// including the next daylight-saving transition. The payload is a flat
 /// array of fixed-size [`LocalTimeOffsetEntry`] records.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LocalTimeOffsetDescriptor {
     /// Per-country / per-region offset entries, in wire order.
     pub entries: Vec<LocalTimeOffsetEntry>,
@@ -406,6 +410,7 @@ pub struct LocalTimeOffsetDescriptor {
 /// can attach a text description to it. Within one `program_map_section`
 /// each `stream_identifier_descriptor` carries a distinct value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StreamIdentifierDescriptor {
     /// 8-bit `component_tag` — the cross-reference key matching a
     /// `component_descriptor`'s `component_tag` field for this stream.
@@ -421,6 +426,7 @@ pub struct StreamIdentifierDescriptor {
 /// page identifiers an EN 300 743 decoder uses to select the composition
 /// (and optional ancillary) pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubtitlingEntry {
     /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
     /// coded as one ISO/IEC 8859-1 byte (e.g. `b"eng"`).
@@ -446,6 +452,7 @@ pub struct SubtitlingEntry {
 /// payload is a flat array of fixed 8-byte [`SubtitlingEntry`] records,
 /// one per language / subtitle service multiplexed in the stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubtitlingDescriptor {
     /// Per-language subtitle service entries, in wire order.
     pub entries: Vec<SubtitlingEntry>,
@@ -458,6 +465,7 @@ pub struct SubtitlingDescriptor {
 /// inside the elementary stream: its language, the `teletext_type`
 /// (Table 102), and the magazine + page number locating it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TeletextEntry {
     /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
     /// coded as one ISO/IEC 8859-1 byte.
@@ -481,6 +489,7 @@ pub struct TeletextEntry {
 /// [`TeletextEntry`] records, one per language / page multiplexed in the
 /// stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TeletextDescriptor {
     /// Per-language teletext page entries, in wire order.
     pub entries: Vec<TeletextEntry>,
@@ -494,6 +503,7 @@ pub struct TeletextDescriptor {
 /// flags byte, four optional 8-bit fields may follow, each gated by its
 /// flag; any remaining bytes are reserved `additional_info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Ac3Descriptor<'a> {
     /// `component_type` — set when `component_type_flag == 0b1`; mirrors
     /// the `component_descriptor` `component_type` for AC-3 (Table D.1).
@@ -520,6 +530,7 @@ pub struct Ac3Descriptor<'a> {
 /// plus three independent-substream flags, each gating an optional
 /// 8-bit field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EnhancedAc3Descriptor<'a> {
     /// `component_type` — set when `component_type_flag == 0b1`; the type
     /// of audio carried in independent substream 0 (Table D.1).
@@ -557,6 +568,7 @@ pub struct EnhancedAc3Descriptor<'a> {
 /// the sample-rate / bit-rate codes, the frame size, and the surround /
 /// LFE / extended-surround flags as a contiguous bitfield.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DtsDescriptor<'a> {
     /// 4-bit `sample_rate_code` — equivalent to SFREQ (Table G.2):
     /// `0b1000` = 44,1 kHz, `0b1101` = 48 kHz, `0b1110` = 96 kHz, etc.
@@ -590,6 +602,7 @@ pub struct DtsDescriptor<'a> {
 /// this crate exposes the raw nibbles so the caller maps them against
 /// whatever classification table its UI uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentNibble {
     /// 4-bit `content_nibble_level_1` — first level of the content
     /// identifier (Table 29). `0x0` = undefined, `0x1` = movie/drama,
@@ -613,6 +626,7 @@ pub struct ContentNibble {
 /// the raw nibble values plus the broadcaster-defined `user_byte` are
 /// surfaced directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentDescriptor {
     /// Genre-classification entries, in wire order.
     pub entries: Vec<ContentNibble>,
@@ -633,6 +647,7 @@ pub struct ContentDescriptor {
 /// to the caller. The bytes are exactly the `service_provider_name`
 /// and `service_name` runs as they appear on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServiceDescriptor<'a> {
     /// 8-bit `service_type` (Table 89). Common values: `0x01` digital
     /// television, `0x02` digital radio, `0x11` HD digital television,
@@ -660,6 +675,7 @@ pub struct ServiceDescriptor<'a> {
 /// caller. The bytes are exactly the `event_name` and `text` runs as
 /// they appear on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShortEventDescriptor<'a> {
     /// 24-bit `ISO_639_language_code` — three ISO 639-2 characters, each
     /// coded as one ISO/IEC 8859-1 byte (e.g. `b"eng"`, `b"fre"`).
@@ -681,6 +697,7 @@ pub struct ShortEventDescriptor<'a> {
 /// the character-table selection is left to the caller, as with every
 /// other DVB text field in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtendedEventItem<'a> {
     /// Raw `item_description_char` bytes (DVB text string, annex A).
     pub item_description: &'a [u8],
@@ -709,6 +726,7 @@ pub struct ExtendedEventItem<'a> {
 /// `item`, and `text` runs are exposed **raw** (DVB text string,
 /// annex A) so the caller chooses the character-table interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtendedEventDescriptor<'a> {
     /// 4-bit `descriptor_number` — the index of this descriptor within
     /// the associated set (the first is `0x0`).
@@ -740,6 +758,7 @@ pub struct ExtendedEventDescriptor<'a> {
 /// descriptors, the bytes are exposed **raw** (DVB text string, annex A)
 /// so the caller chooses the character-table interpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NetworkNameDescriptor<'a> {
     /// Raw `network_name` bytes (DVB text string, annex A) — the entire
     /// descriptor payload.
@@ -759,6 +778,7 @@ pub struct NetworkNameDescriptor<'a> {
 /// are exposed **raw** (DVB text string, annex A) so the caller chooses
 /// the character-table interpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BouquetNameDescriptor<'a> {
     /// Raw `bouquet_name` bytes (DVB text string, annex A) — the entire
     /// descriptor payload.
@@ -767,6 +787,7 @@ pub struct BouquetNameDescriptor<'a> {
 
 /// video_stream_descriptor body (§2.6.2 Table 2-46).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VideoStreamDescriptor {
     /// `multiple_frame_rate_flag`.
     pub multiple_frame_rate_flag: bool,
@@ -788,6 +809,7 @@ pub struct VideoStreamDescriptor {
 
 /// audio_stream_descriptor body (§2.6.4 Table 2-47).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AudioStreamDescriptor {
     /// `free_format_flag` — `1` when the bitrate is "free format".
     pub free_format_flag: bool,
@@ -817,6 +839,7 @@ pub struct AudioStreamDescriptor {
 /// per §2.6.7); `hierarchy_channel` is the intended transmission
 /// channel rank — lower values are the more robust channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HierarchyDescriptor {
     /// Typed `hierarchy_type` (Table 2-44). The wire value is preserved
     /// in the [`HierarchyType::Reserved`] / [`HierarchyType::Unknown`]
@@ -916,6 +939,7 @@ impl HierarchyType {
 
 /// CA_descriptor body (§2.6.16 Table 2-50).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaDescriptor<'a> {
     /// `CA_system_ID`.
     pub ca_system_id: u16,
@@ -937,6 +961,7 @@ pub struct Iso639Language {
 
 /// AVC_video_descriptor body (§2.6.64 Table 2-71).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AvcVideoDescriptor {
     /// `profile_idc`.
     pub profile_idc: u8,
@@ -972,6 +997,7 @@ pub struct AvcVideoDescriptor {
 /// caller selects the table based on the enclosing PMT entry's
 /// `stream_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DataStreamAlignmentDescriptor {
     /// Raw 8-bit `alignment_type` byte (Tables 2-47 / 2-48).
     pub alignment_type: u8,
@@ -1006,6 +1032,7 @@ pub struct DataStreamAlignmentDescriptor {
 /// Both size fields are big-endian 14-bit unsigned values; the table
 /// carries no reserved bits, so all 32 bits are payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TargetBackgroundGridDescriptor {
     /// `horizontal_size` (14 bits) — grid width in pixels.
     pub horizontal_size: u16,
@@ -1045,6 +1072,7 @@ pub struct TargetBackgroundGridDescriptor {
 /// Both offset fields are big-endian 14-bit unsigned values; the table
 /// carries no reserved bits, so all 32 bits are payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VideoWindowDescriptor {
     /// `horizontal_offset` (14 bits) — top-left X on the grid, in pixels.
     pub horizontal_offset: u16,
@@ -1062,6 +1090,7 @@ pub struct VideoWindowDescriptor {
 /// million (§2.6.21). When `clock_accuracy_integer == 0` the spec
 /// defines the accuracy as 30 ppm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SystemClockDescriptor {
     /// `external_clock_reference_indicator` — when `true`, the clock
     /// is derived from an external frequency reference at the decoder.
@@ -1082,6 +1111,7 @@ pub struct SystemClockDescriptor {
 /// `copyright_identifier` field) falls back to
 /// [`DescriptorBody::Raw`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CopyrightDescriptor<'a> {
     /// 32-bit `copyright_identifier` value obtained from the §2.9
     /// Registration Authority.
@@ -1096,6 +1126,7 @@ pub struct CopyrightDescriptor<'a> {
 /// `maximum_bitrate` is a 22-bit field in units of 50 bytes/s (§2.6.27).
 /// Multiply by 50 to get bytes/s, or by 400 to get bits/s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MaximumBitrateDescriptor {
     /// Raw 22-bit `maximum_bitrate` value (units of 50 bytes/s).
     pub maximum_bitrate: u32,
@@ -1129,6 +1160,7 @@ impl MaximumBitrateDescriptor {
 /// would overflow is a spec violation, not something this typed view
 /// enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SmoothingBufferDescriptor {
     /// Raw 22-bit `sb_leak_rate` value (units of 400 bits/s — i.e.
     /// the same 50 bytes/s units as `maximum_bitrate_descriptor`).
@@ -1167,6 +1199,7 @@ impl SmoothingBufferDescriptor {
 /// comes from a preceding `registration_descriptor` /
 /// `private_data_specifier_descriptor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrivateDataIndicatorDescriptor {
     /// 32-bit `private_data_indicator` — opaque.
     pub private_data_indicator: u32,
@@ -1178,6 +1211,7 @@ pub struct PrivateDataIndicatorDescriptor {
 /// elementary stream carried directly in PES packets (§2.11.2). Does
 /// not apply to 14496-2 streams inside SL packets or FlexMux packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mpeg4VideoDescriptor {
     /// 8-bit `MPEG-4_visual_profile_and_level` — same coding as the
     /// `profile_and_level_indication` of the stream's Visual Object
@@ -1191,6 +1225,7 @@ pub struct Mpeg4VideoDescriptor {
 /// elementary stream carried directly in PES packets (§2.11.2). Does
 /// not apply to 14496-3 streams inside SL packets or FlexMux packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mpeg4AudioDescriptor {
     /// 8-bit `MPEG-4_audio_profile_and_level`, coded per Table 2-62 —
     /// see [`Self::classification`].
@@ -1229,6 +1264,7 @@ impl Mpeg4AudioDescriptor {
 /// The InitialObjectDescriptor's internal structure belongs to
 /// ISO/IEC 14496-1 and is surfaced as raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IodDescriptor<'a> {
     /// 8-bit `Scope_of_IOD_label` (§2.6.41) — `0x10`: the label is
     /// unique within this program; `0x11`: unique within the whole
@@ -1247,6 +1283,7 @@ pub struct IodDescriptor<'a> {
 /// SL-packetized stream is encapsulated in PES packets; binds that
 /// stream's `ES_ID` to the `elementary_PID`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SlDescriptor {
     /// 16-bit `ES_ID` of the SL-packetized stream.
     pub es_id: u16,
@@ -1255,6 +1292,7 @@ pub struct SlDescriptor {
 /// One `(ES_ID, FlexMuxChannel)` entry of an [`FmcDescriptor`]
 /// (§2.6.44).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FmcEntry {
     /// 16-bit `ES_ID` of one SL-packetized stream in the FlexMux
     /// stream.
@@ -1270,6 +1308,7 @@ pub struct FmcEntry {
 /// with the `ES_ID` of the SL-packetized stream it carries (one entry
 /// per stream, 3 bytes each on the wire).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FmcDescriptor {
     /// The channel-association entries.
     pub entries: Vec<FmcEntry>,
@@ -1281,6 +1320,7 @@ pub struct FmcDescriptor {
 /// none, so non-14496 components can be referenced from the scene
 /// description or associated with an IPMP stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExternalEsIdDescriptor {
     /// The assigned 16-bit `External_ES_ID`.
     pub external_es_id: u16,
@@ -1292,6 +1332,7 @@ pub struct ExternalEsIdDescriptor {
 /// configuring the FlexMux MuxCode mode; their internal structure
 /// belongs to ISO/IEC 14496-1 and is surfaced as raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MuxCodeDescriptor<'a> {
     /// Raw concatenated `MuxCodeTableEntry()` bytes.
     pub mux_code_table_entries: &'a [u8],
@@ -1305,6 +1346,7 @@ pub struct MuxCodeDescriptor<'a> {
 /// are defined in ISO/IEC 14496-1 §11.2 and are surfaced as raw
 /// bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FmxBufferSizeDescriptor<'a> {
     /// Raw `DefaultFlexMuxBufferDescriptor()` +
     /// `FlexMuxBufferDescriptor()` bytes.
@@ -1319,6 +1361,7 @@ pub struct FmxBufferSizeDescriptor<'a> {
 /// `MBn` and the `TBn → MBn` transfer rate for the §2.11.3.9 extended
 /// model. On the wire the body is two big-endian 24-bit fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultiplexBufferDescriptor {
     /// 24-bit `MB_buffer_size` — size of `MBn` in bytes (§2.6.53).
     pub mb_buffer_size: u32,
@@ -1343,6 +1386,7 @@ impl MultiplexBufferDescriptor {
 /// may discard them. This typed view simply surfaces the raw bytes so a
 /// caller can confirm the descriptor was consumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StuffingDescriptor<'a> {
     /// Raw `stuffing_byte` run — no meaning per §6.2.40.
     pub stuffing_bytes: &'a [u8],
@@ -1359,6 +1403,7 @@ pub struct StuffingDescriptor<'a> {
 /// (22-bit, both in units of 400 bit/s), and
 /// `maximum_overall_smoothing_buffer` (14-bit, in units of 1 byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PartialTransportStreamDescriptor {
     /// 22-bit `peak_rate` — the maximum momentary TS-packet rate
     /// (188 bytes ÷ inter-packet interval), coded in units of 400 bit/s.
@@ -1398,6 +1443,7 @@ impl PartialTransportStreamDescriptor {
 /// One `(service_id, service_type)` entry of a
 /// [`ServiceListDescriptor`] (ETSI EN 300 468 §6.2.35 Table 91).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServiceListEntry {
     /// 16-bit `service_id` — equal to the `program_number` of the
     /// corresponding `program_map_section` for normal services.
@@ -1416,6 +1462,7 @@ pub struct ServiceListEntry {
 /// a channel map from a NIT/BAT can read it without first opening every
 /// PMT.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServiceListDescriptor {
     /// The `(service_id, service_type)` entries, in wire order.
     pub entries: Vec<ServiceListEntry>,
@@ -1434,6 +1481,7 @@ pub struct ServiceListDescriptor {
 /// an ISO 3166 alpha-3 country code, or the decimal string of a
 /// 900..=999 country-group identifier (ETSI TS 101 162).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CountryAvailabilityDescriptor {
     /// `true` when the listed countries are those where reception is
     /// intended; `false` when they are countries where it is not.
@@ -1458,6 +1506,7 @@ pub struct CountryAvailabilityDescriptor {
 /// surfaced verbatim as [`Self::link_data`] — the specialised body (if
 /// any) followed by the private-data run — so no information is lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkageDescriptor<'a> {
     /// 16-bit `transport_stream_id` of the TS carrying the linked
     /// service.
@@ -1485,6 +1534,7 @@ pub struct LinkageDescriptor<'a> {
 /// matches the `stream_identifier_descriptor` of the corresponding PMT
 /// `ES_info` loop. The trailing `text` is a free-text description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ComponentDescriptor<'a> {
     /// 4-bit `stream_content_ext` — combined with `stream_content` per
     /// Table 26. For `stream_content` in `0x1..=0x8` this is `0xF` for
@@ -1511,6 +1561,7 @@ pub struct ComponentDescriptor<'a> {
 /// Lists the `CA_system_id`s a bouquet / service / event is associated
 /// with. Each id is coded per ETSI TS 101 162.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaIdentifierDescriptor {
     /// The 16-bit `CA_system_id`s, in wire order.
     pub ca_system_ids: Vec<u16>,
@@ -1519,6 +1570,7 @@ pub struct CaIdentifierDescriptor {
 /// One `(country_code, rating)` entry of a
 /// [`ParentalRatingDescriptor`] (ETSI EN 300 468 §6.2.28 Table 82).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParentalRatingEntry {
     /// 24-bit `country_code` — three ISO/IEC 8859-1 bytes (ISO 3166
     /// alpha-3, or a 900..=999 country-group decimal string).
@@ -1546,6 +1598,7 @@ impl ParentalRatingEntry {
 /// A flat array of `(country_code, rating)` entries giving the
 /// recommended minimum age per country for an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParentalRatingDescriptor {
     /// The `(country_code, rating)` entries, in wire order.
     pub entries: Vec<ParentalRatingEntry>,
@@ -1558,6 +1611,7 @@ pub struct ParentalRatingDescriptor {
 /// TS 101 162) that scopes the interpretation of any private
 /// descriptors / fields appearing after it in the same loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrivateDataSpecifierDescriptor {
     /// 32-bit `private_data_specifier`.
     pub private_data_specifier: u32,
@@ -1573,6 +1627,7 @@ pub struct PrivateDataSpecifierDescriptor {
 /// after the 3rd character) are surfaced as their raw packed BCD
 /// integers — the caller scales them per the table's worked examples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SatelliteDeliverySystemDescriptor {
     /// 32-bit packed-BCD `frequency` (GHz, decimal after digit 3).
     pub frequency_bcd: u32,
@@ -1607,6 +1662,7 @@ pub struct SatelliteDeliverySystemDescriptor {
 /// `symbol_rate` (7-digit BCD, Msymbol/s, decimal after the 3rd
 /// character) are surfaced as raw packed BCD integers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CableDeliverySystemDescriptor {
     /// 32-bit packed-BCD `frequency` (MHz, decimal after digit 4).
     pub frequency_bcd: u32,
@@ -1627,6 +1683,7 @@ pub struct CableDeliverySystemDescriptor {
 /// Unlike the cable / satellite descriptors, `centre_frequency` here is
 /// a plain unsigned integer in multiples of 10 Hz (not BCD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TerrestrialDeliverySystemDescriptor {
     /// 32-bit `centre_frequency` in multiples of 10 Hz.
     pub centre_frequency_10hz: u32,
@@ -1665,6 +1722,7 @@ pub struct TerrestrialDeliverySystemDescriptor {
 /// `centre_frequency` depends on [`Self::coding_type`] (the same coding
 /// as the matching delivery-system descriptor).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrequencyListDescriptor {
     /// 2-bit `coding_type` (Table 56): `0` undefined, `1` satellite,
     /// `2` cable, `3` terrestrial. Decides how each `centre_frequency`
@@ -1677,6 +1735,7 @@ pub struct FrequencyListDescriptor {
 /// service_move_descriptor body (ETSI EN 300 468 §6.2.36 Table 92) —
 /// a fixed 6-byte body carrying the post-move addressing triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServiceMoveDescriptor {
     /// 16-bit `new_original_network_id`.
     pub new_original_network_id: u16,
@@ -1694,6 +1753,7 @@ pub struct ServiceMoveDescriptor {
 /// (Table 96) codes the leak rate in Mbit/s. Any trailing
 /// `reserved_future_use` bytes are preserved in `reserved`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShortSmoothingBufferDescriptor<'a> {
     /// 2-bit `sb_size` (Table 95).
     pub sb_size: u8,
@@ -1706,6 +1766,7 @@ pub struct ShortSmoothingBufferDescriptor<'a> {
 /// scrambling_descriptor body (ETSI EN 300 468 §6.2.32 Table 86) — a
 /// fixed 1-byte body carrying the `scrambling_mode` (annex E).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScramblingDescriptor {
     /// 8-bit `scrambling_mode` (annex E).
     pub scrambling_mode: u8,
@@ -1718,6 +1779,7 @@ pub struct ScramblingDescriptor {
 /// `data_broadcast_id` (coded per ETSI TS 101 162) plus a run of
 /// `selector_byte`s whose interpretation depends on the id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DataBroadcastIdDescriptor<'a> {
     /// 16-bit `data_broadcast_id`.
     pub data_broadcast_id: u16,
@@ -1729,6 +1791,7 @@ pub struct DataBroadcastIdDescriptor<'a> {
 /// a fixed 1-byte body whose bits flag the ancillary data present in an
 /// audio elementary stream (Table 16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AncillaryDataDescriptor {
     /// 8-bit `ancillary_data_identifier` bit-flags (Table 16).
     pub ancillary_data_identifier: u8,
@@ -1774,6 +1837,7 @@ impl AncillaryDataDescriptor {
 /// `AAC_type_flag` gates an optional `AAC_type`, and any further bytes
 /// are `additional_info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AacDescriptor<'a> {
     /// 8-bit `profile_and_level`.
     pub profile_and_level: u8,
@@ -1796,6 +1860,7 @@ pub struct AacDescriptor<'a> {
 /// field is exposed both raw ([`Self::selector`]) and, for the
 /// extension tags this module decodes, as a typed [`ExtensionBody`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtensionDescriptor<'a> {
     /// 8-bit `descriptor_tag_extension` (Table 109). Notable values:
     /// `0x04` T2 delivery system, `0x06` supplementary audio, `0x0D` C2
@@ -1811,6 +1876,7 @@ pub struct ExtensionDescriptor<'a> {
 /// Typed body for the extension_descriptor sub-tags this module decodes
 /// (ETSI EN 300 468 clause 6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExtensionBody<'a> {
     /// `0x06` supplementary_audio_descriptor (§6.4.11 Table 153).
     SupplementaryAudio(SupplementaryAudioDescriptor<'a>),
@@ -1826,6 +1892,7 @@ pub enum ExtensionBody<'a> {
 /// component is meant to be presented / mixed and optionally overrides
 /// the ES loop's language code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SupplementaryAudioDescriptor<'a> {
     /// `mix_type` (Table 154): `false` a dependent stream meant to be
     /// mixed, `true` a complete and independent stream.
@@ -1851,6 +1918,7 @@ pub struct SupplementaryAudioDescriptor<'a> {
 /// length-prefixed selector field, and a language-tagged free-text
 /// description of the data component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DataBroadcastDescriptor<'a> {
     /// 16-bit `data_broadcast_id` (coded per ETSI TS 101 162).
     pub data_broadcast_id: u16,
@@ -1873,6 +1941,7 @@ pub struct DataBroadcastDescriptor<'a> {
 /// when `false`, the transfer uses the `vbv_delay` method (provided
 /// the per-frame `vbv_delay` is not `0xFFFF`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StdDescriptor {
     /// `leak_valid_flag` — 1 bit.
     pub leak_valid_flag: bool,
@@ -1912,6 +1981,7 @@ pub struct StdDescriptor {
 /// adaptation-field source field; a future spec corrigendum is the
 /// expected path to close the typo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultiplexBufferUtilizationDescriptor {
     /// `bound_valid_flag` — when `false`, the two bound fields are
     /// undefined and callers should ignore them.
@@ -1952,6 +2022,7 @@ pub struct MultiplexBufferUtilizationDescriptor {
 ///   two consecutive I-pictures in the sequence. The value `0` is
 ///   forbidden by the spec; [`Self::is_well_formed`] flags that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IbpDescriptor {
     /// `closed_gop_flag` (1 bit).
     pub closed_gop_flag: bool,
@@ -1974,6 +2045,7 @@ impl IbpDescriptor {
 
 /// HEVC_video_descriptor body (Amd. 3 §2.6.95 Table 2-96).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HevcVideoDescriptor {
     /// `profile_space`, 2 bits.
     pub profile_space: u8,

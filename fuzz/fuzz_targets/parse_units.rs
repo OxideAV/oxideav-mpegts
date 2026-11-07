@@ -242,15 +242,13 @@ fuzz_target!(|data: &[u8]| {
     // Adaptation-field spec → encode → parse via a synthetic packet:
     // §2.4.3.4 Table 2-6 field set + §2.4.3.5 pairings.
     {
-        let spec = AdaptationFieldSpec {
-            discontinuity_indicator: r.chance(64),
-            random_access_indicator: r.chance(128),
-            pcr: r
-                .chance(160)
-                .then(|| (r.u64() & 0x1_FFFF_FFFF, r.u16() % 300)),
-            splice_countdown: r.chance(64).then(|| r.u8() as i8),
-            ..Default::default()
-        };
+        let mut spec = AdaptationFieldSpec::default()
+            .with_discontinuity_indicator(r.chance(64))
+            .with_random_access_indicator(r.chance(128));
+        spec.pcr = r
+            .chance(160)
+            .then(|| (r.u64() & 0x1_FFFF_FFFF, r.u16() % 300));
+        let spec = spec.with_splice_countdown(r.chance(64).then(|| r.u8() as i8));
         if let Ok(af) = spec.encode(Some(1 + (r.u8() as usize) % (TS_PACKET_LEN - 5))) {
             let mut pkt = vec![0u8; TS_PACKET_LEN];
             pkt[0] = TS_SYNC_BYTE;
@@ -287,10 +285,12 @@ fuzz_target!(|data: &[u8]| {
 
         let n_streams = (r.u8() % 6) as usize;
         let streams: Vec<oxideav_mpegts::PmtStreamEntry> = (0..n_streams)
-            .map(|k| oxideav_mpegts::PmtStreamEntry {
-                stream_type: r.u8(),
-                elementary_pid: 0x0100 + k as u16,
-                es_info: vec![0x52, 1, r.u8()], // stream_identifier
+            .map(|k| {
+                oxideav_mpegts::PmtStreamEntry::new(
+                    r.u8(),
+                    0x0100 + k as u16,
+                    vec![0x52, 1, r.u8()],
+                )
             })
             .collect();
         let pcr_pid = 0x0100;

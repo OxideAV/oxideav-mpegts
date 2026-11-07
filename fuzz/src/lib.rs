@@ -568,16 +568,17 @@ impl MuxPlan {
                 // Splice request on a video stream, armed mid-run.
                 let splice_before = (is_video && n_frames > 1 && r.chance(64)).then(|| {
                     let at = 1 + (r.u8() as usize) % (n_frames - 1);
-                    let seamless = r.chance(128).then(|| SeamlessSpliceSpec {
-                        splice_type: r.u8() & 0x0F,
-                        dts_next_au: (frames[at].pts + step) as u64 & 0x1_FFFF_FFFF,
+                    let seamless = r.chance(128).then(|| {
+                        SeamlessSpliceSpec::new(
+                            r.u8() & 0x0F,
+                            (frames[at].pts + step) as u64 & 0x1_FFFF_FFFF,
+                        )
                     });
                     (
                         at,
-                        SpliceSpec {
-                            seamless,
-                            post_splice_packets: r.u8() % 4,
-                        },
+                        SpliceSpec::default()
+                            .with_seamless(seamless)
+                            .with_post_splice_packets(r.u8() % 4),
                     )
                 });
                 streams.push(PlannedStream {
@@ -623,48 +624,47 @@ impl MuxPlan {
         let programs = self
             .programs
             .iter()
-            .map(|p| ProgramSpec {
-                program_number: p.program_number,
-                pmt_pid: p.pmt_pid,
-                pcr_pid: None,
-                stream_indices: p.stream_slots.iter().map(|&s| s as u32).collect(),
-                service: p.service.then(|| ServiceSpec {
-                    service_type: 0x01,
-                    provider_name: b"fuzz provider".to_vec(),
-                    service_name: format!("fuzz svc {}", p.program_number).into_bytes(),
-                }),
-                events: if p.event {
-                    vec![EventSpec {
-                        event_id: 0x1000 + p.program_number,
-                        start_time: oxideav_mpegts::decode_utc_time([0xC0, 0x79, 0x12, 0x45, 0x00]),
-                        duration: oxideav_mpegts::psi::EitDuration {
-                            hours: 1,
-                            minutes: 30,
-                            seconds: 0,
-                        },
-                        running_status: RunningStatus::Running,
-                        language: *b"eng",
-                        event_name: b"fuzz event".to_vec(),
-                        text: b"structure-aware plan".to_vec(),
-                    }]
-                } else {
-                    Vec::new()
-                },
-                es_descriptors: Vec::new(),
+            .map(|p| {
+                ProgramSpec::new(p.program_number, p.pmt_pid)
+                    .with_stream_indices(p.stream_slots.iter().map(|&s| s as u32).collect())
+                    .with_service(p.service.then(|| {
+                        ServiceSpec::new(
+                            0x01,
+                            b"fuzz provider".to_vec(),
+                            format!("fuzz svc {}", p.program_number).into_bytes(),
+                        )
+                    }))
+                    .with_events(if p.event {
+                        vec![
+                            EventSpec::new(
+                                0x1000 + p.program_number,
+                                oxideav_mpegts::psi::EitDuration {
+                                    hours: 1,
+                                    minutes: 30,
+                                    seconds: 0,
+                                },
+                                RunningStatus::Running,
+                                *b"eng",
+                            )
+                            .with_start_time(oxideav_mpegts::decode_utc_time([
+                                0xC0, 0x79, 0x12, 0x45, 0x00,
+                            ]))
+                            .with_event_name(b"fuzz event".to_vec())
+                            .with_text(b"structure-aware plan".to_vec()),
+                        ]
+                    } else {
+                        Vec::new()
+                    })
             })
             .collect();
-        MpegTsMuxConfig {
-            transport_stream_id: 1,
-            original_network_id: 1,
-            programs,
-            network: self.network.then(|| NetworkSpec {
-                network_id: 0x3001,
-                network_name: b"fuzz net".to_vec(),
-                network_descriptors: Vec::new(),
-                transport_descriptors: Vec::new(),
-            }),
-            ..Default::default()
-        }
+        MpegTsMuxConfig::default()
+            .with_transport_stream_id(1)
+            .with_original_network_id(1)
+            .with_programs(programs)
+            .with_network(
+                self.network
+                    .then(|| NetworkSpec::new(0x3001).with_network_name(b"fuzz net".to_vec())),
+            )
     }
 
     /// Execute the plan: mux every frame in global PTS order and

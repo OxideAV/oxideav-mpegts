@@ -52,6 +52,7 @@ const NULL_PID: u16 = 0x1FFF;
 /// normative rule being broken; a fully conformant stream reports zero
 /// everywhere.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ViolationCounts {
     /// Packets whose `adaptation_field_control` is the reserved `'00'`
     /// (Table 2-5 — decoders shall discard these).
@@ -115,6 +116,7 @@ impl ViolationCounts {
 
 /// Per-PID packet statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PidReport {
     /// Packets seen on this PID.
     pub packets: u64,
@@ -128,6 +130,7 @@ pub struct PidReport {
 
 /// PCR health for one PCR PID (§2.4.2.2 / §2.7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PcrReport {
     /// The PCR PID (as named by one or more PMTs).
     pub pid: u16,
@@ -150,6 +153,7 @@ pub struct PcrReport {
 
 /// Everything [`validate_ts`] learned about a stream.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TsValidationReport {
     /// Physical packet framing the buffer was walked with (`None`
     /// when no consistent sync grid was found — the report then

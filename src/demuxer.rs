@@ -64,6 +64,7 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> CoreResult<
 /// program whose PMT can be selected via
 /// [`MpegTsDemuxer::open_program`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TsProgram {
     /// 16-bit program label, unique within the transport stream.
     pub program_number: u16,
@@ -153,6 +154,7 @@ pub struct MpegTsDemuxer {
 /// container-level signals ISO/IEC 13818-1 offers, in decreasing
 /// strength.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum AccessPointKind {
     /// Adaptation-field `random_access_indicator` (§2.4.3.5): the next
     /// PES packet to start on the PID contains the first byte of a
@@ -179,6 +181,7 @@ pub enum AccessPointKind {
 /// demuxer at `byte_offset` picks the access point up as its first
 /// PES on the PID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RandomAccessPoint {
     /// Byte offset of the TS packet that carried the indicator (for
     /// [`AccessPointKind::RandomAccessIndicator`]) or the PES-start

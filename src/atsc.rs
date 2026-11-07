@@ -100,6 +100,7 @@ pub fn gps_to_unix(gps_seconds: u32, gps_utc_offset: u8) -> i64 {
 /// One segment of a [`MssString`] (A/65 §6.10 Table 6.39) — a
 /// `compression_type` / `mode` pair plus the raw segment bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MssSegment {
     /// Table 6.40 `compression_type` — `0x00` uncompressed; `0x01` /
     /// `0x02` Huffman-coded with the annex-C standard tables (only
@@ -276,6 +277,7 @@ fn huffman_decode_text(bytes: &[u8], table: &'static [(u8, u8, u8, u16)]) -> Opt
 
 /// One per-language string of a [`MultipleStringStructure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MssString {
     /// 3-byte ISO 639.2/B language code.
     pub language_code: [u8; 3],
@@ -301,6 +303,7 @@ impl MssString {
 /// carrier of every human-readable text in PSIP (event titles, long
 /// channel names, ETT messages, RRT labels).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultipleStringStructure {
     /// Per-language strings, in wire order.
     pub strings: Vec<MssString>,
@@ -380,6 +383,7 @@ impl MultipleStringStructure {
 /// One closed-caption service entry of a `caption_service_descriptor`
 /// (A/65 §6.9.2 Table 6.26).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaptionServiceEntry {
     /// 3-byte ISO 639.2/B language code of the caption service.
     pub language: [u8; 3],
@@ -403,6 +407,7 @@ pub struct CaptionServiceEntry {
 /// One `(rating_dimension_j, rating_value)` pair of a
 /// `content_advisory_descriptor` region (A/65 §6.9.3 Table 6.27).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentAdvisoryDimension {
     /// Dimension index into the region's RRT instance.
     pub rating_dimension: u8,
@@ -413,6 +418,7 @@ pub struct ContentAdvisoryDimension {
 /// One per-region block of a `content_advisory_descriptor`
 /// (A/65 §6.9.3 Table 6.27).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentAdvisoryRegion {
     /// The `rating_region` this block's dimensions refer to (matches
     /// an RRT instance's `rating_region`).
@@ -427,6 +433,7 @@ pub struct ContentAdvisoryRegion {
 /// One elementary-stream entry of a `service_location_descriptor`
 /// (A/65 §6.9.5 Table 6.29).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServiceLocationEntry {
     /// ISO/IEC 13818-1 `stream_type` of the elementary stream.
     pub stream_type: u8,
@@ -440,6 +447,7 @@ pub struct ServiceLocationEntry {
 /// One entry of a `time_shifted_service_descriptor`
 /// (A/65 §6.9.6 Table 6.31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TimeShiftedServiceEntry {
     /// 10-bit `time_shift` — minutes (1–720) the listed channel lags
     /// the channel carrying this descriptor.
@@ -452,6 +460,7 @@ pub struct TimeShiftedServiceEntry {
 
 /// Typed body of one PSIP descriptor (A/65 §6.9 Table 6.25).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AtscDescriptorBody {
     /// `stuffing_descriptor` (tag `0x80`, §6.9.8) — contents are to be
     /// disregarded.
@@ -525,6 +534,7 @@ pub enum AtscDescriptorBody {
 /// One walked PSIP descriptor: the TLV `tag`, the raw payload, and the
 /// typed decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AtscDescriptor {
     /// `descriptor_tag`.
     pub tag: u8,
@@ -823,6 +833,7 @@ fn parse_psip_section(
 /// wall-clock anchor carried on [`ATSC_BASE_PID`] with
 /// `table_id == 0xCD`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SystemTimeTable {
     /// `system_time` — seconds since the GPS epoch (1980-01-06
     /// 00:00:00 UTC), leap seconds *not* subtracted.
@@ -894,6 +905,7 @@ impl SystemTimeTable {
 /// One `tables_defined` entry of the MGT (A/65 §6.2 Table 6.2) —
 /// announces one PSIP table instance's PID, version, and size.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MgtTableEntry {
     /// Table 6.3 `table_type` — e.g. `0x0000` current TVCT, `0x0002`
     /// current CVCT, `0x0004` channel ETT, `0x0100 + k` EIT-k,
@@ -969,6 +981,7 @@ impl MgtTableEntry {
 /// table (except the STT), carried in a single section on
 /// [`ATSC_BASE_PID`] with `table_id == 0xC7`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MasterGuideTable {
     /// 5-bit `version_number` of the MGT itself.
     pub version_number: u8,
@@ -1061,6 +1074,7 @@ impl MasterGuideTable {
 /// One virtual channel of a [`VirtualChannelTable`]
 /// (A/65 §6.3 Tables 6.4 / 6.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VctChannel {
     /// `short_name` — up to 7 UTF-16 code units, NUL-padded on the
     /// wire; see [`Self::short_name_text`].
@@ -1145,6 +1159,7 @@ impl VctChannel {
 /// CVCT-only bits (`path_select` / `out_of_band`) sit where the TVCT
 /// has reserved bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VirtualChannelTable {
     /// `true` when this section is a Cable VCT (`table_id 0xC9`).
     pub cable: bool,
@@ -1287,6 +1302,7 @@ impl VirtualChannelTable {
 /// One rating value of an [`RrtDimension`] — abbreviated and full
 /// display names.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RrtRatingValue {
     /// Abbreviated display name (≤ 8 characters; empty MSS for rating
     /// value 0).
@@ -1299,6 +1315,7 @@ pub struct RrtRatingValue {
 /// One rating dimension of a [`RatingRegionTable`] (e.g. an age-based
 /// scale or a content-category scale).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RrtDimension {
     /// Dimension display name (≤ 20 characters).
     pub dimension_name: MultipleStringStructure,
@@ -1315,6 +1332,7 @@ pub struct RrtDimension {
 /// `table_id == 0xCA`; the `rating_region` rides in the low byte of
 /// `table_id_extension`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RatingRegionTable {
     /// 8-bit `rating_region` this instance defines (`0x01`–`0xFF`).
     pub rating_region: u8,
@@ -1477,6 +1495,7 @@ impl RatingRegionTable {
 /// One event of an [`AtscEventInformationTable`]
 /// (A/65 §6.5 Table 6.11).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AtscEitEvent {
     /// 14-bit `event_id` (also the low half of the event's `ETM_id`).
     pub event_id: u16,
@@ -1507,6 +1526,7 @@ impl AtscEitEvent {
 /// MGT-announced PID with `table_id == 0xCB` and keyed by the
 /// channel's `source_id` in `table_id_extension`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AtscEventInformationTable {
     /// The `source_id` of the virtual channel these events belong to.
     pub source_id: u16,
@@ -1614,6 +1634,7 @@ impl AtscEventInformationTable {
 /// one Extended Text Message on an MGT-announced PID with
 /// `table_id == 0xCC`, keyed by its 32-bit `ETM_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtendedTextTable {
     /// `ETT_table_id_extension` — instance disambiguator when several
     /// ETTs share a PID.
@@ -1722,6 +1743,7 @@ pub enum DccContext {
 
 /// Classified `dcc_selection_type` per A/65 §6.7 Table 6.17.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DccSelectionCategory {
     /// `0x00` — term always evaluates True.
     Unconditional,
@@ -1794,6 +1816,7 @@ impl DccSelectionCategory {
 /// One `dcc_term_count` entry of a [`DccTest`] (A/65 §6.7 Table 6.15)
 /// — a single selection criterion; all terms of a test AND together.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DccTerm {
     /// Raw 8-bit `dcc_selection_type` (Table 6.17) — see
     /// [`Self::category`].
@@ -1863,6 +1886,7 @@ impl DccTerm {
 /// virtual channel to another between two GPS instants when every
 /// term evaluates True.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DccTest {
     /// The Table 6.16 `dcc_context` — Temporary Retune vs Channel
     /// Redirect handling.
@@ -1923,6 +1947,7 @@ fn dcc_descriptor_loop<'a>(
 /// Table 6.15) — carried on [`ATSC_BASE_PID`] with `table_id == 0xD3`,
 /// always a single section (`section_number == 0`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DirectedChannelChangeTable {
     /// 8-bit `dcc_id` distinguishing concurrently transmitted DCCT
     /// instances (the MGT announces each as `table_type 0x1400 +
@@ -2058,6 +2083,7 @@ impl DirectedChannelChangeTable {
 /// an extension of the Table 6.20 genre codes or the annex-H
 /// state / county location codes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DccsctUpdate {
     /// `update_type 0x01` — a new Table 6.20 genre category: the code
     /// (`0x01..=0x1F` basic / `0xAE..=0xFE` detailed) plus its display
@@ -2100,6 +2126,7 @@ pub enum DccsctUpdate {
 /// One `updates_defined` entry of a [`DccSelectionCodeTable`] — the
 /// typed update plus its descriptor loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DccsctUpdateEntry {
     /// The typed update.
     pub update: DccsctUpdate,
@@ -2120,6 +2147,7 @@ impl DccsctUpdateEntry {
 /// single section; extends the genre / location code sets the DCCT
 /// selection terms reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DccSelectionCodeTable {
     /// 5-bit `version_number`.
     pub version_number: u8,

@@ -13,6 +13,7 @@
 
 /// One elementary-stream codec / payload class (`stream_type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamType {
     /// `0x01` ISO/IEC 11172-2 video (MPEG-1 video).
     Mpeg1Video,
