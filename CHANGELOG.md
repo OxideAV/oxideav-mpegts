@@ -9,6 +9,12 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.4...v0.0.5) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive enums, muxer specs and parsed records
+
 ### Added
 
 - Constructors for the builder inputs: `ProgramSpec::new(program_number,
