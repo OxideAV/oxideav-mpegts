@@ -410,6 +410,21 @@ impl PesPacket {
     /// `bytes` runs from the `packet_start_code_prefix` through the
     /// end of the PES payload.
     pub fn parse(bytes: &[u8]) -> Result<Self, TsError> {
+        let (mut pes, payload_at) = Self::parse_header(bytes)?;
+        pes.payload = bytes[payload_at..].to_vec();
+        Ok(pes)
+    }
+
+    /// Parse the PES packet header at the head of `bytes` — the 6-byte
+    /// fixed part plus, for the stream_ids that carry one, the whole
+    /// optional header (`PES_header_data_length` bytes). Returns the
+    /// packet with an **empty** payload and the offset in `bytes` at
+    /// which the payload begins, so a caller that receives the packet
+    /// in pieces can collect the payload without copying it twice.
+    ///
+    /// Fails with [`TsError::Truncated`] when `bytes` ends inside the
+    /// header.
+    pub fn parse_header(bytes: &[u8]) -> Result<(Self, usize), TsError> {
         if bytes.len() < 6 {
             return Err(TsError::Truncated {
                 what: "PES header",
@@ -421,10 +436,8 @@ impl PesPacket {
             return Err(TsError::BadPesStartCode([bytes[0], bytes[1], bytes[2]]));
         }
         let stream_id = bytes[3];
-        let _pes_packet_length = u16::from_be_bytes([bytes[4], bytes[5]]);
-
         if !has_optional_pes_header(stream_id) {
-            return Ok(Self {
+            let pes = Self {
                 stream_id,
                 pes_scrambling_control: 0,
                 pes_priority: false,
@@ -440,8 +453,9 @@ impl PesPacket {
                 previous_pes_packet_crc: None,
                 pes_extension: None,
                 random_access: false,
-                payload: bytes[6..].to_vec(),
-            });
+                payload: Vec::new(),
+            };
+            return Ok((pes, 6));
         }
         if bytes.len() < 9 {
             return Err(TsError::Truncated {
@@ -593,7 +607,7 @@ impl PesPacket {
         };
         let _ = cursor;
 
-        Ok(Self {
+        let pes = Self {
             stream_id,
             pes_scrambling_control,
             pes_priority,
@@ -609,8 +623,9 @@ impl PesPacket {
             previous_pes_packet_crc,
             pes_extension,
             random_access: false,
-            payload: bytes[header_end..].to_vec(),
-        })
+            payload: Vec::new(),
+        };
+        Ok((pes, header_end))
     }
 }
 
@@ -810,26 +825,79 @@ fn decode_timestamp(b: &[u8]) -> Result<u64, TsError> {
     Ok(ts)
 }
 
+/// Default ceiling on the bytes one [`PesReassembler`] holds for an
+/// in-flight PES packet.
+pub const DEFAULT_MAX_PES_BYTES: usize = 32 << 20;
+
+/// Raw bytes collected before giving up on a header that does not
+/// parse: the longest PES header is 9 + 255 bytes, so anything still
+/// unparsed past two TS payloads beyond that is not a header.
+const HEADER_RETRY_LIMIT: usize = 9 + 255 + 2 * 184;
+
 /// Per-PID PES reassembler.
 ///
-/// Tracks one in-flight PES packet's accumulated payload bytes; emits
-/// a parsed [`PesPacket`] when the next PUSI=1 TS packet arrives or
-/// the caller flushes.
-#[derive(Debug, Default)]
+/// Tracks one in-flight PES packet; emits a parsed [`PesPacket`] when
+/// the next PUSI=1 TS packet arrives or the caller flushes.
+///
+/// The PES header is decoded as soon as it is complete (normally from
+/// the very TS packet the PES starts in), after which payload bytes go
+/// straight into the outgoing packet — one copy from the transport
+/// packet, no intermediate buffer.
+///
+/// Memory is bounded whatever the input:
+///
+/// * a PES packet that declares a `PES_packet_length` (§2.4.3.7) keeps
+///   at most that many bytes — anything a damaged stream appends
+///   behind it is dropped;
+/// * an unbounded PES packet (`PES_packet_length == 0`) that grows past
+///   the ceiling ([`DEFAULT_MAX_PES_BYTES`], see
+///   [`Self::with_max_bytes`]) is handed out in pieces: the bytes
+///   gathered so far leave as a packet carrying the header's fields,
+///   and the remainder continues as further packets without PTS / DTS;
+/// * bytes behind a header that never parses stop accumulating at the
+///   ceiling.
+#[derive(Debug)]
 pub struct PesReassembler {
-    /// Accumulated PES packet bytes (starts at packet_start_code_prefix).
+    /// Raw PES bytes (from the packet_start_code_prefix) while the
+    /// header is still incomplete or does not parse.
     buf: Vec<u8>,
-    /// Set once a PUSI=1 TS packet has populated `buf`.
+    /// The in-flight PES once its header has been decoded; payload
+    /// bytes accumulate in `head.payload`.
+    head: Option<PesPacket>,
+    /// Payload bytes the in-flight PES may still take per its
+    /// `PES_packet_length`; `None` for an unbounded packet.
+    remaining: Option<usize>,
+    /// Set once a PUSI=1 TS packet has started a PES.
     started: bool,
-    /// `random_access_indicator` state for the in-flight PES in `buf`
-    /// — the indicator seen on the TS packet the PES started in, or on
-    /// a preceding same-PID packet (§2.4.3.5: the indicator announces
+    /// `random_access_indicator` state for the in-flight PES — the
+    /// indicator seen on the TS packet the PES started in, or on a
+    /// preceding same-PID packet (§2.4.3.5: the indicator announces
     /// "the next PES packet to start").
     current_rai: bool,
     /// A `random_access_indicator` observed *after* the current PES
     /// start (e.g. on a payload-less PCR carrier packet interleaved
     /// mid-PES); it applies to the next PES to start.
     pending_rai: bool,
+    /// Ceiling on the bytes held for one in-flight PES.
+    max_bytes: usize,
+    /// Payload size of the previous PES on this PID — the capacity
+    /// guess for the next unbounded one.
+    size_hint: usize,
+}
+
+impl Default for PesReassembler {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            head: None,
+            remaining: None,
+            started: false,
+            current_rai: false,
+            pending_rai: false,
+            max_bytes: DEFAULT_MAX_PES_BYTES,
+            size_hint: 0,
+        }
+    }
 }
 
 impl PesReassembler {
@@ -838,9 +906,40 @@ impl PesReassembler {
         Self::default()
     }
 
+    /// Set the ceiling on the bytes held for one in-flight PES packet
+    /// (at least one TS payload's worth). See the type docs for what
+    /// happens at the ceiling.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes.max(184);
+        self
+    }
+
+    /// Bytes currently held for the in-flight PES packet.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len() + self.head.as_ref().map_or(0, |h| h.payload.len())
+    }
+
+    /// Drop the in-flight PES packet and every pending flag; the next
+    /// PUSI=1 packet starts afresh. The ceiling is kept.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.head = None;
+        self.remaining = None;
+        self.started = false;
+        self.current_rai = false;
+        self.pending_rai = false;
+    }
+
     /// Feed the next TS packet (must have the same PID as the prior
     /// feeds). Returns `Some(PesPacket)` when a complete PES packet
-    /// has been finalised by this packet's PUSI=1.
+    /// has been finalised by this packet's PUSI=1 — or, for an
+    /// unbounded PES packet that reached the ceiling, a piece of it.
+    ///
+    /// A PES packet whose header does not parse is reported as `Err`
+    /// when it closes; the reassembler has by then already started on
+    /// the PES packet the closing TS packet opens, so the error costs
+    /// exactly the damaged packet.
     ///
     /// The TS packet's `random_access_indicator` (§2.4.3.5) is folded
     /// into the emitted [`PesPacket::random_access`]: the indicator
@@ -855,46 +954,134 @@ impl PesReassembler {
         if ts.payload_unit_start {
             // The arriving PES packet's PUSI=1 closes the prior PES
             // packet (if any).
-            let finished = if self.started {
-                let mut pes = PesPacket::parse(&self.buf)?;
-                pes.random_access = self.current_rai;
-                Some(pes)
-            } else {
-                None
-            };
-            self.buf.clear();
-            self.buf.extend_from_slice(ts.payload);
+            let finished = self.take_current();
             self.started = true;
             // The PES starting here is announced by an indicator on
             // this very packet or one seen since the previous start.
             self.current_rai = self.pending_rai || rai;
             self.pending_rai = false;
-            Ok(finished)
+            self.begin(ts.payload);
+            finished
         } else {
             if rai {
                 // Announces the *next* PES to start on this PID.
                 self.pending_rai = true;
             }
-            if self.started {
-                self.buf.extend_from_slice(ts.payload);
-            }
             // Continuation bytes before we've seen the first PUSI=1
             // are discarded — per spec we can't anchor the packet yet.
-            Ok(None)
+            if !self.started {
+                return Ok(None);
+            }
+            Ok(self.extend(ts.payload))
         }
     }
 
     /// Drain the buffered PES packet (call at end-of-stream).
     pub fn flush(&mut self) -> Result<Option<PesPacket>, TsError> {
+        let out = self.take_current();
+        self.started = false;
+        self.current_rai = false;
+        out
+    }
+
+    /// Close the in-flight PES packet, leaving the reassembler empty.
+    fn take_current(&mut self) -> Result<Option<PesPacket>, TsError> {
         if !self.started {
             return Ok(None);
         }
-        let buf = std::mem::take(&mut self.buf);
-        self.started = false;
-        let mut pes = PesPacket::parse(&buf)?;
+        self.remaining = None;
+        if let Some(mut pes) = self.head.take() {
+            pes.random_access = self.current_rai;
+            self.size_hint = pes.payload.len();
+            return Ok(Some(pes));
+        }
+        let parsed = PesPacket::parse(&self.buf);
+        self.buf.clear();
+        let mut pes = parsed?;
         pes.random_access = self.current_rai;
-        self.current_rai = false;
         Ok(Some(pes))
+    }
+
+    /// Start a PES packet from the first TS payload carrying it.
+    fn begin(&mut self, first: &[u8]) {
+        self.buf.clear();
+        self.head = None;
+        self.remaining = None;
+        if !self.adopt_header(first) {
+            // Header continues in the next TS packet (or is damaged):
+            // collect raw bytes until it parses.
+            self.buf.extend_from_slice(first);
+        }
+    }
+
+    /// Try to decode the PES header at the head of `bytes`; on success
+    /// switch to payload collection and take the payload bytes that
+    /// follow the header.
+    fn adopt_header(&mut self, bytes: &[u8]) -> bool {
+        let Ok((mut pes, payload_at)) = PesPacket::parse_header(bytes) else {
+            return false;
+        };
+        // PES_packet_length counts the bytes after the length field; 0
+        // means unbounded (§2.4.3.7).
+        let declared = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        let body = &bytes[payload_at..];
+        self.remaining = (declared != 0).then(|| (6 + declared).saturating_sub(payload_at));
+        let capacity = match self.remaining {
+            Some(n) => n,
+            None => self.size_hint.max(body.len()),
+        };
+        pes.payload = Vec::with_capacity(capacity.min(self.max_bytes));
+        self.head = Some(pes);
+        // The first TS payload is far below any ceiling, so nothing can
+        // spill here.
+        let spilled = self.extend(body);
+        debug_assert!(spilled.is_none());
+        true
+    }
+
+    /// Append continuation bytes to the in-flight PES packet. Returns a
+    /// piece of it when an unbounded packet reached the ceiling.
+    fn extend(&mut self, bytes: &[u8]) -> Option<PesPacket> {
+        let Some(head) = self.head.as_mut() else {
+            // Still hunting for a complete header.
+            if self.buf.len() < HEADER_RETRY_LIMIT {
+                self.buf.extend_from_slice(bytes);
+                let raw = std::mem::take(&mut self.buf);
+                if !self.adopt_header(&raw) {
+                    self.buf = raw;
+                }
+            } else if self.buf.len() < self.max_bytes {
+                let room = self.max_bytes - self.buf.len();
+                self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            }
+            return None;
+        };
+        let take = match self.remaining.as_mut() {
+            Some(left) => {
+                let n = bytes.len().min(*left);
+                *left -= n;
+                n
+            }
+            None => bytes.len(),
+        };
+        let bytes = &bytes[..take];
+        if head.payload.len() + bytes.len() <= self.max_bytes {
+            head.payload.extend_from_slice(bytes);
+            return None;
+        }
+        // Ceiling reached: hand out what has been gathered and carry on
+        // with an empty payload. The timestamps belong to the first
+        // piece only.
+        let gathered = std::mem::take(&mut head.payload);
+        let mut piece = head.clone();
+        piece.payload = gathered;
+        piece.random_access = self.current_rai;
+        self.current_rai = false;
+        head.pts_90k = None;
+        head.dts_90k = None;
+        head.payload = Vec::with_capacity(self.max_bytes.min(piece.payload.len()));
+        head.payload.extend_from_slice(bytes);
+        Some(piece)
     }
 }
 
@@ -2184,5 +2371,118 @@ mod tests {
             }
             other => panic!("expected Truncated, got {other:?}"),
         }
+    }
+
+    /// Feed every TS packet of `ts` and collect what the reassembler
+    /// hands out, errors included.
+    fn feed_all(r: &mut PesReassembler, ts: &[u8]) -> Vec<Result<PesPacket, TsError>> {
+        let mut out = Vec::new();
+        for pkt in crate::iter_packets(ts) {
+            match r.feed(&pkt.unwrap()) {
+                Ok(Some(p)) => out.push(Ok(p)),
+                Ok(None) => {}
+                Err(e) => out.push(Err(e)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn header_split_across_ts_packets_is_reassembled() {
+        let payload: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let pes = build_pes(0xE0, 4242, &payload);
+        // 5-byte chunks: the 14-byte header needs three TS packets.
+        for chunk in [1usize, 5, 8, 13, 14, 15, 184] {
+            let mut ts = pes_into_ts(0x100, &pes, chunk);
+            ts.extend(pes_into_ts(0x100, &build_pes(0xE0, 1, b"x"), 184));
+            let mut r = PesReassembler::new();
+            let got = feed_all(&mut r, &ts);
+            assert_eq!(got.len(), 1, "chunk {chunk}");
+            let p = got[0].as_ref().unwrap();
+            assert_eq!(p.pts_90k, Some(4242));
+            assert_eq!(p.payload, payload, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn damaged_pes_costs_one_packet_not_the_pid() {
+        let good1 = build_pes(0xC0, 100, b"one");
+        let mut bad = build_pes(0xC0, 200, b"two");
+        bad[2] = 0x02; // break the start-code prefix
+        let good2 = build_pes(0xC0, 300, b"three");
+        let good3 = build_pes(0xC0, 400, b"four");
+        let mut ts = Vec::new();
+        for pes in [&good1, &bad, &good2, &good3] {
+            ts.extend(pes_into_ts(0x101, pes, 184));
+        }
+        let mut r = PesReassembler::new();
+        let mut got = feed_all(&mut r, &ts);
+        got.push(r.flush().transpose().unwrap());
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].as_ref().unwrap().payload, b"one");
+        assert!(matches!(got[1], Err(TsError::BadPesStartCode(_))));
+        assert_eq!(got[2].as_ref().unwrap().payload, b"three");
+        assert_eq!(got[3].as_ref().unwrap().payload, b"four");
+        assert_eq!(r.buffered_len(), 0);
+    }
+
+    #[test]
+    fn declared_length_bounds_the_payload() {
+        // A PES that declares 3 payload bytes, followed on the same PID
+        // by continuation packets that do not belong to it (a lost
+        // PUSI packet in between).
+        let pes = build_pes(0xC0, 100, b"abc");
+        let mut ts = pes_into_ts(0x101, &pes, 184);
+        let stray = pes_into_ts(0x101, &[0x77u8; 400], 184);
+        for (k, pkt) in stray.chunks(TS_PACKET_LEN).enumerate() {
+            let mut pkt = pkt.to_vec();
+            pkt[1] &= !0b0100_0000; // continuation
+            pkt[3] = (pkt[3] & 0xF0) | ((k as u8 + 1) & 0x0F);
+            ts.extend(pkt);
+        }
+        let mut r = PesReassembler::new();
+        assert!(feed_all(&mut r, &ts).is_empty());
+        let p = r.flush().unwrap().unwrap();
+        assert_eq!(p.payload, b"abc");
+    }
+
+    #[test]
+    fn unbounded_pes_is_handed_out_in_pieces_at_the_ceiling() {
+        // PES_packet_length = 0 (unbounded video) and no further PUSI.
+        let mut pes = build_pes(0xE0, 9000, &[]);
+        pes[4] = 0;
+        pes[5] = 0;
+        let total = 10_000usize;
+        pes.extend((0..total).map(|i| (i % 251) as u8));
+        let ts = pes_into_ts(0x100, &pes, 184);
+        let mut r = PesReassembler::new().with_max_bytes(1000);
+        let mut pieces = Vec::new();
+        for pkt in crate::iter_packets(&ts) {
+            if let Some(p) = r.feed(&pkt.unwrap()).unwrap() {
+                pieces.push(p);
+            }
+            assert!(r.buffered_len() <= 1000);
+        }
+        pieces.extend(r.flush().unwrap());
+        assert!(pieces.len() >= 10);
+        assert_eq!(pieces[0].pts_90k, Some(9000));
+        assert!(pieces[1..].iter().all(|p| p.pts_90k.is_none()));
+        let joined: Vec<u8> = pieces.iter().flat_map(|p| p.payload.clone()).collect();
+        assert_eq!(joined, pes[14..]);
+    }
+
+    #[test]
+    fn unparseable_start_never_buffers_past_the_ceiling() {
+        // A PUSI packet whose payload is not a PES header, then an
+        // endless run of continuation packets.
+        let junk = vec![0x5Au8; 184 * 200];
+        let ts = pes_into_ts(0x100, &junk, 184);
+        let mut r = PesReassembler::new().with_max_bytes(4096);
+        for pkt in crate::iter_packets(&ts) {
+            assert!(matches!(r.feed(&pkt.unwrap()), Ok(None)));
+            assert!(r.buffered_len() <= 4096);
+        }
+        assert!(r.flush().is_err());
+        assert_eq!(r.buffered_len(), 0);
     }
 }
