@@ -600,3 +600,124 @@ fn a_refused_seek_leaves_the_streaming_position_alone() {
     got.extend(drain(&mut d));
     assert_eq!(shape(&got), want);
 }
+
+#[test]
+fn program_map_changes_are_followed_mid_stream() {
+    let entry = |st: u8, pid: u16| PmtStreamEntry::new(st, pid, Vec::new());
+    let mut ts = Ts::default();
+    ts.tables();
+    let mut k = 0u32;
+    let mut want: Vec<(u32, i64)> = Vec::new();
+    let mut burst =
+        |ts: &mut Ts, video: Option<u16>, audio: Option<u16>, want: &mut Vec<(u32, i64)>| {
+            for _ in 0..4 {
+                let pts = 90_000 + u64::from(k) * 3_600;
+                if let Some(pid) = video {
+                    let pes = PesHeaderSpec::with_timestamps(0xE0, pts, None)
+                        .encode(&frame(k, 300))
+                        .unwrap();
+                    ts.pes_bytes(pid, &pes, true, Some(pts - 900));
+                    want.push((0, pts as i64));
+                }
+                if let Some(pid) = audio {
+                    let pes = PesHeaderSpec::with_timestamps(0xBD, pts, None)
+                        .encode(&frame(500 + k, 120))
+                        .unwrap();
+                    ts.pes_bytes(pid, &pes, false, None);
+                    want.push((1, pts as i64));
+                }
+                k += 1;
+            }
+        };
+    burst(&mut ts, Some(VIDEO), Some(AUDIO), &mut want);
+
+    // 1. Same PMT PID, new elementary PIDs (and the PCR moves along).
+    ts.psi(
+        PMT,
+        &build_pmt(
+            1,
+            1,
+            0x0201,
+            &[],
+            &[entry(0x1B, 0x0201), entry(0x83, 0x0202)],
+        ),
+    );
+    burst(&mut ts, Some(0x0201), Some(0x0202), &mut want);
+
+    // 2. The PAT moves the program to another PMT PID, whose table
+    //    swaps the two elementary PIDs and lists the audio first.
+    ts.psi(PAT, &build_pat(1, 1, &[(1, 0x0300)]));
+    ts.psi(
+        0x0300,
+        &build_pmt(
+            1,
+            2,
+            0x0202,
+            &[],
+            &[entry(0x83, 0x0201), entry(0x1B, 0x0202)],
+        ),
+    );
+    burst(&mut ts, Some(0x0202), Some(0x0201), &mut want);
+
+    // 3. The audio disappears; an entry of an unsurfaced type and a
+    //    second video entry appear. Video keeps flowing, the rest is
+    //    not picked up.
+    ts.psi(
+        0x0300,
+        &build_pmt(
+            1,
+            3,
+            0x0401,
+            &[],
+            &[
+                entry(0x05, 0x0400),
+                entry(0x1B, 0x0401),
+                entry(0x1B, 0x0402),
+            ],
+        ),
+    );
+    let before_phase3 = want.len();
+    burst(&mut ts, Some(0x0401), None, &mut want);
+    // Packets on the dropped audio PID and the second video entry.
+    let mut ignored = Vec::new();
+    burst(&mut ts, Some(0x0402), Some(0x0201), &mut ignored);
+
+    // A PMT for another program on the watched PID changes nothing.
+    ts.psi(
+        0x0300,
+        &build_pmt(9, 0, 0x0999, &[], &[entry(0x1B, 0x0999)]),
+    );
+    burst(&mut ts, Some(0x0401), None, &mut want);
+
+    let mut d = open(ts.bytes);
+    assert_eq!(d.streams().len(), 2);
+    let got: Vec<(u32, i64)> = drain(&mut d)
+        .iter()
+        .map(|p| (p.stream_index, p.pts.unwrap()))
+        .collect();
+    assert_eq!(got, want);
+    assert!(got[before_phase3..].iter().all(|&(s, _)| s == 0));
+    // PMT change, PAT move, PMT on the new PID, PMT dropping audio.
+    assert_eq!(d.stats().program_map_changes, 4);
+    assert_eq!(d.stats().continuity_errors, 0);
+    assert_eq!(d.pcr_pid(), Some(0x0401));
+}
+
+#[test]
+fn scrambling_control_is_counted_not_acted_on() {
+    let mut ts = sample(4);
+    let n = ts.bytes.len() / TS_PACKET_LEN;
+    let mut marked = 0u64;
+    for k in 2..n {
+        let pkt = &mut ts.bytes[k * TS_PACKET_LEN..(k + 1) * TS_PACKET_LEN];
+        let pid = (u16::from(pkt[1] & 0x1F) << 8) | u16::from(pkt[2]);
+        if pid == AUDIO {
+            pkt[3] |= 0x80;
+            marked += 1;
+        }
+    }
+    let want = shape(&drain(&mut open(sample(4).bytes)));
+    let mut d = open(ts.bytes);
+    assert_eq!(shape(&drain(&mut d)), want);
+    assert_eq!(d.stats().scrambled_packets, marked);
+}

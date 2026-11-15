@@ -95,6 +95,15 @@ pub struct TsDemuxStats {
     pub continuity_errors: u64,
     /// PES packets dropped because their header does not parse.
     pub damaged_pes: u64,
+    /// Payload packets on the demuxed PIDs whose
+    /// `transport_scrambling_control` is not '00' (Table 2-4). Their
+    /// payload is passed on as it is.
+    pub scrambled_packets: u64,
+    /// Times the selected program's map changed mid-stream — a new
+    /// `program_map_PID` in the PAT, or a PMT assigning different
+    /// elementary PIDs or a different `PCR_PID` — and the demuxer
+    /// re-pointed its streams (see [`MpegTsDemuxer`]).
+    pub program_map_changes: u64,
 }
 
 /// Bytes read from the input per block. Large enough that a plain
@@ -423,6 +432,12 @@ const MAX_INFLIGHT_BYTES: usize = 256 << 20;
 /// stream index.
 struct PidSlot {
     pid: u16,
+    /// `false` once a later PMT no longer lists a stream of this
+    /// slot's codec: no PID routes here any more.
+    mapped: bool,
+    /// Codec the PMT entry names (before any refinement from the
+    /// elementary stream) — what a later PMT's entries are matched on.
+    pmt_codec: CodecId,
     reassembler: PesReassembler,
     /// 33-bit PTS / DTS unwrappers (§2.4.3.7) onto one monotonic
     /// 64-bit timeline; reorder-tolerant.
@@ -476,6 +491,19 @@ impl PidSlot {
 /// [`Self::stats`] counts each of these. Memory is bounded whatever the
 /// input: every PID's in-flight PES packet has a ceiling (an unbounded
 /// PES packet that reaches it is handed out in pieces).
+///
+/// ## Program-map changes
+///
+/// The PAT and the selected program's PMT are followed while
+/// streaming. When the PAT moves the program to another
+/// `program_map_PID`, or the PMT assigns different elementary PIDs or a
+/// different `PCR_PID` (spliced captures, a remultiplexed service), each
+/// stream is re-pointed at the first not-yet-taken PMT entry of its
+/// codec, in order; the PES packet in flight on the old PID is handed
+/// out first. The stream list itself is fixed at open: a stream whose
+/// codec the new PMT no longer lists simply stops, and entries beyond
+/// the opened set are not picked up. [`TsDemuxStats::program_map_changes`]
+/// counts the changes.
 pub struct MpegTsDemuxer {
     reader: PacketReader,
     /// Every non-network program the PAT advertised, in PAT order. The
@@ -488,6 +516,16 @@ pub struct MpegTsDemuxer {
     /// `PCR_PID` for the selected program (§2.4.4.9), or
     /// [`NULL_PID`] when the program carries no PCR.
     pcr_pid: u16,
+    /// `program_map_PID` of the selected program, as the latest PAT
+    /// gives it.
+    pmt_pid: u16,
+    /// Section assemblers following the PAT and the program's PMT
+    /// while streaming.
+    pat_watch: PsiSectionAssembler,
+    pmt_watch: PsiSectionAssembler,
+    /// `(stream_type, elementary_PID)` of every entry of the PMT in
+    /// effect — what a later PMT is compared against.
+    pmt_entries: Vec<(u8, u16)>,
     /// 27 MHz clock recovery on the selected program's `PCR_PID`. Fed
     /// every adaptation field that carries a PCR; supplies the absolute
     /// clock anchor a remux uses to align the PES timeline.
@@ -835,12 +873,11 @@ impl MpegTsDemuxer {
         let mut pid_slot = vec![0u16; PID_SPACE].into_boxed_slice();
         let mut slots: Vec<PidSlot> = Vec::new();
         for pmt_stream in &pmt.streams {
-            let mut params = match codec_params_for_stream_type(pmt_stream.stream_type)
-                .or_else(|| codec_params_for_private_pes(pmt_stream))
-            {
+            let mut params = match pmt_entry_codec(pmt_stream) {
                 Some(p) => p,
                 None => continue,
             };
+            let pmt_codec = params.codec_id.clone();
             apply_descriptor_params(&mut params, pmt_stream);
             let syntax = if StreamType::from_raw(pmt_stream.stream_type) == StreamType::AacAdts {
                 Some(crate::AudioSyntax::AacAdts)
@@ -870,6 +907,8 @@ impl MpegTsDemuxer {
             pid_slot[pid as usize] = idx as u16 + 1;
             slots.push(PidSlot {
                 pid,
+                mapped: true,
+                pmt_codec,
                 reassembler: PesReassembler::new(),
                 pts: NearestEpochUnwrap::default(),
                 dts: NearestEpochUnwrap::default(),
@@ -896,6 +935,10 @@ impl MpegTsDemuxer {
             programs,
             selected_program,
             pcr_pid: pmt.pcr_pid,
+            pmt_pid,
+            pat_watch: PsiSectionAssembler::new(),
+            pmt_watch: PsiSectionAssembler::new(),
+            pmt_entries: pmt_signature(&pmt),
             pcr_tracker: PcrTracker::new(),
             streams,
             pid_slot,
@@ -1607,6 +1650,8 @@ impl MpegTsDemuxer {
         self.pending.clear();
         self.eof_reached = false;
         self.pcr_tracker.reset();
+        self.pat_watch.reset();
+        self.pmt_watch.reset();
         let hint = time_hint_90k.and_then(|t| u64::try_from(t).ok());
         for slot in &mut self.slots {
             slot.rehome(hint);
@@ -1838,13 +1883,23 @@ impl MpegTsDemuxer {
         // demuxer does not follow: decide that from the two PID bytes
         // before parsing anything else.
         let pid = (u16::from(raw[1] & 0x1F) << 8) | u16::from(raw[2]);
-        if self.pid_slot[pid as usize] == 0 && pid != self.pcr_pid {
+        if self.pid_slot[pid as usize] == 0
+            && pid != self.pcr_pid
+            && pid != self.pmt_pid
+            && pid != PAT_PID
+        {
             return;
         }
         let Ok(pkt) = TsPacket::parse(raw) else {
             self.stats.malformed_packets += 1;
             return;
         };
+        if pid == PAT_PID {
+            self.watch_pat(&pkt);
+        }
+        if pid == self.pmt_pid {
+            self.watch_pmt(&pkt);
+        }
         // PCR recovery runs on the PCR_PID regardless of whether that
         // PID also carries an elementary stream we track.
         if pkt.pid == self.pcr_pid
@@ -1862,6 +1917,9 @@ impl MpegTsDemuxer {
         // unless the adaptation field announces the discontinuity.
         let has_payload = raw[3] & 0x10 != 0;
         if has_payload {
+            if pkt.transport_scrambling_control != 0 {
+                self.stats.scrambled_packets += 1;
+            }
             let cc = pkt.continuity_counter;
             let announced = pkt
                 .adaptation_field
@@ -1894,6 +1952,129 @@ impl MpegTsDemuxer {
                 self.stats.damaged_pes += 1;
             }
         }
+    }
+
+    /// Follow the PAT: when a currently applicable table lists the
+    /// selected program under another `program_map_PID`, watch that
+    /// PID from now on.
+    fn watch_pat(&mut self, pkt: &TsPacket<'_>) {
+        if pkt.payload.is_empty() {
+            return;
+        }
+        let Ok(sections) =
+            self.pat_watch
+                .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+        else {
+            return;
+        };
+        for section in &sections {
+            let Ok(pat) = ProgramAssociationTable::parse(section) else {
+                continue;
+            };
+            if !pat.current_next_indicator {
+                continue;
+            }
+            let listed = pat
+                .programs
+                .iter()
+                .find(|&&(number, _)| number == self.selected_program)
+                .map(|&(_, pid)| pid & 0x1FFF);
+            if let Some(pid) = listed
+                && pid != self.pmt_pid
+            {
+                self.pmt_pid = pid;
+                self.pmt_watch.reset();
+                self.stats.program_map_changes += 1;
+            }
+        }
+    }
+
+    /// Follow the selected program's PMT: a currently applicable
+    /// section that differs from the map in effect re-points the
+    /// streams (see the type docs).
+    fn watch_pmt(&mut self, pkt: &TsPacket<'_>) {
+        if pkt.payload.is_empty() {
+            return;
+        }
+        let Ok(sections) =
+            self.pmt_watch
+                .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+        else {
+            return;
+        };
+        for section in &sections {
+            let Ok(pmt) = ProgramMapTable::parse(section) else {
+                continue;
+            };
+            if pmt.program_number != self.selected_program || !pmt.current_next_indicator {
+                continue;
+            }
+            let entries = pmt_signature(&pmt);
+            if entries == self.pmt_entries && pmt.pcr_pid == self.pcr_pid {
+                continue;
+            }
+            self.apply_program_map(&pmt, entries);
+        }
+    }
+
+    /// Re-point every stream at the first not-yet-taken entry of its
+    /// codec in `pmt`.
+    fn apply_program_map(&mut self, pmt: &ProgramMapTable, entries: Vec<(u8, u16)>) {
+        self.stats.program_map_changes += 1;
+        let codecs: Vec<Option<CodecId>> = pmt
+            .streams
+            .iter()
+            .map(|e| pmt_entry_codec(e).map(|p| p.codec_id))
+            .collect();
+        let mut taken = vec![false; codecs.len()];
+        let mut target: Vec<Option<u16>> = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let hit = (0..codecs.len())
+                .find(|&k| !taken[k] && codecs[k].as_ref() == Some(&slot.pmt_codec));
+            if let Some(k) = hit {
+                taken[k] = true;
+            }
+            target.push(hit.map(|k| pmt.streams[k].elementary_pid & 0x1FFF));
+        }
+        for (i, new_pid) in target.iter().enumerate() {
+            let slot = &mut self.slots[i];
+            let unchanged = slot.mapped && *new_pid == Some(slot.pid);
+            if unchanged {
+                continue;
+            }
+            // Whatever was in flight on the old PID is complete as far
+            // as this stream will ever see it.
+            let flushed = slot.reassembler.flush();
+            let corrupt = std::mem::take(&mut slot.damaged);
+            slot.last_cc = None;
+            slot.duplicate_seen = false;
+            if slot.mapped {
+                self.pid_slot[slot.pid as usize] = 0;
+            }
+            slot.mapped = new_pid.is_some();
+            if let Some(pid) = *new_pid {
+                slot.pid = pid;
+            }
+            match flushed {
+                Ok(Some(pes)) => {
+                    self.emit_pes(i, pes, corrupt);
+                }
+                Ok(None) => {}
+                Err(_) => self.stats.damaged_pes += 1,
+            }
+        }
+        // Old entries are cleared above before any new one is set, so
+        // two streams trading PIDs end up routed correctly.
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.mapped {
+                self.pid_slot[slot.pid as usize] = i as u16 + 1;
+            }
+        }
+        if pmt.pcr_pid != self.pcr_pid {
+            self.pcr_pid = pmt.pcr_pid;
+            self.pcr_tracker.reset();
+        }
+        self.pmt_entries = entries;
     }
 
     /// Flush every per-PID reassembler — used once the input runs
@@ -2077,6 +2258,21 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
         }
     }
     None
+}
+
+/// Codec parameters a PMT entry names: by `stream_type`, or — for PES
+/// private data — by its descriptors. `None` for entries this demuxer
+/// does not surface.
+fn pmt_entry_codec(entry: &crate::PmtStream) -> Option<CodecParameters> {
+    codec_params_for_stream_type(entry.stream_type).or_else(|| codec_params_for_private_pes(entry))
+}
+
+/// `(stream_type, elementary_PID)` of every PMT entry, in order.
+fn pmt_signature(pmt: &ProgramMapTable) -> Vec<(u8, u16)> {
+    pmt.streams
+        .iter()
+        .map(|e| (e.stream_type, e.elementary_pid & 0x1FFF))
+        .collect()
 }
 
 /// `stream_type` 0x06 (PES private data, Table 2-29) names its codec

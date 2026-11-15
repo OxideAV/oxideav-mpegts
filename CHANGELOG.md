@@ -11,13 +11,21 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- Demuxer follows program-map changes while streaming: when the PAT
+  moves the selected program to another `program_map_PID`, or its PMT
+  assigns different elementary PIDs or a different `PCR_PID`, each
+  stream is re-pointed at the first not-yet-taken PMT entry of its
+  codec (the PES packet in flight on the old PID is handed out first).
+  The stream list stays as opened: a stream whose codec the new PMT no
+  longer lists stops, new entries are not picked up.
 - Demuxer robustness surface: `MpegTsDemuxer::stats()` returning
-  `TsDemuxStats` (resync bytes, malformed / error-flagged / duplicate
-  packets, continuity gaps, dropped PES packets), `leading_bytes()`,
-  `set_max_pes_bytes()`, `buffered_bytes()`.
+  `TsDemuxStats` (resync bytes, malformed / error-flagged / duplicate /
+  scrambled packets, continuity gaps, dropped PES packets, program-map
+  changes), `leading_bytes()`, `set_max_pes_bytes()`,
+  `buffered_bytes()`.
 - `locate_packet_layout` — finds the 188 / 192 / 204-byte packet grid
   in a buffer that does not start on a packet boundary and returns the
-  offset of the first whole packet.
+  offset of the first packet on it.
 - `NearestEpochUnwrap` — reorder-tolerant 33-bit timestamp unwrapper
   (each value extends to the wrap epoch nearest the previous one).
 - `PesPacket::parse_header` (header fields + payload offset, no payload
@@ -94,6 +102,10 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 - `PsiSectionAssembler` accepts private sections up to 4096 bytes
   (§2.4.4.11) — DVB EIT sections longer than 1024 bytes used to be
   refused; the four fixed PSI tables keep the 1024-byte bound.
+- `mpeg2_crc32` works a byte at a time from a 256-entry table instead
+  of bit by bit (same values).
+- Fuzz `structured_mutate` mutations gain byte insertions / deletions
+  (grid shifts) and leading bytes ahead of the first packet.
 - Fuzz `demux` / `structured_mutate` battery: the demuxer is drained to
   the end under liveness and memory oracles (end of stream within a
   call count bounded by the input, no more payload out than bytes in,
