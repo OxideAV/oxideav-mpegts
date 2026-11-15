@@ -23,3 +23,9 @@ registry = ["dep:oxideav-core"]
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
 thiserror = "2"
+
+# Mux / demux throughput (plain `main`, no harness dependency).
+[[bench]]
+name = "throughput"
+harness = false
+required-features = ["registry"]

@@ -111,6 +111,11 @@ const CBR_AUDIO_LEAD_27MHZ: i64 = 27_000_000 * 4 / 100;
 /// CBR mode: emit a PCR at least this often on the byte clock
 /// (§2.7.2 bounds the interval at 0,1 s; aim at 40 ms).
 const CBR_PCR_INTERVAL_27MHZ: i64 = 27_000_000 / 25;
+
+/// Gathered output handed to the sink mid-call once it reaches this
+/// size, so one very large frame (or a long CBR null run) does not sit
+/// in memory whole.
+const OUT_BUF_FLUSH_BYTES: usize = 256 << 10;
 /// Full modulus of the 33+9-bit PCR field.
 const PCR_MODULUS_27MHZ: i64 = (1i64 << 33) * 300;
 /// §2.4.2.3 transport-buffer size — the CBR pacer keeps every paced
@@ -665,6 +670,11 @@ impl Default for MpegTsMuxConfig {
 /// MPEG-TS muxer state.
 pub struct MpegTsMuxer {
     output: Box<dyn WriteSeek>,
+    /// Transport packets produced by the call in progress, handed to
+    /// `output` in one write when the call returns (or sooner, once
+    /// [`OUT_BUF_FLUSH_BYTES`] have gathered) — a frame costs the sink
+    /// one write instead of one per 188-byte packet.
+    out_buf: Vec<u8>,
     /// Per-stream PID + stream_type + stream_id + CC + owning program.
     tracks: Vec<TrackState>,
     /// One entry per multiplexed program — its PMT PID, PCR PID, and the
@@ -982,6 +992,7 @@ impl MpegTsMuxer {
 
         Ok(Self {
             output,
+            out_buf: Vec::with_capacity(64 << 10),
             tracks,
             programs,
             idx_to_track,
@@ -1170,11 +1181,32 @@ impl MpegTsMuxer {
 
     /// Emit one 188-byte packet, advancing the CBR byte clock.
     fn emit(&mut self, pkt: &[u8; TS_PACKET_LEN]) -> CoreResult<()> {
-        self.output.write_all(pkt).map_err(CoreError::Io)?;
+        self.out_buf.extend_from_slice(pkt);
         if let Some(cbr) = &mut self.cbr {
             cbr.bytes_out += TS_PACKET_LEN as u64;
         }
+        if self.out_buf.len() >= OUT_BUF_FLUSH_BYTES {
+            self.flush_out()?;
+        }
         Ok(())
+    }
+
+    /// Hand every gathered packet to the sink.
+    fn flush_out(&mut self) -> CoreResult<()> {
+        if self.out_buf.is_empty() {
+            return Ok(());
+        }
+        let written = self.output.write_all(&self.out_buf);
+        self.out_buf.clear();
+        written.map_err(CoreError::Io)
+    }
+
+    /// Run one caller-facing write step and flush what it produced, so
+    /// nothing stays behind in the muxer between calls.
+    fn flushing(&mut self, step: impl FnOnce(&mut Self) -> CoreResult<()>) -> CoreResult<()> {
+        let done = step(self);
+        let flushed = self.flush_out();
+        done.and(flushed)
     }
 
     /// Emit a null packet (PID 0x1FFF) — CBR stream-time filler.
@@ -1852,8 +1884,19 @@ impl MpegTsMuxer {
     /// the first TS packet of a video PES, and injects standalone
     /// PCR-only packets when the inter-PCR interval would be exceeded.
     fn write_pes_packet(&mut self, track_idx: usize, packet: &Packet) -> CoreResult<()> {
-        let track = self.tracks[track_idx].clone();
-        let prog_idx = track.program;
+        // The few fixed facts of the track this function needs; the
+        // rest of its state is updated in place as packets go out.
+        struct TrackFacts {
+            pid: u16,
+            stream_id: u8,
+            is_video: bool,
+        }
+        let prog_idx = self.tracks[track_idx].program;
+        let track = TrackFacts {
+            pid: self.tracks[track_idx].pid,
+            stream_id: self.tracks[track_idx].stream_id,
+            is_video: self.tracks[track_idx].is_video,
+        };
         let pcr_pid = self.programs[prog_idx].pcr_pid;
         // CBR: anchor the byte clock on the first timestamped frame,
         // then burn stream time with null packets until this frame is
@@ -1934,6 +1977,7 @@ impl MpegTsMuxer {
             self.backfill_pcr_chain(prog_idx, p.saturating_sub(900).max(0))?;
         }
         let pes = build_pes(track.stream_id, packet)?;
+        let data: &[u8] = &packet.data;
         let pcr = pcr_on_this_pes.map(|p| {
             // PCR-base = PTS - ~10ms guard so the PCR never leads the
             // first access unit it accompanies. Both are 90 kHz units;
@@ -1959,14 +2003,14 @@ impl MpegTsMuxer {
             && (track.pid != self.programs[prog_idx].pcr_pid || pcr.is_some());
         let splice = self.tracks[track_idx].pending_splice.take();
         let last = pes.len() - 1;
-        for (i, chunk) in pes.iter().enumerate() {
+        for (i, (header, body)) in pes.iter().enumerate() {
             // The PCR + random-access indicator belong to the frame's
             // first PES envelope; an armed splicing point lands after
             // the frame's LAST byte, i.e. the last envelope.
             self.write_pes_bytes_as_ts(
-                track.pid,
                 track_idx,
-                chunk,
+                header,
+                &data[body.clone()],
                 pcr.map(|(_, base, ext)| (base, ext)).filter(|_| i == 0),
                 random_access && i == 0,
                 splice.filter(|_| i == last),
@@ -1986,8 +2030,9 @@ impl MpegTsMuxer {
         }
     }
 
-    /// Fragment a contiguous PES byte buffer into 188-byte TS packets
-    /// for `pid`, with PUSI=1 on the first packet and continuity-
+    /// Fragment one PES packet — its `header` bytes followed by its
+    /// `body` (a slice of the caller's frame) — into 188-byte TS
+    /// packets on the track's PID, with PUSI=1 on the first packet and continuity-
     /// counter increment per packet. `first_packet_pcr` is an optional
     /// PCR carried in the FIRST packet's adaptation field;
     /// `random_access` sets the §2.4.3.5 `random_access_indicator`
@@ -2006,13 +2051,14 @@ impl MpegTsMuxer {
     /// countdown from the track's `post_splice` state.
     fn write_pes_bytes_as_ts(
         &mut self,
-        pid: u16,
         track_idx: usize,
-        pes: &[u8],
+        header: &[u8],
+        body: &[u8],
         first_packet_pcr: Option<(u64, u16)>,
         random_access: bool,
         splice: Option<SpliceSpec>,
     ) -> CoreResult<()> {
+        let pid = self.tracks[track_idx].pid;
         // A fresh splicing point supersedes any negative-countdown run
         // left over from the previous one — the field can only carry
         // one value per packet.
@@ -2034,12 +2080,26 @@ impl MpegTsMuxer {
         // otherwise overflow the 512-byte TBn on back-to-back
         // packets). Undeclared video stays back-to-back.
         let tb_rx = self.cbr_tb_rx_for_track(track_idx);
+        // The PES packet is `header` followed by `body`; `fill` copies
+        // a run of it starting at byte `from` into a TS payload window.
+        let pes_len = header.len() + body.len();
+        let fill = |dst: &mut [u8], from: usize| {
+            let from_header = header.len().saturating_sub(from).min(dst.len());
+            if from_header > 0 {
+                dst[..from_header].copy_from_slice(&header[from..from + from_header]);
+            }
+            let rest = dst.len() - from_header;
+            if rest > 0 {
+                let at = from + from_header - header.len();
+                dst[from_header..].copy_from_slice(&body[at..at + rest]);
+            }
+        };
         let mut cursor = 0usize;
         let mut first = true;
         // `Some(n)` once countdown annotation has started: this packet
         // and `n - 1` more finish the PES (countdown value `n - 1`).
         let mut splice_run: Option<usize> = None;
-        while cursor < pes.len() {
+        while cursor < pes_len {
             if let Some(rx) = tb_rx {
                 self.cbr_pace_tb(pid, rx)?;
             }
@@ -2056,7 +2116,7 @@ impl MpegTsMuxer {
             pkt[1] = pusi | ((pid >> 8) as u8 & 0b0001_1111);
             pkt[2] = pid as u8;
             let cc = self.tracks[track_idx].cc;
-            let remaining = pes.len() - cursor;
+            let remaining = pes_len - cursor;
             // Adaptation field carried when the first packet needs a
             // PCR / random-access flag, or when the (tail) fragment is
             // short and needs AF stuffing to land on 188 bytes
@@ -2136,12 +2196,11 @@ impl MpegTsMuxer {
                 pkt[4..4 + af.len()].copy_from_slice(&af);
                 let payload_start = 4 + af.len();
                 let take = (TS_PACKET_LEN - payload_start).min(remaining);
-                pkt[payload_start..payload_start + take]
-                    .copy_from_slice(&pes[cursor..cursor + take]);
+                fill(&mut pkt[payload_start..payload_start + take], cursor);
                 cursor += take;
             } else {
                 let take = payload_room_no_af.min(remaining);
-                pkt[4..4 + take].copy_from_slice(&pes[cursor..cursor + take]);
+                fill(&mut pkt[4..4 + take], cursor);
                 cursor += take;
             }
             self.emit(&pkt)?;
@@ -2171,18 +2230,31 @@ impl Muxer for MpegTsMuxer {
     }
 
     fn write_header(&mut self) -> CoreResult<()> {
-        self.write_pat()?;
-        self.write_cat()?;
-        self.write_pmt()?;
-        self.write_sdt()?;
-        self.write_nit()?;
-        self.write_eit()?;
-        self.write_time_tables(0)?;
-        self.header_written = true;
-        Ok(())
+        self.flushing(|m| {
+            m.write_pat()?;
+            m.write_cat()?;
+            m.write_pmt()?;
+            m.write_sdt()?;
+            m.write_nit()?;
+            m.write_eit()?;
+            m.write_time_tables(0)?;
+            m.header_written = true;
+            Ok(())
+        })
     }
 
     fn write_packet(&mut self, packet: &Packet) -> CoreResult<()> {
+        self.flushing(|m| m.write_packet_inner(packet))
+    }
+
+    fn write_trailer(&mut self) -> CoreResult<()> {
+        self.flushing(|m| m.write_trailer_inner())?;
+        self.output.flush().map_err(CoreError::Io)
+    }
+}
+
+impl MpegTsMuxer {
+    fn write_packet_inner(&mut self, packet: &Packet) -> CoreResult<()> {
         if !self.header_written {
             return Err(CoreError::invalid(
                 "mpegts muxer: write_packet called before write_header",
@@ -2216,7 +2288,7 @@ impl Muxer for MpegTsMuxer {
         self.write_pes_packet(track_idx, packet)
     }
 
-    fn write_trailer(&mut self) -> CoreResult<()> {
+    fn write_trailer_inner(&mut self) -> CoreResult<()> {
         // CBR: release every still-held frame in due order (each
         // write burns null packets up to its own release point).
         while let Some(ti) = self.cbr.as_ref().and_then(|cbr| {
@@ -2243,9 +2315,7 @@ impl Muxer for MpegTsMuxer {
         self.write_sdt()?;
         self.write_nit()?;
         self.write_eit()?;
-        self.write_time_tables(self.elapsed_seconds(self.last_pts_seen))?;
-        self.output.flush().map_err(CoreError::Io)?;
-        Ok(())
+        self.write_time_tables(self.elapsed_seconds(self.last_pts_seen))
     }
 }
 
@@ -2285,9 +2355,10 @@ fn advance_utc(dt: crate::psi::EitDateTime, seconds: u64) -> crate::psi::EitDate
 /// the `data_alignment_indicator`, which the muxer leaves clear).
 /// Timestamps ride the 33-bit ring, so extended values are reduced
 /// modulo `2^33` before encoding.
-fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<Vec<u8>>> {
+fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<(Vec<u8>, std::ops::Range<usize>)>> {
     let ring = |t: i64| (t as u64) & 0x1_FFFF_FFFF;
     let map_err = |e: crate::TsError| CoreError::invalid(format!("mpegts muxer: {e}"));
+    let len = packet.data.len();
     // Compare on the ring: two timestamps that coincide there must
     // collapse to the PTS-only form (§2.7.5 forbids DTS == PTS).
     let has_dts = packet.dts.is_some() && packet.dts.map(ring) != packet.pts.map(ring);
@@ -2299,7 +2370,10 @@ fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<Vec<u8>>> {
         ..Default::default()
     };
     if first_spec.unbounded_length {
-        return Ok(vec![first_spec.encode(&packet.data).map_err(map_err)?]);
+        return Ok(vec![(
+            first_spec.encode_header(len).map_err(map_err)?,
+            0..len,
+        )]);
     }
     // Bounded form: `PES_packet_length` counts the 3 post-length header
     // bytes, the optional PTS/DTS area, and the payload.
@@ -2309,21 +2383,26 @@ fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<Vec<u8>>> {
         _ => 0,
     };
     let first_max = u16::MAX as usize - 3 - opt_len;
-    if packet.data.len() <= first_max {
-        return Ok(vec![first_spec.encode(&packet.data).map_err(map_err)?]);
+    if len <= first_max {
+        return Ok(vec![(
+            first_spec.encode_header(len).map_err(map_err)?,
+            0..len,
+        )]);
     }
-    let mut out = vec![
-        first_spec
-            .encode(&packet.data[..first_max])
-            .map_err(map_err)?,
-    ];
+    let mut out = vec![(
+        first_spec.encode_header(first_max).map_err(map_err)?,
+        0..first_max,
+    )];
     let cont_spec = crate::pes::PesHeaderSpec {
         stream_id,
         ..Default::default()
     };
     let cont_max = u16::MAX as usize - 3;
-    for chunk in packet.data[first_max..].chunks(cont_max) {
-        out.push(cont_spec.encode(chunk).map_err(map_err)?);
+    let mut at = first_max;
+    while at < len {
+        let n = (len - at).min(cont_max);
+        out.push((cont_spec.encode_header(n).map_err(map_err)?, at..at + n));
+        at += n;
     }
     Ok(out)
 }
@@ -3109,6 +3188,7 @@ mod tests {
             let out: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
             let mut mx = MpegTsMuxer::new(out, std::slice::from_ref(&s)).expect("open");
             mx.write_psi_packet(0x0100, &mut cc, &section).expect("psi");
+            mx.flush_out().expect("flush");
         }
         let _ = output;
         let bytes = sink.into_bytes();
