@@ -133,9 +133,24 @@ const SECTION_HEADER_LEN: usize = 8;
 const SECTION_CRC_LEN: usize = 4;
 /// Upper bound on a single PSI section per §2.4.4: 3 header bytes
 /// (table_id + section_length wrappers) plus `section_length` ≤ 0x3FD
-/// (1021). For private sections this rises to 4096 — kept conservative
-/// here since the assembler is sized for ITU-T-defined PSI tables.
+/// (1021) — the bound for the tables this Recommendation defines
+/// itself (PAT, CAT, PMT, TSDT; §2.4.4.5 / .7 / .9 / .14).
 pub const MAX_PSI_SECTION_LEN: usize = 3 + 0x3FD;
+
+/// Upper bound on a private section (§2.4.4.11):
+/// `private_section_length` ≤ 0xFFD (4093), so 4096 bytes in all. This
+/// is the ceiling [`PsiSectionAssembler`] applies to every `table_id`
+/// above the four fixed PSI tables.
+pub const MAX_PRIVATE_SECTION_LEN: usize = 3 + 0xFFD;
+
+/// Largest whole section the assembler accepts for `table_id`.
+fn section_len_cap(table_id: u8) -> usize {
+    if table_id <= 0x03 {
+        MAX_PSI_SECTION_LEN
+    } else {
+        MAX_PRIVATE_SECTION_LEN
+    }
+}
 
 /// Parsed Program Association Table.
 #[derive(Debug, Default, Clone)]
@@ -1825,13 +1840,20 @@ fn parse_short_section_body(section: &[u8]) -> Result<&[u8], TsError> {
 ///   §2.4.3.3) discards the in-flight buffer rather than blindly
 ///   concatenating misordered bytes — the next PUSI=1 packet rebuilds
 ///   from scratch.
+/// * A packet repeating the previous `continuity_counter` is the one
+///   duplicate §2.4.3.3 permits ("two, and only two, consecutive
+///   transport stream packets"): its bytes were already consumed, so it
+///   is skipped. A second repeat is a discontinuity.
 ///
 /// The assembler is `table_id`-agnostic — it yields raw section bytes
 /// and leaves CRC verification + table parsing to the caller (the
 /// `Parse::parse` methods on [`ProgramAssociationTable`],
 /// [`ProgramMapTable`], and [`ConditionalAccessTable`] each verify
-/// CRC-32/MPEG-2 themselves). Sections that exceed
-/// [`MAX_PSI_SECTION_LEN`] are dropped with [`TsError::SectionLengthOverrun`].
+/// CRC-32/MPEG-2 themselves). A section claiming more than its
+/// `table_id` allows — [`MAX_PSI_SECTION_LEN`] for the four fixed PSI
+/// tables, [`MAX_PRIVATE_SECTION_LEN`] for every other — is dropped
+/// with [`TsError::SectionLengthOverrun`], so the assembler never holds
+/// more than 4096 bytes.
 #[derive(Debug, Default)]
 pub struct PsiSectionAssembler {
     /// Bytes of the section being assembled, including the 3-byte
@@ -1844,6 +1866,8 @@ pub struct PsiSectionAssembler {
     /// `None` until the first TS packet has been fed. Used to detect a
     /// CC skip that invalidates the in-flight buffer.
     last_cc: Option<u8>,
+    /// `true` once the packet carrying `last_cc` has been seen twice.
+    duplicate_seen: bool,
 }
 
 impl PsiSectionAssembler {
@@ -1859,6 +1883,7 @@ impl PsiSectionAssembler {
         self.in_flight.clear();
         self.target_len = None;
         self.last_cc = None;
+        self.duplicate_seen = false;
     }
 
     /// Feed one TS-packet payload to the assembler.
@@ -1892,6 +1917,12 @@ impl PsiSectionAssembler {
         // PUSI=1 packet.
         let cc = continuity_counter & 0x0F;
         if let Some(prev) = self.last_cc {
+            if cc == prev && !self.duplicate_seen {
+                // §2.4.3.3 duplicate packet: every byte was consumed
+                // with the original.
+                self.duplicate_seen = true;
+                return Ok(Vec::new());
+            }
             let expected = (prev + 1) & 0x0F;
             if cc != expected {
                 // CC skip — discard buffer.
@@ -1900,6 +1931,7 @@ impl PsiSectionAssembler {
             }
         }
         self.last_cc = Some(cc);
+        self.duplicate_seen = false;
 
         let mut out = Vec::new();
         let mut rest: &[u8] = payload;
@@ -1936,9 +1968,12 @@ impl PsiSectionAssembler {
                 self.target_len = None;
             }
             rest = after_ptr;
-        } else if self.target_len.is_none() {
+        } else if self.target_len.is_none() && self.in_flight.is_empty() {
             // PUSI=0 with nothing in flight — payload bytes belong to
-            // a section that started before we attached. Skip.
+            // a section that started before we attached. Skip. (A
+            // section whose 3-byte header straddled the packet edge
+            // has bytes in flight but no target yet, and continues
+            // below.)
             return Ok(out);
         } else {
             // PUSI=0 continuation — every payload byte feeds the
@@ -1967,9 +2002,14 @@ impl PsiSectionAssembler {
             let section_length =
                 ((((rest[1] & 0b0000_1111) as usize) << 8) | (rest[2] as usize)) & 0x0FFF;
             let total = 3 + section_length;
-            if total > MAX_PSI_SECTION_LEN {
+            if total > section_len_cap(rest[0]) {
                 self.in_flight.clear();
                 self.target_len = None;
+                if !out.is_empty() {
+                    // Sections completed earlier in this payload are
+                    // still good; only the overlong one is dropped.
+                    break;
+                }
                 return Err(TsError::SectionLengthOverrun {
                     claimed: section_length,
                     have: rest.len() - 3,
@@ -2012,7 +2052,7 @@ impl PsiSectionAssembler {
                 | (self.in_flight[2] as usize))
                 & 0x0FFF;
             let total = 3 + section_length;
-            if total > MAX_PSI_SECTION_LEN {
+            if total > section_len_cap(self.in_flight[0]) {
                 self.in_flight.clear();
                 self.target_len = None;
                 return Err(TsError::SectionLengthOverrun {
@@ -4043,6 +4083,115 @@ mod tests {
         assert!(matches!(
             SelectionInformationTable::parse(&section),
             Err(TsError::Unsupported(_))
+        ));
+    }
+
+    /// A section whose 3-byte length-bearing header straddles two TS
+    /// payloads must still assemble (the first payload ends one or two
+    /// bytes into the header).
+    #[test]
+    fn assembler_section_header_straddles_packet_edge() {
+        let first = build_pat_section(1, 0, &[(1, 0x100)]);
+        let second = build_pat_section(2, 1, &[(7, 0x200), (8, 0x300)]);
+        for head in [1usize, 2] {
+            // Payload 0: pointer, the first section, then `head` bytes
+            // of the second section's header at the very end.
+            let mut p0 = vec![0u8];
+            p0.extend_from_slice(&first);
+            let filler = 184 - p0.len() - head;
+            // A stuffing run would terminate the walk, so pad with a
+            // third complete section sized to fit instead.
+            let pad_len = filler - 3;
+            let mut pad = vec![0x80u8, (pad_len >> 8) as u8 & 0x0F, pad_len as u8];
+            pad.extend(std::iter::repeat_n(0xAA, pad_len));
+            p0.extend_from_slice(&pad);
+            p0.extend_from_slice(&second[..head]);
+            assert_eq!(p0.len(), 184);
+            let mut p1 = second[head..].to_vec();
+            p1.resize(184, 0xFF);
+
+            let mut asm = PsiSectionAssembler::new();
+            let out0 = asm.feed(&p0, true, 0).unwrap();
+            assert_eq!(out0.len(), 2, "head {head}");
+            assert_eq!(out0[0], first);
+            let out1 = asm.feed(&p1, false, 1).unwrap();
+            assert_eq!(out1, vec![second.clone()], "head {head}");
+        }
+    }
+
+    /// §2.4.3.3: a duplicate packet (same continuity_counter, sent
+    /// once more) neither breaks nor doubles the in-flight section; a
+    /// third copy is a discontinuity.
+    #[test]
+    fn assembler_ignores_one_duplicate_packet() {
+        let stuff = vec![0xC0u8, 150];
+        let mut descr = stuff.clone();
+        descr.extend(std::iter::repeat_n(0u8, 150));
+        let section = build_pmt_section(
+            1,
+            0,
+            0x100,
+            &[],
+            &[(0x1B, 0x1011, &descr), (0x81, 0x1100, &descr)],
+        );
+        assert!(section.len() > 183 && section.len() <= 183 + 184);
+        let mut p0 = vec![0u8];
+        p0.extend_from_slice(&section[..183]);
+        let mut p1 = section[183..].to_vec();
+        p1.resize(184, 0xFF);
+
+        let mut asm = PsiSectionAssembler::new();
+        assert!(asm.feed(&p0, true, 4).unwrap().is_empty());
+        assert!(asm.feed(&p0, true, 4).unwrap().is_empty()); // duplicate
+        assert_eq!(asm.feed(&p1, false, 5).unwrap(), vec![section.clone()]);
+        assert!(asm.feed(&p1, false, 5).unwrap().is_empty()); // duplicate
+
+        // Three copies: the third is not a legal duplicate.
+        let mut asm = PsiSectionAssembler::new();
+        assert!(asm.feed(&p0, true, 4).unwrap().is_empty());
+        assert!(asm.feed(&p0, true, 4).unwrap().is_empty());
+        assert!(asm.feed(&p0, true, 4).unwrap().is_empty());
+        assert_eq!(asm.feed(&p1, false, 5).unwrap(), vec![section]);
+    }
+
+    /// §2.4.4.11: private sections run to 4096 bytes; the four fixed
+    /// PSI tables stay capped at 1024.
+    #[test]
+    fn assembler_takes_long_private_sections_and_caps_fixed_tables() {
+        let body_len = 0xFFDusize;
+        let mut section = vec![0x4Eu8, 0xF0 | (body_len >> 8) as u8, body_len as u8];
+        section.extend((0..body_len).map(|i| (i % 253) as u8));
+        assert_eq!(section.len(), MAX_PRIVATE_SECTION_LEN);
+
+        let mut asm = PsiSectionAssembler::new();
+        let mut cc = 0u8;
+        let mut got = Vec::new();
+        let mut first = vec![0u8];
+        first.extend_from_slice(&section[..183]);
+        got.extend(asm.feed(&first, true, cc).unwrap());
+        for chunk in section[183..].chunks(184) {
+            cc = (cc + 1) & 0x0F;
+            let mut p = chunk.to_vec();
+            p.resize(184, 0xFF);
+            got.extend(asm.feed(&p, false, cc).unwrap());
+        }
+        assert_eq!(got, vec![section]);
+
+        // One byte more than a private section may claim.
+        let mut asm = PsiSectionAssembler::new();
+        let mut over = vec![0u8, 0x4E, 0xFF, 0xFE];
+        over.resize(184, 0);
+        assert!(matches!(
+            asm.feed(&over, true, 0),
+            Err(TsError::SectionLengthOverrun { claimed: 0xFFE, .. })
+        ));
+        // A PMT (table_id 2) claiming a private-sized section.
+        let mut asm = PsiSectionAssembler::new();
+        let mut pmt = vec![0u8, 0x02, 0xB4, 0x00];
+        pmt.resize(184, 0);
+        assert!(matches!(
+            asm.feed(&pmt, true, 0),
+            Err(TsError::SectionLengthOverrun { claimed: 0x400, .. })
         ));
     }
 }

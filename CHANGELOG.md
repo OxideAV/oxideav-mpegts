@@ -9,7 +9,36 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `PesPacket::parse_header` (header fields + payload offset, no payload
+  copy), `PesReassembler::with_max_bytes` / `buffered_len` / `reset`,
+  `DEFAULT_MAX_PES_BYTES`, `MAX_PRIVATE_SECTION_LEN`.
+
+### Changed
+
+- `PesReassembler` decodes the PES header as soon as it is complete and
+  collects payload bytes straight into the outgoing packet (one copy
+  instead of two, capacity taken from `PES_packet_length` or the
+  previous packet on the PID).
+- `PesReassembler` memory is bounded: a PES packet keeps at most the
+  bytes its `PES_packet_length` declares, an unbounded packet that
+  reaches the ceiling (32 MiB by default) leaves in pieces, and bytes
+  behind a header that never parses stop accumulating at the ceiling.
+- `PsiSectionAssembler` accepts private sections up to 4096 bytes
+  (§2.4.4.11) — DVB EIT sections longer than 1024 bytes used to be
+  refused; the four fixed PSI tables keep the 1024-byte bound.
+
 ### Fixed
+
+- `PesReassembler`: a PES packet whose header did not parse left the
+  reassembler stuck on it — every later `payload_unit_start` returned
+  the same error and the buffer grew without limit. The error now costs
+  exactly the damaged packet.
+- `PsiSectionAssembler`: a section whose 3-byte header straddled two TS
+  packets was never completed; a §2.4.3.3 duplicate packet discarded the
+  section in flight (it is now skipped); sections completed in a payload
+  ahead of an overlong one are no longer lost with it.
 
 - Program-stream demuxer: a pack header whose `pack_stuffing_length`
   claims more stuffing bytes than the input holds stepped the read
