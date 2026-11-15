@@ -50,15 +50,16 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 - Demuxer reads the source a 128 KiB block at a time instead of one
   packet per `read` call, follows PIDs through a direct 8192-entry
   table instead of five hash maps, and skips packets of other PIDs from
-  the two PID bytes. Demux throughput on the bench stream: 2.3 → 4.9
-  GiB/s from memory, 0.33 → 3.8 GiB/s from an unbuffered file. The
+  the two PID bytes. Demux throughput on the bench stream: 1 450 →
+  4 051 MiB/s from memory (2.8×), 226 → 2 663 MiB/s from an unbuffered
+  file (11.8×). The
   duration probe, PCR bisection and access-point index scan read in
   blocks too.
 - Muxer hands each call's packets to the sink in one write instead of
   one per 188-byte packet, and fragments a frame from its PES header
   and payload directly instead of first copying the payload behind the
   header. Output is byte-identical; mux throughput to an unbuffered
-  file: 0.1 → 1.5 GiB/s.
+  file: 51 → 1 142 MiB/s (22×), to memory 2 342 → 3 017 MiB/s.
 - Demuxer streaming no longer ends on damaged input. Bytes that break
   the packet grid are skipped by a byte-granular search for the next
   three aligned sync bytes (inserted or deleted bytes used to end the

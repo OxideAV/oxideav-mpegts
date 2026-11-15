@@ -18,9 +18,14 @@
 //!   sections that overflow the ~184-byte per-TS payload budget
 //!   (common for PMTs with rich descriptor blocks) are reassembled
 //!   across as many same-PID continuation packets as the section
-//!   spans, per §2.4.4. Multi-section tables (`last_section_number >
-//!   0`) still pick the first section — the table-level cross-section
-//!   join is a separate follow-up.
+//!   spans, per §2.4.4. Every section of a multi-section PAT
+//!   (`last_section_number > 0`) is collected; a PMT is one section
+//!   per program by definition (§2.4.4.9).
+//! * Damaged input. The streaming path resynchronises byte by byte,
+//!   drops what does not parse, and keeps going; the PAT and the
+//!   selected program's PMT are followed, so a mid-stream PID
+//!   reassignment re-points the streams. See [`MpegTsDemuxer`] and
+//!   [`TsDemuxStats`].
 //! * Per-PID streams. Streams whose [`StreamType`] maps to an audio /
 //!   video / subtitle [`CodecParameters`] surface as
 //!   [`StreamInfo`]s the muxer can write; streams whose type we don't
@@ -30,9 +35,9 @@
 //! ## Time base
 //!
 //! TS PTS / DTS are in 90 kHz units. Each [`StreamInfo`] uses
-//! `TimeBase::new(1, 90_000)` and packet timestamps are the raw
-//! 33-bit values without rescaling — downstream muxers do their own
-//! base conversion.
+//! `TimeBase::new(1, 90_000)`; packet timestamps are the 33-bit wire
+//! values unwrapped onto one 64-bit axis (§2.4.3.7), without
+//! rescaling — downstream muxers do their own base conversion.
 
 use std::collections::VecDeque;
 use std::io::Seek;
