@@ -126,8 +126,10 @@ fn skip_scaling_list(r: &mut Bits<'_>, size: usize) -> Option<()> {
     let mut next = 8i32;
     for _ in 0..size {
         if next != 0 {
-            let delta = r.se()?;
-            next = (last + delta + 256) % 256;
+            // Modulo-256 update; widened so a hostile delta_scale
+            // cannot overflow the sum.
+            let delta = r.se()? as i64;
+            next = (last as i64 + delta).rem_euclid(256) as i32;
         }
         last = if next == 0 { last } else { next };
     }
@@ -152,7 +154,12 @@ pub(crate) fn parse_h264_sps(rbsp: &[u8]) -> Option<VideoEsParams> {
         if chroma_format_idc == 3 {
             separate_colour_plane = r.u(1)?;
         }
-        bit_depth_luma = 8 + r.ue()?;
+        // A depth that does not fit a byte is not a usable SPS.
+        let luma_minus8 = r.ue()?;
+        if luma_minus8 > 247 {
+            return None;
+        }
+        bit_depth_luma = 8 + luma_minus8;
         r.ue()?; // bit_depth_chroma_minus8
         r.u(1)?; // qpprime_y_zero_transform_bypass_flag
         if r.u(1)? == 1 {
@@ -609,5 +616,39 @@ mod tests {
         let p = mpeg12_params(&es[..12]).unwrap();
         assert!(!p.mpeg2);
         assert_eq!(p.chroma_format, 1);
+    }
+
+    /// Minimised from a fuzz finding: a scaling list whose delta_scale
+    /// is near `i32::MAX`, and a bit depth near `u32::MAX`, must be
+    /// rejected or reduced without overflowing.
+    #[test]
+    fn hostile_sps_scaling_delta_and_bit_depth_do_not_overflow() {
+        // High profile, chroma 1, depth 0/0, bypass 0, scaling matrix
+        // present, first list present with a 31-zero-prefix se(v).
+        let mut w = W::new();
+        w.u(8, 100);
+        w.u(8, 0);
+        w.u(8, 40);
+        w.ue(0);
+        w.ue(1);
+        w.ue(0);
+        w.ue(0);
+        w.u(1, 0);
+        w.u(1, 1);
+        w.u(1, 1);
+        w.ue(0xFFFF_FFFD); // se(v) magnitude 2^31 - 1
+        w.u(32, 0xFFFF_FFFF);
+        w.u(32, 0xFFFF_FFFF);
+        let _ = parse_h264_sps(&w.0);
+
+        let mut w = W::new();
+        w.u(8, 100);
+        w.u(8, 0);
+        w.u(8, 40);
+        w.ue(0);
+        w.ue(1);
+        w.ue(0xFFFF_FFFE); // bit_depth_luma_minus8
+        w.u(32, 0);
+        assert_eq!(parse_h264_sps(&w.0), None);
     }
 }

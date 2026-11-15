@@ -132,6 +132,9 @@ pub struct MpegPsDemuxer {
     input: Box<dyn ReadSeek>,
     buf: Vec<u8>,
     pos: usize,
+    /// Input bytes already compacted out of `buf`: the absolute offset
+    /// of `buf[0]`.
+    drained: u64,
     eof: bool,
     streams: Vec<StreamInfo>,
     keys: HashMap<StreamKey, u32>,
@@ -165,6 +168,7 @@ impl MpegPsDemuxer {
             input,
             buf: Vec::new(),
             pos: 0,
+            drained: 0,
             eof: false,
             streams: Vec::new(),
             keys: HashMap::new(),
@@ -203,6 +207,7 @@ impl MpegPsDemuxer {
         d.input.seek(SeekFrom::Start(0)).map_err(CoreError::Io)?;
         d.buf.clear();
         d.pos = 0;
+        d.drained = 0;
         d.eof = false;
         if d.streams.is_empty() {
             return Err(CoreError::invalid(
@@ -218,6 +223,7 @@ impl MpegPsDemuxer {
         while self.buf.len().saturating_sub(self.pos) < n && !self.eof {
             if self.pos > 0 && self.pos >= self.buf.len() / 2 {
                 self.buf.drain(..self.pos);
+                self.drained += self.pos as u64;
                 self.pos = 0;
             }
             let old = self.buf.len();
@@ -326,13 +332,13 @@ impl MpegPsDemuxer {
         let mut first_pts: HashMap<StreamKey, u64> = HashMap::new();
         let mut payloads: HashMap<StreamKey, Vec<u8>> = HashMap::new();
         let mut first_raw: HashMap<StreamKey, Vec<u8>> = HashMap::new();
-        let mut consumed = 0u64;
-        while consumed < DISCOVERY_BYTES {
-            let before = self.pos;
+        // Absolute input offsets, so a buffer compaction inside
+        // `next_unit` cannot hide progress from the budget.
+        let start = self.drained + self.pos as u64;
+        while self.drained + self.pos as u64 - start < DISCOVERY_BYTES {
             let Some(unit) = self.next_unit()? else {
                 break;
             };
-            consumed += self.pos.saturating_sub(before) as u64;
             let Unit::Pes(bytes) = unit else {
                 continue;
             };
@@ -728,6 +734,13 @@ fn find_scr(buf: &[u8], last: bool) -> Option<u64> {
     found
 }
 
+/// Ceiling on the elementary-stream bytes one video stream buffers
+/// while waiting for an access-unit boundary.
+const MAX_AU_BYTES: usize = 16 << 20;
+
+/// Ceiling on the PES timestamps waiting for their access unit.
+const MAX_ANCHORS: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoKind {
     Mpeg12,
@@ -843,7 +856,50 @@ impl VideoAuSplitter {
         }
         // Every position before `i` has been classified exactly once.
         self.scanned = i;
+        self.bound(&mut out);
         out
+    }
+
+    /// Keep the buffered bytes and the timestamp anchors bounded
+    /// whatever the input: bytes that precede any access-unit start are
+    /// dropped once scanned, and an access unit that outgrows
+    /// [`MAX_AU_BYTES`] without meeting a boundary is handed out in
+    /// pieces.
+    fn bound(&mut self, out: &mut Vec<VideoAu>) {
+        match self.au_start {
+            None => {
+                // One byte stays: it may be the leading zero of a
+                // 4-byte start code still to be classified.
+                let drop = self.scanned.saturating_sub(1);
+                if drop > 0 {
+                    self.buf.drain(..drop);
+                    self.base += drop as u64;
+                    self.scanned -= drop;
+                    // The newest timestamp at or before the new front
+                    // still belongs to the next access unit to start.
+                    let mut last = None;
+                    while let Some(&a) = self.anchors.front() {
+                        if a.0 > self.base {
+                            break;
+                        }
+                        last = self.anchors.pop_front();
+                    }
+                    if let Some((_, p, d)) = last {
+                        self.anchors.push_front((self.base, p, d));
+                    }
+                }
+            }
+            Some(s) if self.buf.len() > MAX_AU_BYTES && self.scanned > s => {
+                let piece = self.cut(s, self.scanned);
+                out.push(piece);
+                self.au_start = Some(0);
+                self.key = false;
+            }
+            Some(_) => {}
+        }
+        while self.anchors.len() > MAX_ANCHORS {
+            self.anchors.pop_front();
+        }
     }
 
     /// Is the unit starting with start code `code` (next byte `next`,
@@ -1185,5 +1241,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Memory stays bounded when the elementary stream never offers an
+    /// access-unit boundary: unanchored bytes are dropped, timestamp
+    /// anchors do not pile up, and an oversized unit leaves in pieces.
+    #[test]
+    fn video_splitter_buffers_are_bounded() {
+        let mut v = VideoAuSplitter::new(VideoKind::Mpeg12);
+        let junk = vec![0x55u8; 4096];
+        for k in 0..4096i64 {
+            assert!(v.push(&junk, Some(k), None).is_empty());
+            assert!(v.buf.len() <= 2 * junk.len());
+            assert!(v.anchors.len() <= 2);
+        }
+        // The newest timestamp still lands on the first unit to start.
+        let mut pic = vec![0, 0, 1, 0x00, 0x00, 0x08, 0, 0];
+        pic.extend(vec![0x55u8; 64]);
+        assert!(v.push(&pic, None, None).is_empty());
+        let aus = v.push(&[0, 0, 1, 0x00, 0x00, 0x08, 0, 0], None, None);
+        assert_eq!(aus.len(), 1);
+        assert_eq!(aus[0].pts, Some(4095));
+
+        // One picture followed by an endless slice body.
+        let mut v = VideoAuSplitter::new(VideoKind::Mpeg12);
+        let mut total = v.push(&pic, Some(7), None).len();
+        let body = vec![0x55u8; 1 << 20];
+        let mut emitted = 0usize;
+        for _ in 0..40 {
+            for au in v.push(&body, None, None) {
+                emitted += au.data.len();
+                total += 1;
+            }
+            assert!(v.buf.len() <= MAX_AU_BYTES + body.len());
+        }
+        assert!(total >= 2, "oversized unit must be handed out in pieces");
+        assert!(emitted >= 16 << 20);
     }
 }

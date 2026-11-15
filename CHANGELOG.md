@@ -16,6 +16,16 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   cursor past the buffered window and panicked on the next refill
   (found by the scheduled fuzz run). The stuffing is now buffered and
   the cursor clamped to the window.
+- Elementary-stream parameter probe: an H.264 SPS with an out-of-range
+  scaling-list delta or bit depth overflowed 32-bit arithmetic; both are
+  now computed without overflow (found by a local fuzz run).
+- Program-stream video re-framing keeps its buffers bounded whatever
+  the input: bytes ahead of any access-unit start are dropped once
+  scanned, an access unit that grows past 16 MiB without a boundary is
+  handed out in pieces, and waiting PES timestamps are capped.
+- Program-stream discovery budget is measured in absolute input bytes,
+  so buffer compaction no longer lets the open-time pass read past its
+  4 MiB limit.
 
 ### Added
 
