@@ -1840,10 +1840,12 @@ fn parse_short_section_body(section: &[u8]) -> Result<&[u8], TsError> {
 ///   §2.4.3.3) discards the in-flight buffer rather than blindly
 ///   concatenating misordered bytes — the next PUSI=1 packet rebuilds
 ///   from scratch.
-/// * A packet repeating the previous `continuity_counter` is the one
-///   duplicate §2.4.3.3 permits ("two, and only two, consecutive
-///   transport stream packets"): its bytes were already consumed, so it
-///   is skipped. A second repeat is a discontinuity.
+/// * A packet repeating the previous `continuity_counter` **and** the
+///   previous payload is the one duplicate §2.4.3.3 permits ("two, and
+///   only two, consecutive transport stream packets", every byte
+///   duplicated): its bytes were already consumed, so it is skipped. A
+///   second repeat, or a repeated counter over a different payload, is
+///   a discontinuity.
 ///
 /// The assembler is `table_id`-agnostic — it yields raw section bytes
 /// and leaves CRC verification + table parsing to the caller (the
@@ -1868,6 +1870,8 @@ pub struct PsiSectionAssembler {
     last_cc: Option<u8>,
     /// `true` once the packet carrying `last_cc` has been seen twice.
     duplicate_seen: bool,
+    /// Fingerprint of the payload that carried `last_cc`.
+    last_payload: crate::packet::PayloadMark,
 }
 
 impl PsiSectionAssembler {
@@ -1916,8 +1920,9 @@ impl PsiSectionAssembler {
         // is no longer trustable, so drop it and resume on the next
         // PUSI=1 packet.
         let cc = continuity_counter & 0x0F;
+        let mark = crate::packet::PayloadMark::of(payload);
         if let Some(prev) = self.last_cc {
-            if cc == prev && !self.duplicate_seen {
+            if cc == prev && !self.duplicate_seen && mark == self.last_payload {
                 // §2.4.3.3 duplicate packet: every byte was consumed
                 // with the original.
                 self.duplicate_seen = true;
@@ -1932,6 +1937,7 @@ impl PsiSectionAssembler {
         }
         self.last_cc = Some(cc);
         self.duplicate_seen = false;
+        self.last_payload = mark;
 
         let mut out = Vec::new();
         let mut rest: &[u8] = payload;
@@ -4190,6 +4196,16 @@ mod tests {
         assert!(asm.feed(&p0, true, 4).unwrap().is_empty()); // duplicate
         assert_eq!(asm.feed(&p1, false, 5).unwrap(), vec![section.clone()]);
         assert!(asm.feed(&p1, false, 5).unwrap().is_empty()); // duplicate
+
+        // Same counter, different payload: not a duplicate — the
+        // section in flight is void and this packet starts afresh.
+        let mut asm = PsiSectionAssembler::new();
+        let other = build_pat_section(3, 0, &[(5, 0x500)]);
+        let mut q = vec![0u8];
+        q.extend_from_slice(&other);
+        q.resize(184, 0xFF);
+        assert!(asm.feed(&p0, true, 4).unwrap().is_empty());
+        assert_eq!(asm.feed(&q, true, 4).unwrap(), vec![other]);
 
         // Three copies: the third is not a legal duplicate.
         let mut asm = PsiSectionAssembler::new();

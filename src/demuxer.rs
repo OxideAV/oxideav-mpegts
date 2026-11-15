@@ -453,6 +453,8 @@ struct PidSlot {
     last_cc: Option<u8>,
     /// The packet carrying `last_cc` has already been seen twice.
     duplicate_seen: bool,
+    /// Fingerprint of the payload that carried `last_cc`.
+    last_payload: crate::packet::PayloadMark,
     /// Packets were lost inside the PES packet in flight.
     damaged: bool,
 }
@@ -915,6 +917,7 @@ impl MpegTsDemuxer {
                 splitter: syntax.map(crate::AudioFrameSplitter::new),
                 last_cc: None,
                 duplicate_seen: false,
+                last_payload: Default::default(),
                 damaged: false,
             });
         }
@@ -1912,15 +1915,17 @@ impl MpegTsDemuxer {
         };
         let slot = &mut self.slots[i];
         // §2.4.3.3: the counter increments on packets with a payload
-        // (adaptation_field_control '01' / '11'); the same value twice
-        // is a duplicate; any other step means packets were lost —
-        // unless the adaptation field announces the discontinuity.
+        // (adaptation_field_control '01' / '11'); the same value over
+        // the same payload is a duplicate; any other step means
+        // packets were lost — unless the adaptation field announces
+        // the discontinuity.
         let has_payload = raw[3] & 0x10 != 0;
         if has_payload {
             if pkt.transport_scrambling_control != 0 {
                 self.stats.scrambled_packets += 1;
             }
             let cc = pkt.continuity_counter;
+            let mark = crate::packet::PayloadMark::of(pkt.payload);
             let announced = pkt
                 .adaptation_field
                 .as_ref()
@@ -1928,7 +1933,7 @@ impl MpegTsDemuxer {
             if let Some(prev) = slot.last_cc
                 && !announced
             {
-                if cc == prev && !slot.duplicate_seen {
+                if cc == prev && !slot.duplicate_seen && mark == slot.last_payload {
                     slot.duplicate_seen = true;
                     self.stats.duplicate_packets += 1;
                     return;
@@ -1940,6 +1945,7 @@ impl MpegTsDemuxer {
             }
             slot.last_cc = Some(cc);
             slot.duplicate_seen = false;
+            slot.last_payload = mark;
         }
         match slot.reassembler.feed(&pkt) {
             Ok(Some(pes)) => {

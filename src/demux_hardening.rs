@@ -721,3 +721,25 @@ fn scrambling_control_is_counted_not_acted_on() {
     assert_eq!(shape(&drain(&mut d)), want);
     assert_eq!(d.stats().scrambled_packets, marked);
 }
+
+#[test]
+fn a_stuck_continuity_counter_does_not_cost_packets() {
+    // A writer that never advances the counter: every packet repeats
+    // it over a different payload, so none of them is a duplicate.
+    let mut ts = sample(10);
+    let reference = shape(&drain(&mut open(ts.bytes.clone())));
+    for pkt in ts.bytes.chunks_mut(TS_PACKET_LEN) {
+        let pid = (u16::from(pkt[1] & 0x1F) << 8) | u16::from(pkt[2]);
+        if pid == VIDEO {
+            pkt[3] &= 0xF0;
+        }
+    }
+    let mut d = open(ts.bytes);
+    let got = drain(&mut d);
+    let plain = |s: &Shape| -> Vec<(u32, Option<i64>, Vec<u8>)> {
+        s.iter().map(|(a, b, c, _)| (*a, *b, c.clone())).collect()
+    };
+    assert_eq!(plain(&shape(&got)), plain(&reference));
+    assert_eq!(d.stats().duplicate_packets, 0);
+    assert!(d.stats().continuity_errors > 0);
+}

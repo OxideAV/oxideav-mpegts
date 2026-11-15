@@ -610,6 +610,31 @@ pub fn detect_packet_layout(buf: &[u8]) -> Option<TsPacketLayout> {
     None
 }
 
+/// Fingerprint of a TS payload — its length plus its first and last
+/// eight bytes — used to tell a §2.4.3.3 duplicate packet ("each byte
+/// of the original packet shall be duplicated") from a different
+/// packet that merely repeats the continuity counter, without keeping
+/// the whole previous payload around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PayloadMark {
+    len: u8,
+    head: [u8; 8],
+    tail: [u8; 8],
+}
+
+impl PayloadMark {
+    pub(crate) fn of(payload: &[u8]) -> Self {
+        let mut mark = Self {
+            len: payload.len().min(255) as u8,
+            ..Self::default()
+        };
+        let n = payload.len().min(8);
+        mark.head[..n].copy_from_slice(&payload[..n]);
+        mark.tail[..n].copy_from_slice(&payload[payload.len() - n..]);
+        mark
+    }
+}
+
 /// Packets that must line up for [`locate_packet_layout`] to accept a
 /// grid that does not start at byte 0.
 const LOCATE_MIN_RUN: usize = 5;

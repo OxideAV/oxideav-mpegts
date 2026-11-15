@@ -408,7 +408,9 @@ fn demux_battery(bytes: &[u8], program: u16) {
     let n_streams = dmx.streams().len() as u32;
     let rows = drain_checked(&mut dmx, bytes.len(), CEILING);
 
-    let step = 1 + bytes.len() % 7;
+    // 1..=97 bytes per read: every packet boundary gets split
+    // somewhere without making the run crawl.
+    let step = 1 + bytes.len() % 97;
     let trickle: Box<dyn ReadSeek> = Box::new(Trickle {
         inner: Cursor::new(bytes.to_vec()),
         step,

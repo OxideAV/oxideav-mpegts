@@ -65,7 +65,7 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   stream); a tail shorter than one packet, or one holding no packets,
   is a clean end of stream; packets that do not parse or carry
   `transport_error_indicator` are dropped; §2.4.3.3 duplicate packets
-  are consumed once; a continuity-counter gap marks the PES packet in
+  (same counter over the same payload) are consumed once; a continuity-counter gap marks the PES packet in
   flight `corrupt`; a PES packet whose header does not parse is dropped
   on its own. Only a garbage run longer than 256 packets is still
   reported as an error, after which reading carries on.
