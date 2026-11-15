@@ -743,3 +743,58 @@ fn a_stuck_continuity_counter_does_not_cost_packets() {
     assert_eq!(d.stats().duplicate_packets, 0);
     assert!(d.stats().continuity_errors > 0);
 }
+
+/// A source that returns at most `step` bytes per `read`.
+struct Trickle {
+    inner: Cursor<Vec<u8>>,
+    step: usize,
+}
+
+impl std::io::Read for Trickle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.step);
+        self.inner.read(&mut buf[..n])
+    }
+}
+
+impl std::io::Seek for Trickle {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn output_does_not_depend_on_read_granularity() {
+    // Damage of every kind in one stream: leading bytes, an inserted
+    // run, a deleted run, a dropped packet, a cut tail.
+    let clean = sample(50).bytes;
+    let n = clean.len() / TS_PACKET_LEN;
+    let mut bytes = clean.clone();
+    bytes.truncate(clean.len() - 77);
+    let drop_at = (n / 2) * TS_PACKET_LEN;
+    bytes.drain(drop_at..drop_at + TS_PACKET_LEN);
+    let del = (n / 3) * TS_PACKET_LEN + 17;
+    bytes.drain(del..del + 9);
+    let ins = (n / 5) * TS_PACKET_LEN + 101;
+    for k in 0..21u8 {
+        bytes.insert(ins, 0x30 | (k & 0x0F));
+    }
+    let mut framed: Vec<u8> = vec![0x21; 333];
+    framed.extend_from_slice(&bytes);
+
+    let mut reference = open(framed.clone());
+    let want = shape(&drain(&mut reference));
+    let want_stats = reference.stats();
+    assert!(want.len() > 80);
+    assert!(want_stats.resync_bytes > 0);
+    for step in [1usize, 2, 3, 7, 187, 188, 189, 1000, 4096] {
+        let input: Box<dyn ReadSeek> = Box::new(Trickle {
+            inner: Cursor::new(framed.clone()),
+            step,
+        });
+        let mut d = MpegTsDemuxer::open_program(input, 1).expect("open");
+        assert_eq!(shape(&drain(&mut d)), want, "step {step}");
+        assert_eq!(d.stats(), want_stats, "step {step}");
+        assert_eq!(d.duration_micros(), reference.duration_micros());
+    }
+}
