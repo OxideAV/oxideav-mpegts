@@ -215,7 +215,7 @@ impl MpegPsDemuxer {
     /// Make sure at least `n` bytes are buffered past `pos` (fewer at
     /// end of input).
     fn fill(&mut self, n: usize) -> CoreResult<()> {
-        while self.buf.len() - self.pos < n && !self.eof {
+        while self.buf.len().saturating_sub(self.pos) < n && !self.eof {
             if self.pos > 0 && self.pos >= self.buf.len() / 2 {
                 self.buf.drain(..self.pos);
                 self.pos = 0;
@@ -270,7 +270,12 @@ impl MpegPsDemuxer {
                     self.pos += 4.min(b.len());
                     return Ok(Some(Unit::Other));
                 }
-                self.pos += 14 + (b[13] & 0x07) as usize;
+                // pack_stuffing_length (Table 2-39) may claim stuffing
+                // bytes the input does not hold: buffer them, and never
+                // step the cursor past the buffered window.
+                let total = 14 + (b[13] & 0x07) as usize;
+                self.fill(total)?;
+                self.pos = (self.pos + total).min(self.buf.len());
                 Ok(Some(Unit::Other))
             }
             PROGRAM_END => {
@@ -1153,6 +1158,32 @@ mod tests {
         junk.extend((0..5000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8));
         if let Ok(mut d) = MpegPsDemuxer::new(Box::new(Cursor::new(junk))) {
             while d.next_packet().is_ok() {}
+        }
+    }
+
+    /// Minimised input from the scheduled fuzz run: a pack header whose
+    /// `pack_stuffing_length` claims 7 stuffing bytes when only three
+    /// bytes follow. The cursor must stop at the end of the buffered
+    /// window instead of stepping past it.
+    #[test]
+    fn pack_stuffing_past_end_of_input_is_bounded() {
+        let crash: [u8; 17] = [
+            0x00, 0x00, 0x01, 0xBA, 0x47, 0x40, 0x00, 0x10, 0xFF, 0xFF, 0xFF, 0xFC, 0xF4, 0x0E,
+            0x59, 0x47, 0x00,
+        ];
+        assert!(MpegPsDemuxer::new(Box::new(Cursor::new(crash.to_vec()))).is_err());
+        // Every stuffing claim against every truncation of a stream
+        // that does carry a PES packet.
+        for stuffing in 0..8u8 {
+            let mut ps = pack_header(0);
+            ps[13] = 0xF8 | stuffing;
+            let head = ps.len();
+            ps.extend(pes(0xC0, Some(900), &mp2_frame(1)));
+            for cut in head..ps.len() {
+                if let Ok(mut d) = MpegPsDemuxer::new(Box::new(Cursor::new(ps[..cut].to_vec()))) {
+                    while d.next_packet().is_ok() {}
+                }
+            }
         }
     }
 }

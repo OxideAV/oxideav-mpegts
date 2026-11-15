@@ -9,6 +9,14 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Program-stream demuxer: a pack header whose `pack_stuffing_length`
+  claims more stuffing bytes than the input holds stepped the read
+  cursor past the buffered window and panicked on the next refill
+  (found by the scheduled fuzz run). The stuffing is now buffered and
+  the cursor clamped to the window.
+
 ### Added
 
 - Constructors for the builder inputs: `ProgramSpec::new(program_number,
