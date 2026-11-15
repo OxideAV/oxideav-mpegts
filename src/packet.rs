@@ -610,6 +610,46 @@ pub fn detect_packet_layout(buf: &[u8]) -> Option<TsPacketLayout> {
     None
 }
 
+/// Packets that must line up for [`locate_packet_layout`] to accept a
+/// grid that does not start at byte 0.
+const LOCATE_MIN_RUN: usize = 5;
+
+/// Find the packet grid in a buffer that need not start on a packet
+/// boundary — a capture cut mid-packet, or one with leading bytes
+/// that are not transport packets. Returns the layout and the byte
+/// offset of the first whole physical packet.
+///
+/// Offset 0 is judged by [`detect_packet_layout`] (two aligned packets
+/// suffice there). Any later offset needs the sync byte `0x47` at the
+/// layout's position in five consecutive packets, which chance bytes
+/// meet about once in 2^32 candidates. The search covers the whole
+/// buffer; the earliest offset wins, and at one offset the layouts are
+/// tried in the order 188 / 192 / 204.
+pub fn locate_packet_layout(buf: &[u8]) -> Option<(TsPacketLayout, usize)> {
+    if let Some(layout) = detect_packet_layout(buf) {
+        return Some((layout, 0));
+    }
+    let layouts = [
+        TsPacketLayout::STANDARD,
+        TsPacketLayout::PREFIXED_192,
+        TsPacketLayout::TRAILER_204,
+    ];
+    for start in 1..buf.len() {
+        for layout in layouts {
+            let last = start + (LOCATE_MIN_RUN - 1) * layout.packet_size + layout.sync_offset;
+            if last >= buf.len() {
+                continue;
+            }
+            if (0..LOCATE_MIN_RUN)
+                .all(|k| buf[start + k * layout.packet_size + layout.sync_offset] == TS_SYNC_BYTE)
+            {
+                return Some((layout, start));
+            }
+        }
+    }
+    None
+}
+
 /// Maximum byte size of an adaptation field including its length byte
 /// (§2.4.3.5 — `adaptation_field_length` caps at 183, so the field
 /// occupies at most 184 of the packet's 184 non-header bytes).

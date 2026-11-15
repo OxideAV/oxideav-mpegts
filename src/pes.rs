@@ -915,6 +915,12 @@ impl PesReassembler {
         self
     }
 
+    /// In-place form of [`Self::with_max_bytes`]; applies from the
+    /// next byte fed.
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes.max(184);
+    }
+
     /// Bytes currently held for the in-flight PES packet.
     pub fn buffered_len(&self) -> usize {
         self.buf.len() + self.head.as_ref().map_or(0, |h| h.payload.len())
@@ -1266,6 +1272,20 @@ impl PesHeaderSpec {
     /// non-video `stream_id`, or a bounded packet whose length
     /// overflows the 16-bit `PES_packet_length` field.
     pub fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, TsError> {
+        let mut out = self.encode_header(payload.len())?;
+        out.reserve_exact(payload.len());
+        out.extend_from_slice(payload);
+        Ok(out)
+    }
+
+    /// Encode just the PES packet header for a payload of
+    /// `payload_len` bytes — everything [`Self::encode`] writes ahead
+    /// of the payload, with `PES_packet_length` already accounting for
+    /// it. Lets a writer fragment header and payload from two slices
+    /// instead of first copying the payload behind the header.
+    ///
+    /// Same validation and errors as [`Self::encode`].
+    pub fn encode_header(&self, payload_len: usize) -> Result<Vec<u8>, TsError> {
         if !has_optional_pes_header(self.stream_id) {
             if self.pts_90k.is_some()
                 || self.dts_90k.is_some()
@@ -1280,13 +1300,12 @@ impl PesHeaderSpec {
                     what: "optional PES fields on a header-less stream_id",
                 });
             }
-            let len = u16::try_from(payload.len()).map_err(|_| TsError::InvalidField {
+            let len = u16::try_from(payload_len).map_err(|_| TsError::InvalidField {
                 what: "PES payload exceeds PES_packet_length",
             })?;
-            let mut out = Vec::with_capacity(6 + payload.len());
+            let mut out = Vec::with_capacity(6);
             out.extend_from_slice(&[0x00, 0x00, 0x01, self.stream_id]);
             out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(payload);
             return Ok(out);
         }
 
@@ -1394,7 +1413,7 @@ impl PesHeaderSpec {
         })?;
 
         // ---- PES_packet_length (bytes after the length field). ----
-        let tail_len = 3 + opt.len() + payload.len();
+        let tail_len = 3 + opt.len() + payload_len;
         let pes_packet_length: u16 = if self.unbounded_length {
             if !(0xE0..=0xEF).contains(&self.stream_id) {
                 return Err(TsError::InvalidField {
@@ -1408,7 +1427,7 @@ impl PesHeaderSpec {
             })?
         };
 
-        let mut out = Vec::with_capacity(9 + opt.len() + payload.len());
+        let mut out = Vec::with_capacity(9 + opt.len());
         out.extend_from_slice(&[0x00, 0x00, 0x01, self.stream_id]);
         out.extend_from_slice(&pes_packet_length.to_be_bytes());
         out.push(
@@ -1430,7 +1449,6 @@ impl PesHeaderSpec {
         );
         out.push(header_data_length);
         out.extend_from_slice(&opt);
-        out.extend_from_slice(payload);
         Ok(out)
     }
 }

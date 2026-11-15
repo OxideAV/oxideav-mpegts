@@ -321,10 +321,79 @@ fn walk_packets(bytes: &[u8]) -> Option<u16> {
     first_program
 }
 
-/// Typed demuxer battery: open on a program, drain bounded, build the
-/// RAP index, run all three seek paths. Whether a given input opens or
-/// errors is the stream's business — panicking is not.
+/// A source that hands out at most a few bytes per `read` call — the
+/// block reader must assemble the same packets whatever the read
+/// granularity.
+struct Trickle {
+    inner: Cursor<Vec<u8>>,
+    step: usize,
+}
+
+impl std::io::Read for Trickle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.step);
+        self.inner.read(&mut buf[..n])
+    }
+}
+
+impl Seek for Trickle {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// Drain a demuxer to end of stream and return what it handed out as
+/// `(stream, pts, dts, len, keyframe, corrupt)` rows.
+///
+/// Liveness and memory oracles: every call either yields a packet,
+/// reports a corruption (which must have consumed input), or ends the
+/// stream, so the end is reached within a number of calls bounded by
+/// the input size; the payload handed out never exceeds the input; and
+/// the bytes buffered in flight stay within the configured ceiling.
+#[allow(clippy::type_complexity)]
+fn drain_checked(
+    dmx: &mut MpegTsDemuxer,
+    input_len: usize,
+    ceiling: usize,
+) -> Vec<(u32, Option<i64>, Option<i64>, usize, bool, bool)> {
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    let mut ended = false;
+    for _ in 0..input_len + 64 {
+        match dmx.next_packet() {
+            Ok(p) => {
+                total += p.data.len();
+                rows.push((
+                    p.stream_index,
+                    p.pts,
+                    p.dts,
+                    p.data.len(),
+                    p.flags.keyframe,
+                    p.flags.corrupt,
+                ));
+            }
+            Err(oxideav_core::Error::Eof) => {
+                ended = true;
+                break;
+            }
+            Err(_) => {}
+        }
+        assert!(dmx.buffered_bytes() <= ceiling * dmx.streams().len());
+    }
+    assert!(ended, "demuxer must reach end of stream in bounded calls");
+    assert!(total <= input_len, "more payload out than bytes in");
+    let _ = dmx.stats();
+    rows
+}
+
+/// Typed demuxer battery: open on a program, drain to the end under
+/// the liveness / memory oracles, repeat through a trickling source
+/// and require the identical packet sequence, then build the RAP
+/// index and run all three seek paths. Whether a given input opens or
+/// errors is the stream's business — panicking, stalling, or
+/// depending on read granularity is not.
 fn demux_battery(bytes: &[u8], program: u16) {
+    const CEILING: usize = 4096;
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.to_vec()));
     let Ok(mut dmx) = MpegTsDemuxer::open_program(input, program) else {
         return;
@@ -334,14 +403,25 @@ fn demux_battery(bytes: &[u8], program: u16) {
     let _ = dmx.pcr_pid();
     let _ = dmx.last_pcr();
     let _ = dmx.packet_layout();
+    assert!(dmx.leading_bytes() as usize <= bytes.len());
+    dmx.set_max_pes_bytes(CEILING);
     let n_streams = dmx.streams().len() as u32;
-    // Bounded drain: the input is fuzz-sized, so a few dozen packets
-    // cross every reassembly path; anything unbounded is the bug.
-    for _ in 0..64 {
-        if dmx.next_packet().is_err() {
-            break;
-        }
-    }
+    let rows = drain_checked(&mut dmx, bytes.len(), CEILING);
+
+    let step = 1 + bytes.len() % 7;
+    let trickle: Box<dyn ReadSeek> = Box::new(Trickle {
+        inner: Cursor::new(bytes.to_vec()),
+        step,
+    });
+    let mut again =
+        MpegTsDemuxer::open_program(trickle, program).expect("opens whatever the read size");
+    again.set_max_pes_bytes(CEILING);
+    assert_eq!(
+        drain_checked(&mut again, bytes.len(), CEILING),
+        rows,
+        "packet sequence must not depend on read granularity"
+    );
+
     let _ = dmx.random_access_points();
     for s in 0..n_streams.min(2) {
         let _ = dmx.seek_to_random_access(Some(s), 90_000);

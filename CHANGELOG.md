@@ -11,53 +11,22 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- Demuxer robustness surface: `MpegTsDemuxer::stats()` returning
+  `TsDemuxStats` (resync bytes, malformed / error-flagged / duplicate
+  packets, continuity gaps, dropped PES packets), `leading_bytes()`,
+  `set_max_pes_bytes()`, `buffered_bytes()`.
+- `locate_packet_layout` — finds the 188 / 192 / 204-byte packet grid
+  in a buffer that does not start on a packet boundary and returns the
+  offset of the first whole packet.
+- `NearestEpochUnwrap` — reorder-tolerant 33-bit timestamp unwrapper
+  (each value extends to the wrap epoch nearest the previous one).
 - `PesPacket::parse_header` (header fields + payload offset, no payload
-  copy), `PesReassembler::with_max_bytes` / `buffered_len` / `reset`,
-  `DEFAULT_MAX_PES_BYTES`, `MAX_PRIVATE_SECTION_LEN`.
-
-### Changed
-
-- `PesReassembler` decodes the PES header as soon as it is complete and
-  collects payload bytes straight into the outgoing packet (one copy
-  instead of two, capacity taken from `PES_packet_length` or the
-  previous packet on the PID).
-- `PesReassembler` memory is bounded: a PES packet keeps at most the
-  bytes its `PES_packet_length` declares, an unbounded packet that
-  reaches the ceiling (32 MiB by default) leaves in pieces, and bytes
-  behind a header that never parses stop accumulating at the ceiling.
-- `PsiSectionAssembler` accepts private sections up to 4096 bytes
-  (§2.4.4.11) — DVB EIT sections longer than 1024 bytes used to be
-  refused; the four fixed PSI tables keep the 1024-byte bound.
-
-### Fixed
-
-- `PesReassembler`: a PES packet whose header did not parse left the
-  reassembler stuck on it — every later `payload_unit_start` returned
-  the same error and the buffer grew without limit. The error now costs
-  exactly the damaged packet.
-- `PsiSectionAssembler`: a section whose 3-byte header straddled two TS
-  packets was never completed; a §2.4.3.3 duplicate packet discarded the
-  section in flight (it is now skipped); sections completed in a payload
-  ahead of an overlong one are no longer lost with it.
-
-- Program-stream demuxer: a pack header whose `pack_stuffing_length`
-  claims more stuffing bytes than the input holds stepped the read
-  cursor past the buffered window and panicked on the next refill
-  (found by the scheduled fuzz run). The stuffing is now buffered and
-  the cursor clamped to the window.
-- Elementary-stream parameter probe: an H.264 SPS with an out-of-range
-  scaling-list delta or bit depth overflowed 32-bit arithmetic; both are
-  now computed without overflow (found by a local fuzz run).
-- Program-stream video re-framing keeps its buffers bounded whatever
-  the input: bytes ahead of any access-unit start are dropped once
-  scanned, an access unit that grows past 16 MiB without a boundary is
-  handed out in pieces, and waiting PES timestamps are capped.
-- Program-stream discovery budget is measured in absolute input bytes,
-  so buffer compaction no longer lets the open-time pass read past its
-  4 MiB limit.
-
-### Added
-
+  copy), `PesHeaderSpec::encode_header` (header for a payload of a given
+  length), `PesReassembler::with_max_bytes` / `set_max_bytes` /
+  `buffered_len` / `reset`, `DEFAULT_MAX_PES_BYTES`,
+  `MAX_PRIVATE_SECTION_LEN`.
+- `benches/throughput.rs` — mux / demux throughput on a self-muxed
+  four-program stream (`cargo bench --bench throughput`).
 - Constructors for the builder inputs: `ProgramSpec::new(program_number,
   pmt_pid)`, `ServiceSpec::new`, `EventSpec::new(event_id, duration,
   running_status, language)`, `NetworkSpec::new(network_id)`,
@@ -70,6 +39,66 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Changed
 
+- Demuxer reads the source a 128 KiB block at a time instead of one
+  packet per `read` call, follows PIDs through a direct 8192-entry
+  table instead of five hash maps, and skips packets of other PIDs from
+  the two PID bytes. Demux throughput on the bench stream: 2.3 → 4.9
+  GiB/s from memory, 0.33 → 3.8 GiB/s from an unbuffered file. The
+  duration probe, PCR bisection and access-point index scan read in
+  blocks too.
+- Muxer hands each call's packets to the sink in one write instead of
+  one per 188-byte packet, and fragments a frame from its PES header
+  and payload directly instead of first copying the payload behind the
+  header. Output is byte-identical; mux throughput to an unbuffered
+  file: 0.1 → 1.5 GiB/s.
+- Demuxer streaming no longer ends on damaged input. Bytes that break
+  the packet grid are skipped by a byte-granular search for the next
+  three aligned sync bytes (inserted or deleted bytes used to end the
+  stream); a tail shorter than one packet, or one holding no packets,
+  is a clean end of stream; packets that do not parse or carry
+  `transport_error_indicator` are dropped; §2.4.3.3 duplicate packets
+  are consumed once; a continuity-counter gap marks the PES packet in
+  flight `corrupt`; a PES packet whose header does not parse is dropped
+  on its own. Only a garbage run longer than 256 packets is still
+  reported as an error, after which reading carries on.
+- Demuxer opens captures that start mid-packet or behind leading bytes
+  (the grid is located in the first 64 KiB, in all three framings), and
+  the probe scores such a buffer 50.
+- Demuxer memory is bounded whatever the input: every PID's in-flight
+  PES packet has a ceiling (an equal share of 256 MiB, at most 32 MiB),
+  the access-point index stops at 4 M entries, and the open-time PCR
+  anchor scans stop after 64 MiB.
+- PTS / DTS unwrap is reorder-tolerant in both demuxers: a presentation
+  time stepping backward (B-pictures) after a 2^33 wrap no longer drops
+  the wrap and pulls the timeline back by 26.5 hours.
+- PAT handling at open: every section of a multi-section PAT is
+  collected (programs listed in section order), a table flagged
+  `current_next_indicator = 0` only serves when nothing else is found,
+  and sections or packets that do not parse are skipped instead of
+  failing the open. PMT selection matches the section's
+  `program_number`, so several programs sharing one `program_map_PID`
+  each get their own streams.
+- A refused seek leaves the streaming position where it was (it used
+  to leave the source cursor wherever the probe stopped).
+- The open-time video parameter probe re-scans its buffer at doublings
+  once past 64 KiB, so a stream of tiny PES packets cannot make the
+  open quadratic.
+- `PesReassembler` decodes the PES header as soon as it is complete and
+  collects payload bytes straight into the outgoing packet (one copy
+  instead of two, capacity taken from `PES_packet_length` or the
+  previous packet on the PID).
+- `PesReassembler` memory is bounded: a PES packet keeps at most the
+  bytes its `PES_packet_length` declares, an unbounded packet that
+  reaches the ceiling (32 MiB by default) leaves in pieces, and bytes
+  behind a header that never parses stop accumulating at the ceiling.
+- `PsiSectionAssembler` accepts private sections up to 4096 bytes
+  (§2.4.4.11) — DVB EIT sections longer than 1024 bytes used to be
+  refused; the four fixed PSI tables keep the 1024-byte bound.
+- Fuzz `demux` / `structured_mutate` battery: the demuxer is drained to
+  the end under liveness and memory oracles (end of stream within a
+  call count bounded by the input, no more payload out than bytes in,
+  in-flight bytes within the ceiling) and must hand out the identical
+  packet sequence through a source that returns a few bytes per read.
 - API hygiene: `#[non_exhaustive]` on the growable enums `TsError`,
   `StreamType`, `DescriptorBody`, `ExtensionBody`, `AtscDescriptorBody`,
   `DccSelectionCategory`, `DccsctUpdate`, `DiscontinuityReason`,
@@ -89,6 +118,32 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   `DsmTrickMode`, `RunningStatus`, `HierarchyType`, `DccContext`) and the
   value types `EitDateTime`, `EitDuration`, `Iso639Language`, `Pcr` stay
   as they were.
+
+### Fixed
+
+- `PesReassembler`: a PES packet whose header did not parse left the
+  reassembler stuck on it — every later `payload_unit_start` returned
+  the same error and the buffer grew without limit. The error now costs
+  exactly the damaged packet.
+- `PsiSectionAssembler`: a section whose 3-byte header straddled two TS
+  packets was never completed; a §2.4.3.3 duplicate packet discarded the
+  section in flight (it is now skipped); sections completed in a payload
+  ahead of an overlong one are no longer lost with it.
+- Program-stream demuxer: a pack header whose `pack_stuffing_length`
+  claims more stuffing bytes than the input holds stepped the read
+  cursor past the buffered window and panicked on the next refill
+  (found by the scheduled fuzz run). The stuffing is now buffered and
+  the cursor clamped to the window.
+- Elementary-stream parameter probe: an H.264 SPS with an out-of-range
+  scaling-list delta or bit depth overflowed 32-bit arithmetic; both are
+  now computed without overflow (found by a local fuzz run).
+- Program-stream video re-framing keeps its buffers bounded whatever
+  the input: bytes ahead of any access-unit start are dropped once
+  scanned, an access unit that grows past 16 MiB without a boundary is
+  handed out in pieces, and waiting PES timestamps are capped.
+- Program-stream discovery budget is measured in absolute input bytes,
+  so buffer compaction no longer lets the open-time pass read past its
+  4 MiB limit.
 
 ## [0.0.4](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.3...v0.0.4) - 2026-10-24
 

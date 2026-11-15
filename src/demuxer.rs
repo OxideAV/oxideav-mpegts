@@ -34,16 +34,18 @@
 //! 33-bit values without rescaling — downstream muxers do their own
 //! base conversion.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use std::io::Seek;
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Demuxer, Error as CoreError, Packet, ReadSeek,
     Result as CoreResult, StreamInfo, TimeBase,
 };
 
+use crate::clock::NearestEpochUnwrap;
 use crate::{
     PAT_PID, Pcr, PcrTracker, PesPacket, PesReassembler, ProgramAssociationTable, ProgramMapTable,
-    PsiSectionAssembler, PtsTracker, StreamType, TS_PACKET_LEN, TS_SYNC_BYTE, TsPacket,
+    PsiSectionAssembler, StreamType, TS_PACKET_LEN, TS_SYNC_BYTE, TsPacket,
 };
 
 /// PID value the PMT's `PCR_PID` field carries when no PCR is
@@ -72,11 +74,410 @@ pub struct TsProgram {
     pub pmt_pid: u16,
 }
 
-/// MPEG-TS demuxer state — reads 188-byte packets from a `ReadSeek`,
-/// reassembles PES per PID, hands one [`Packet`] per PES back through
-/// `next_packet`.
-pub struct MpegTsDemuxer {
+/// Counters of what the streaming path skipped or repaired. All are
+/// zero on a clean stream; read them with [`MpegTsDemuxer::stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TsDemuxStats {
+    /// Bytes discarded while re-acquiring the packet grid after a bad
+    /// sync byte (inserted / deleted bytes, garbage runs).
+    pub resync_bytes: u64,
+    /// Packets on the demuxed PIDs (and the `PCR_PID`) dropped because
+    /// their adaptation field does not parse (e.g. an
+    /// `adaptation_field_length` running past the packet).
+    pub malformed_packets: u64,
+    /// Packets dropped because `transport_error_indicator` was set.
+    pub transport_errors: u64,
+    /// §2.4.3.3 duplicate packets skipped on the demuxed PIDs.
+    pub duplicate_packets: u64,
+    /// Continuity-counter gaps seen on the demuxed PIDs (packets were
+    /// lost; the PES packet in flight is flagged corrupt).
+    pub continuity_errors: u64,
+    /// PES packets dropped because their header does not parse.
+    pub damaged_pes: u64,
+}
+
+/// Bytes read from the input per block. Large enough that a plain
+/// `std::fs::File` source costs one system call per several hundred
+/// packets instead of one per packet.
+const READ_BLOCK: usize = 128 << 10;
+
+/// Consecutive packets whose sync bytes must line up for the resync
+/// search to accept a candidate grid position (fewer only when the
+/// input ends first).
+const RESYNC_CONFIRM_PACKETS: usize = 3;
+
+/// Block-buffered reader of physical packets with byte-granular
+/// resynchronisation.
+///
+/// `position()` is the stream offset of the next unread byte; the
+/// offsets handed out with each packet are true byte offsets even
+/// after a resync skipped bytes. Out-of-band probes borrow the
+/// underlying source through [`Self::raw`], which is safe at any
+/// time: the next refill re-seeks to where the buffer ends.
+struct PacketReader {
     input: Box<dyn ReadSeek>,
+    layout: crate::packet::TsPacketLayout,
+    buf: Box<[u8]>,
+    /// Unread bytes are `buf[head..tail]`.
+    head: usize,
+    tail: usize,
+    /// Stream offset of `buf[head]`.
+    pos: u64,
+    /// The source cursor sits at `pos + (tail - head)`.
+    synced: bool,
+    eof: bool,
+    /// Bytes skipped by resynchronisation so far.
+    resync_bytes: u64,
+}
+
+impl PacketReader {
+    fn new(input: Box<dyn ReadSeek>, layout: crate::packet::TsPacketLayout) -> Self {
+        Self {
+            input,
+            layout,
+            buf: vec![0u8; READ_BLOCK].into_boxed_slice(),
+            head: 0,
+            tail: 0,
+            pos: 0,
+            synced: false,
+            eof: false,
+            resync_bytes: 0,
+        }
+    }
+
+    /// Stream offset of the next unread byte.
+    fn position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Continue reading at stream offset `pos`.
+    fn seek(&mut self, pos: u64) {
+        self.head = 0;
+        self.tail = 0;
+        self.pos = pos;
+        self.synced = false;
+        self.eof = false;
+    }
+
+    /// The underlying source, for an out-of-band probe that seeks and
+    /// reads on its own. The streaming position is unaffected.
+    fn raw(&mut self) -> &mut Box<dyn ReadSeek> {
+        self.synced = false;
+        &mut self.input
+    }
+
+    /// Buffer at least `need` unread bytes (fewer only at end of
+    /// input); returns how many are available.
+    fn fill(&mut self, need: usize) -> std::io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        debug_assert!(need <= self.buf.len());
+        while self.tail - self.head < need && !self.eof {
+            if self.head > 0 {
+                self.buf.copy_within(self.head..self.tail, 0);
+                self.tail -= self.head;
+                self.head = 0;
+            }
+            if !self.synced {
+                self.input
+                    .seek(SeekFrom::Start(self.pos + self.tail as u64))?;
+                self.synced = true;
+            }
+            match self.input.read(&mut self.buf[self.tail..]) {
+                Ok(0) => self.eof = true,
+                Ok(n) => self.tail += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(self.tail - self.head)
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.head += n;
+        self.pos += n as u64;
+    }
+
+    /// Read the next physical packet and return its stream offset and
+    /// logical 188-byte window.
+    ///
+    /// `Ok(None)` is the end of the stream — including a trailing
+    /// fragment shorter than one packet (a capture cut mid-packet) and
+    /// a tail in which no packet grid can be found any more.
+    ///
+    /// On a sync-byte mismatch the reader searches forward **byte by
+    /// byte** for a position where the sync byte recurs at the packet
+    /// stride ([`RESYNC_CONFIRM_PACKETS`] packets, fewer only at the
+    /// very end of the input), so inserted or deleted bytes shift the
+    /// grid instead of ending the stream. One call examines at most
+    /// [`RESYNC_PACKET_LIMIT`] packets' worth of bytes; past that it
+    /// reports the corruption as an error, and the following call
+    /// carries on from where the search stopped.
+    fn next_packet(&mut self) -> CoreResult<Option<(u64, [u8; TS_PACKET_LEN])>> {
+        let psize = self.layout.packet_size;
+        let sync_at = self.layout.sync_offset;
+        let have = self.fill(psize).map_err(CoreError::Io)?;
+        if have < psize {
+            self.consume(have);
+            return Ok(None);
+        }
+        if self.buf[self.head + sync_at] != TS_SYNC_BYTE && !self.resync()? {
+            return Ok(None);
+        }
+        let start = self.head + sync_at;
+        let mut out = [0u8; TS_PACKET_LEN];
+        out.copy_from_slice(&self.buf[start..start + TS_PACKET_LEN]);
+        let offset = self.pos;
+        self.consume(psize);
+        Ok(Some((offset, out)))
+    }
+
+    /// Search forward for the packet grid. `Ok(true)` leaves a whole
+    /// packet with a good sync byte at the head of the buffer;
+    /// `Ok(false)` means the input ended first.
+    fn resync(&mut self) -> CoreResult<bool> {
+        let psize = self.layout.packet_size;
+        let sync_at = self.layout.sync_offset;
+        let bad_at = self.pos;
+        let bad_byte = self.buf[self.head + sync_at];
+        let limit = RESYNC_PACKET_LIMIT * psize;
+        let mut skipped = 0usize;
+        loop {
+            let have = self
+                .fill(RESYNC_CONFIRM_PACKETS * psize)
+                .map_err(CoreError::Io)?;
+            if have < psize {
+                self.consume(have);
+                self.resync_bytes += have as u64;
+                return Ok(false);
+            }
+            let window = &self.buf[self.head..self.tail];
+            // Candidates that can be fully confirmed inside the window;
+            // at end of input the confirmation shrinks to what is left.
+            let full = window.len() / psize >= RESYNC_CONFIRM_PACKETS;
+            let last_candidate = if full {
+                window.len() - RESYNC_CONFIRM_PACKETS * psize
+            } else {
+                window.len() - psize
+            };
+            let mut found = None;
+            let mut c = 0usize;
+            while c <= last_candidate && skipped + c <= limit {
+                let confirmed = (0..RESYNC_CONFIRM_PACKETS).all(|k| {
+                    window
+                        .get(c + k * psize + sync_at)
+                        .is_none_or(|&b| b == TS_SYNC_BYTE)
+                });
+                if confirmed {
+                    found = Some(c);
+                    break;
+                }
+                c += 1;
+            }
+            let advance = found.unwrap_or(c);
+            self.consume(advance);
+            self.resync_bytes += advance as u64;
+            skipped += advance;
+            if found.is_some() {
+                return Ok(true);
+            }
+            if skipped > limit {
+                return Err(CoreError::invalid(format!(
+                    "mpegts: bad sync byte 0x{bad_byte:02X} at offset {bad_at} (packet {}), \
+                     no packet grid within {RESYNC_PACKET_LIMIT} {psize}-byte packets",
+                    bad_at / psize as u64,
+                )));
+            }
+            if !full {
+                // End of input and nothing lined up in what was left.
+                let rest = self.tail - self.head;
+                self.consume(rest);
+                self.resync_bytes += rest as u64;
+                return Ok(false);
+            }
+        }
+    }
+}
+
+/// Shifts a source so that stream offset 0 is the first whole packet:
+/// a capture that begins mid-packet (or behind leading bytes that are
+/// not transport packets) then presents the same aligned grid as any
+/// other, which is what the byte-offset arithmetic of the duration
+/// probe, the PCR bisection and the access-point index rely on.
+struct OffsetInput {
+    inner: Box<dyn ReadSeek>,
+    base: u64,
+}
+
+impl std::io::Read for OffsetInput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Seek for OffsetInput {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let abs = match pos {
+            SeekFrom::Start(p) => self
+                .inner
+                .seek(SeekFrom::Start(p.saturating_add(self.base)))?,
+            other => self.inner.seek(other)?,
+        };
+        if abs < self.base {
+            // Landed in the skipped prefix: clamp to the logical start.
+            self.inner.seek(SeekFrom::Start(self.base))?;
+            return Ok(0);
+        }
+        Ok(abs - self.base)
+    }
+}
+
+/// Fixed-grid block scanner for the out-of-band probes (duration, PCR
+/// bisection, access-point index): walks whole packets from a
+/// packet-aligned offset, reading the source a block at a time.
+struct GridScan<'a> {
+    input: &'a mut Box<dyn ReadSeek>,
+    layout: crate::packet::TsPacketLayout,
+    block: Vec<u8>,
+    /// Valid bytes in `block` and the read cursor into them.
+    have: usize,
+    next: usize,
+    /// Stream offset of `block[next]`.
+    off: u64,
+    /// Exclusive end offset of the scan.
+    end: u64,
+    done: bool,
+}
+
+impl<'a> GridScan<'a> {
+    /// Packets per block read.
+    const BLOCK_PACKETS: usize = 256;
+
+    fn new(
+        input: &'a mut Box<dyn ReadSeek>,
+        layout: crate::packet::TsPacketLayout,
+        from: u64,
+        end: u64,
+    ) -> std::io::Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        input.seek(SeekFrom::Start(from))?;
+        Ok(Self {
+            input,
+            layout,
+            block: Vec::new(),
+            have: 0,
+            next: 0,
+            off: from,
+            end,
+            done: false,
+        })
+    }
+
+    /// Stream offset and logical 188-byte window of the next whole
+    /// packet before `end`; `None` when the range or the input is
+    /// exhausted.
+    fn next_packet(&mut self) -> Option<(u64, &[u8])> {
+        use std::io::Read;
+        let psize = self.layout.packet_size;
+        if self.done || self.off + psize as u64 > self.end {
+            return None;
+        }
+        if self.have - self.next < psize {
+            let left = (self.end - self.off) / psize as u64;
+            let want = (left.min(Self::BLOCK_PACKETS as u64) as usize) * psize;
+            self.block.resize(want, 0);
+            let mut filled = 0usize;
+            while filled < want {
+                match self.input.read(&mut self.block[filled..want]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            self.have = filled - filled % psize;
+            self.next = 0;
+            if self.have == 0 {
+                self.done = true;
+                return None;
+            }
+        }
+        let at = self.next;
+        let off = self.off;
+        self.next += psize;
+        self.off += psize as u64;
+        Some((off, self.layout.window(&self.block[at..at + psize])))
+    }
+}
+
+/// Number of PID values (13 bits).
+const PID_SPACE: usize = 1 << 13;
+
+/// Ceiling on the bytes all in-flight PES packets of one demuxer may
+/// hold together; each PID gets an equal share of it, capped at
+/// [`crate::pes::DEFAULT_MAX_PES_BYTES`].
+const MAX_INFLIGHT_BYTES: usize = 256 << 20;
+
+/// Per-PID demux state of one elementary stream. The slot index is the
+/// stream index.
+struct PidSlot {
+    pid: u16,
+    reassembler: PesReassembler,
+    /// 33-bit PTS / DTS unwrappers (§2.4.3.7) onto one monotonic
+    /// 64-bit timeline; reorder-tolerant.
+    pts: NearestEpochUnwrap,
+    dts: NearestEpochUnwrap,
+    /// Audio access-unit splitter for streams whose framing is staged
+    /// (AC-3 / E-AC-3, MPEG-1/2 audio, AAC ADTS): a PES payload
+    /// carrying several syncframes leaves as one packet per frame
+    /// (§2.4.3.7 / §2.7.5 timestamp interpolation, see
+    /// [`crate::audio_frame`]).
+    splitter: Option<crate::AudioFrameSplitter>,
+    /// `continuity_counter` of the last payload-carrying packet.
+    last_cc: Option<u8>,
+    /// The packet carrying `last_cc` has already been seen twice.
+    duplicate_seen: bool,
+    /// Packets were lost inside the PES packet in flight.
+    damaged: bool,
+}
+
+impl PidSlot {
+    /// Void everything that depends on stream position.
+    fn rehome(&mut self, time_hint: Option<u64>) {
+        self.reassembler.reset();
+        if let Some(s) = &mut self.splitter {
+            s.reset();
+        }
+        self.last_cc = None;
+        self.duplicate_seen = false;
+        self.damaged = false;
+        for t in [&mut self.pts, &mut self.dts] {
+            match time_hint {
+                Some(h) => t.seed(h),
+                None => t.reset(),
+            }
+        }
+    }
+}
+
+/// MPEG-TS demuxer state — reads physical packets from a `ReadSeek` a
+/// block at a time, reassembles PES per PID, hands one [`Packet`] per
+/// PES (or per audio access unit) back through `next_packet`.
+///
+/// ## Robustness
+///
+/// The streaming path does not give up on damaged input: bytes that
+/// break the packet grid are skipped by a byte-granular resync,
+/// packets that do not parse or carry `transport_error_indicator` are
+/// dropped, duplicate packets are skipped, a continuity-counter gap
+/// flags the affected [`Packet`] `corrupt`,
+/// and a PES packet whose header does not parse is dropped on its own.
+/// [`Self::stats`] counts each of these. Memory is bounded whatever the
+/// input: every PID's in-flight PES packet has a ceiling (an unbounded
+/// PES packet that reaches it is handed out in pieces).
+pub struct MpegTsDemuxer {
+    reader: PacketReader,
     /// Every non-network program the PAT advertised, in PAT order. The
     /// first entry is the default selection; [`Self::open_program`]
     /// targets any other by `program_number`.
@@ -92,37 +493,21 @@ pub struct MpegTsDemuxer {
     /// clock anchor a remux uses to align the PES timeline.
     pcr_tracker: PcrTracker,
     streams: Vec<StreamInfo>,
-    /// `elementary_pid` → `streams[index]` lookup.
-    pid_to_stream: HashMap<u16, u32>,
-    /// `elementary_pid` → in-flight PES reassembler.
-    reassemblers: HashMap<u16, PesReassembler>,
-    /// `elementary_pid` → 33-bit PTS unwrapper (§2.4.3.7). Turns the
-    /// raw PES timestamps that wrap every ~26.5 h into a monotonic
-    /// 64-bit extended timeline.
-    pts_trackers: HashMap<u16, PtsTracker>,
-    /// `elementary_pid` → 33-bit DTS unwrapper — DTS advances
-    /// independently of PTS so it needs its own ring tracker.
-    dts_trackers: HashMap<u16, PtsTracker>,
-    /// `elementary_pid` → audio access-unit splitter for streams whose
-    /// framing is staged (AC-3 / E-AC-3, MPEG-1/2 audio, AAC ADTS): a
-    /// PES payload carrying several syncframes leaves as one packet
-    /// per frame (§2.4.3.7 / §2.7.5 timestamp interpolation, see
-    /// [`crate::audio_frame`]).
-    splitters: HashMap<u16, crate::AudioFrameSplitter>,
+    /// Direct PID table: `pid_slot[pid]` is the index into `slots`
+    /// plus one, or 0 for a PID this demuxer does not follow.
+    pid_slot: Box<[u16]>,
+    /// One entry per elementary stream, in `streams` order.
+    slots: Vec<PidSlot>,
     /// Already-reassembled packets waiting to be handed out.
     pending: VecDeque<Packet>,
-    /// `true` once `read_one_packet` has returned `Eof` and every
-    /// reassembler has been flushed.
+    /// `true` once the input ran dry and every reassembler has been
+    /// flushed.
     eof_reached: bool,
-    /// Input bytes consumed so far — for diagnostic error messages.
-    bytes_read: u64,
-    /// Tiny look-ahead buffer used by the resync path: we may peek a
-    /// "probe" byte to validate a candidate sync, and need to feed it
-    /// to the next `read_one_packet` rather than discard it (which
-    /// would leave the input cursor 1 byte misaligned and force every
-    /// subsequent read through another resync). Holds at most a few
-    /// bytes in practice.
-    putback: VecDeque<u8>,
+    /// Bytes ahead of the first whole packet in the source (a capture
+    /// cut mid-packet); every offset this demuxer reports is a true
+    /// source offset, i.e. includes it.
+    base_offset: u64,
+    stats: TsDemuxStats,
     /// Container duration in microseconds, probed once at open from the
     /// first and last PCR on the selected program's `PCR_PID`
     /// (§2.4.2.2). `None` when the program declares no PCR_PID, the
@@ -238,13 +623,17 @@ impl MpegTsDemuxer {
     fn with_selector(mut input: Box<dyn ReadSeek>, want: Option<u16>) -> CoreResult<Self> {
         // Step 0: detect the physical packet layout (188-byte plain,
         // 192-byte 4-byte-prefixed source packets, or 204-byte
-        // trailer-appended packets) from the head of the stream, then
-        // rewind. Everything downstream works on the logical 188-byte
-        // window; the framing bytes are stripped at the read layer.
-        let layout = {
+        // trailer-appended packets) and where the first whole packet
+        // sits, from the head of the stream. Everything downstream
+        // works on the logical 188-byte window; the framing bytes are
+        // stripped at the read layer.
+        let (layout, base_offset) = {
             use std::io::Read;
-            let mut head = [0u8; 204 * 8];
+            let mut head = vec![0u8; LAYOUT_PROBE_BYTES];
             let mut filled = 0usize;
+            input
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(CoreError::Io)?;
             while filled < head.len() {
                 match input.read(&mut head[filled..]) {
                     Ok(0) => break,
@@ -253,73 +642,108 @@ impl MpegTsDemuxer {
                     Err(e) => return Err(CoreError::Io(e)),
                 }
             }
-            input
-                .seek(std::io::SeekFrom::Start(0))
-                .map_err(CoreError::Io)?;
             // A head too corrupt (or short) to classify falls back to
-            // the plain layout; the streaming resync path takes over
-            // from there.
-            crate::packet::detect_packet_layout(&head[..filled])
-                .unwrap_or(crate::packet::TsPacketLayout::STANDARD)
+            // the plain layout at offset 0; the streaming resync path
+            // takes over from there.
+            crate::packet::locate_packet_layout(&head[..filled])
+                .map(|(layout, at)| (layout, at as u64))
+                .unwrap_or((crate::packet::TsPacketLayout::STANDARD, 0))
         };
+        let input: Box<dyn ReadSeek> = if base_offset == 0 {
+            input
+        } else {
+            Box::new(OffsetInput {
+                inner: input,
+                base: base_offset,
+            })
+        };
+        let mut reader = PacketReader::new(input, layout);
 
-        // Step 1: scan for the first PAT, reassembling its section
-        // across as many same-PID TS packets as the spec permits per
-        // §2.4.4. A PUSI=1 packet starts a fresh section; subsequent
-        // same-PID packets with PUSI=0 continue it. Real BD `.m2ts`
-        // fits the PAT in one TS packet; broadcast TS with many
-        // programs needs the assembler.
+        // Step 1: scan for the PAT, reassembling its sections across
+        // as many same-PID TS packets as the spec permits per §2.4.4.
         //
         // We collect *every* non-network program the PAT lists so a
         // caller can enumerate them and re-open on a chosen one
         // (§2.4.4.5: `program_number == 0` names the network PID, not a
-        // program). The selected program drives the Step-2 PMT scan.
-        let mut programs: Vec<TsProgram> = Vec::new();
-        let mut probe_bytes: u64 = 0;
-        let mut probe_putback: VecDeque<u8> = VecDeque::new();
+        // program). A PAT may span several sections
+        // (`last_section_number > 0`); collection runs until each has
+        // been seen once, or gives up [`PAT_COMPLETION_BYTES`] past
+        // the first one. A table flagged `current_next_indicator = 0`
+        // is not yet applicable and only serves when the stream offers
+        // nothing else. Packets and sections that do not parse are
+        // skipped.
+        // `(section_number, program)` so the final list is in PAT
+        // order whichever section the stream happened to show first.
+        let mut listed: Vec<(u8, TsProgram)> = Vec::new();
+        let mut upcoming: Vec<(u8, TsProgram)> = Vec::new();
+        let mut sections_seen = [false; 256];
+        let mut sections_missing: Option<usize> = None;
+        let mut first_pat_at: Option<u64> = None;
         let mut pat_assembler = PsiSectionAssembler::new();
-        loop {
-            probe_bytes += layout.packet_size as u64;
-            let buf = match read_one_packet(
-                &mut input,
-                &mut probe_putback,
-                probe_bytes - layout.packet_size as u64,
-                layout,
-            )? {
-                Some(b) => b,
-                None => {
-                    return Err(CoreError::invalid(
-                        "mpegts: stream ended before a PAT was seen",
+        let add = |list: &mut Vec<(u8, TsProgram)>, pat: &ProgramAssociationTable| {
+            for &(program_number, pmt_pid) in &pat.programs {
+                if program_number != 0
+                    && !list.iter().any(|(_, p)| p.program_number == program_number)
+                {
+                    list.push((
+                        pat.section_number,
+                        TsProgram {
+                            program_number,
+                            pmt_pid,
+                        },
                     ));
                 }
+            }
+        };
+        while let Some((offset, raw)) = reader.next_packet()? {
+            if let Some(first) = first_pat_at
+                && offset - first > PAT_COMPLETION_BYTES
+            {
+                break;
+            }
+            let Ok(pkt) = TsPacket::parse(&raw) else {
+                continue;
             };
-            let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
-            if pkt.pid != PAT_PID || pkt.payload.is_empty() {
+            if pkt.pid != PAT_PID || pkt.payload.is_empty() || pkt.transport_error {
                 continue;
             }
-            let sections = pat_assembler
-                .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
-                .map_err(map_ts_err)?;
+            let Ok(sections) =
+                pat_assembler.feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+            else {
+                continue;
+            };
             for section in &sections {
-                if let Ok(pat) = ProgramAssociationTable::parse(section) {
-                    for (prog, pid) in &pat.programs {
-                        if *prog != 0 && !programs.iter().any(|p| p.program_number == *prog) {
-                            programs.push(TsProgram {
-                                program_number: *prog,
-                                pmt_pid: *pid,
-                            });
-                        }
-                    }
+                let Ok(pat) = ProgramAssociationTable::parse(section) else {
+                    continue;
+                };
+                if !pat.current_next_indicator {
+                    add(&mut upcoming, &pat);
+                    continue;
                 }
+                first_pat_at.get_or_insert(offset);
+                let missing = sections_missing.get_or_insert(pat.last_section_number as usize + 1);
+                if !std::mem::replace(&mut sections_seen[pat.section_number as usize], true)
+                    && pat.section_number <= pat.last_section_number
+                {
+                    *missing -= 1;
+                }
+                add(&mut listed, &pat);
             }
-            if !programs.is_empty() {
+            if sections_missing == Some(0) {
                 break;
             }
         }
+        if listed.is_empty() {
+            listed = upcoming;
+        }
+        listed.sort_by_key(|&(section, _)| section);
+        let programs: Vec<TsProgram> = listed.into_iter().map(|(_, p)| p).collect();
         if programs.is_empty() {
-            return Err(CoreError::invalid(
-                "mpegts: PAT carried no program with a PMT PID",
-            ));
+            return Err(CoreError::invalid(if first_pat_at.is_some() {
+                "mpegts: PAT carried no program with a PMT PID"
+            } else {
+                "mpegts: stream ended before a PAT was seen"
+            }));
         }
         let selected = match want {
             None => programs[0],
@@ -346,38 +770,59 @@ impl MpegTsDemuxer {
         // routinely overflow the ~184-byte single-TS payload budget;
         // a Blu-ray title's PMT with multi-language PGS + multi-codec
         // audio is the canonical case.
+        //
+        // Several programs may share one `program_map_PID`; the section
+        // for this program is the one whose `program_number` matches
+        // (§2.4.4.9) and that is currently applicable. A section that
+        // fails either test is kept as a fallback for streams that
+        // carry nothing better within [`PMT_FALLBACK_BYTES`].
         let mut pmt_assembler = PsiSectionAssembler::new();
-        let pmt = loop {
-            probe_bytes += layout.packet_size as u64;
-            let buf = match read_one_packet(
-                &mut input,
-                &mut probe_putback,
-                probe_bytes - layout.packet_size as u64,
-                layout,
-            )? {
-                Some(b) => b,
-                None => {
-                    return Err(CoreError::invalid(
-                        "mpegts: stream ended before the PMT was seen",
-                    ));
-                }
+        let mut fallback: Option<(ProgramMapTable, u64, u64)> = None;
+        let mut chosen: Option<ProgramMapTable> = None;
+        while let Some((offset, raw)) = reader.next_packet()? {
+            if let Some((_, seen_at, _)) = &fallback
+                && offset - seen_at > PMT_FALLBACK_BYTES
+            {
+                break;
+            }
+            let Ok(pkt) = TsPacket::parse(&raw) else {
+                continue;
             };
-            let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
-            if pkt.pid != pmt_pid || pkt.payload.is_empty() {
+            if pkt.pid != pmt_pid || pkt.payload.is_empty() || pkt.transport_error {
                 continue;
             }
-            let sections = pmt_assembler
-                .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
-                .map_err(map_ts_err)?;
-            let mut got: Option<ProgramMapTable> = None;
+            let Ok(sections) =
+                pmt_assembler.feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+            else {
+                continue;
+            };
             for section in &sections {
-                if let Ok(pmt) = ProgramMapTable::parse(section) {
-                    got = Some(pmt);
+                let Ok(pmt) = ProgramMapTable::parse(section) else {
+                    continue;
+                };
+                if pmt.program_number == selected_program && pmt.current_next_indicator {
+                    chosen = Some(pmt);
                     break;
                 }
+                if fallback.is_none() {
+                    fallback = Some((pmt, offset, reader.position()));
+                }
             }
-            if let Some(pmt) = got {
-                break pmt;
+            if chosen.is_some() {
+                break;
+            }
+        }
+        let pmt = match (chosen, fallback) {
+            (Some(pmt), _) => pmt,
+            (None, Some((pmt, _, resume))) => {
+                // Streaming resumes right behind the fallback section.
+                reader.seek(resume);
+                pmt
+            }
+            (None, None) => {
+                return Err(CoreError::invalid(
+                    "mpegts: stream ended before the PMT was seen",
+                ));
             }
         };
 
@@ -387,11 +832,8 @@ impl MpegTsDemuxer {
         // bytes never reach the caller).
         let tb = TimeBase::new(1, 90_000);
         let mut streams: Vec<StreamInfo> = Vec::new();
-        let mut pid_to_stream: HashMap<u16, u32> = HashMap::new();
-        let mut reassemblers: HashMap<u16, PesReassembler> = HashMap::new();
-        let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
-        let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
-        let mut splitters: HashMap<u16, crate::AudioFrameSplitter> = HashMap::new();
+        let mut pid_slot = vec![0u16; PID_SPACE].into_boxed_slice();
+        let mut slots: Vec<PidSlot> = Vec::new();
         for pmt_stream in &pmt.streams {
             let mut params = match codec_params_for_stream_type(pmt_stream.stream_type)
                 .or_else(|| codec_params_for_private_pes(pmt_stream))
@@ -405,12 +847,6 @@ impl MpegTsDemuxer {
             } else {
                 crate::es_params::audio_syntax_for(params.codec_id.as_str())
             };
-            if let Some(syn) = syntax {
-                splitters.insert(
-                    pmt_stream.elementary_pid,
-                    crate::AudioFrameSplitter::new(syn),
-                );
-            }
             // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
             // §2.6.18) into the per-stream language tag so a demux →
             // remux path keeps each track's audio/subtitle language.
@@ -429,10 +865,19 @@ impl MpegTsDemuxer {
                 start_time: None,
                 params,
             });
-            pid_to_stream.insert(pmt_stream.elementary_pid, idx);
-            reassemblers.insert(pmt_stream.elementary_pid, PesReassembler::new());
-            pts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
-            dts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
+            let pid = pmt_stream.elementary_pid & 0x1FFF;
+            // A PID listed twice keeps its last entry, as a map would.
+            pid_slot[pid as usize] = idx as u16 + 1;
+            slots.push(PidSlot {
+                pid,
+                reassembler: PesReassembler::new(),
+                pts: NearestEpochUnwrap::default(),
+                dts: NearestEpochUnwrap::default(),
+                splitter: syntax.map(crate::AudioFrameSplitter::new),
+                last_cc: None,
+                duplicate_seen: false,
+                damaged: false,
+            });
         }
         if streams.is_empty() {
             return Err(CoreError::invalid(
@@ -440,23 +885,25 @@ impl MpegTsDemuxer {
                  0x02/0x1B/0x24/0xEA video, 0x80-0x86 audio, 0x90/0x92 subtitle)",
             ));
         }
+        // Share the in-flight budget between the PIDs.
+        let per_pid = (MAX_INFLIGHT_BYTES / slots.len()).min(crate::pes::DEFAULT_MAX_PES_BYTES);
+        for slot in &mut slots {
+            slot.reassembler = PesReassembler::new().with_max_bytes(per_pid);
+        }
 
         let mut demuxer = Self {
-            input,
+            reader,
             programs,
             selected_program,
             pcr_pid: pmt.pcr_pid,
             pcr_tracker: PcrTracker::new(),
             streams,
-            pid_to_stream,
-            reassemblers,
-            pts_trackers,
-            dts_trackers,
-            splitters,
+            pid_slot,
+            slots,
             pending: VecDeque::new(),
             eof_reached: false,
-            bytes_read: probe_bytes,
-            putback: probe_putback,
+            base_offset,
+            stats: TsDemuxStats::default(),
             duration_micros: None,
             first_pcr: None,
             last_pcr: None,
@@ -464,17 +911,18 @@ impl MpegTsDemuxer {
             layout,
         };
 
-        // Probe the container duration from the PCR span (§2.4.2.2).
-        // This seeks the input to its end and back; restore the
-        // streaming cursor afterwards so the first `next_packet`
-        // resumes exactly where the header scan stopped. A
-        // non-seekable source (or one too short to carry two PCRs)
+        // Probe the stream parameters and the container duration from
+        // the PCR span (§2.4.2.2). Both are out-of-band reads; the
+        // streaming position is restored afterwards so the first
+        // `next_packet` resumes exactly where the header scan stopped.
+        // A non-seekable source (or one too short to carry two PCRs)
         // leaves `duration_micros` at `None`.
+        let resume = demuxer.reader.position();
+        let skipped = demuxer.reader.resync_bytes;
         demuxer.probe_stream_params();
         demuxer.duration_micros = demuxer.compute_duration_micros();
-        let _ = demuxer
-            .input
-            .seek(std::io::SeekFrom::Start(demuxer.bytes_read));
+        demuxer.reader.seek(resume);
+        demuxer.reader.resync_bytes = skipped;
         if let Some(total) = demuxer.duration_micros {
             // Surface the same figure per stream so a consumer reading
             // `StreamInfo.duration` (90 kHz units) sees it too.
@@ -487,6 +935,51 @@ impl MpegTsDemuxer {
         }
 
         Ok(demuxer)
+    }
+
+    /// What the streaming path has skipped or repaired so far.
+    pub fn stats(&self) -> TsDemuxStats {
+        TsDemuxStats {
+            resync_bytes: self.reader.resync_bytes,
+            ..self.stats
+        }
+    }
+
+    /// Set the ceiling on the bytes held for one PID's in-flight PES
+    /// packet (default: an equal share of 256 MiB per stream, at most
+    /// [`crate::pes::DEFAULT_MAX_PES_BYTES`]). A PES packet of
+    /// undeclared length that reaches the ceiling is handed out in
+    /// pieces — the first carries the timestamps, the rest none — so a
+    /// lower ceiling trades packet integrity of oversized access units
+    /// for memory.
+    pub fn set_max_pes_bytes(&mut self, max_bytes: usize) {
+        for slot in &mut self.slots {
+            slot.reassembler.set_max_bytes(max_bytes);
+        }
+    }
+
+    /// Bytes currently buffered across every PID's in-flight PES
+    /// packet.
+    pub fn buffered_bytes(&self) -> usize {
+        self.slots
+            .iter()
+            .map(|s| s.reassembler.buffered_len())
+            .sum()
+    }
+
+    /// Bytes in the source ahead of the first whole transport packet —
+    /// non-zero for a capture that starts mid-packet or behind leading
+    /// bytes that are not transport packets.
+    pub fn leading_bytes(&self) -> u64 {
+        self.base_offset
+    }
+
+    /// Slot (= stream) index following `pid`, if any.
+    fn slot_of(&self, pid: u16) -> Option<usize> {
+        match self.pid_slot[pid as usize & (PID_SPACE - 1)] {
+            0 => None,
+            n => Some(n as usize - 1),
+        }
     }
 
     /// The list of programs the PAT advertised, in PAT order
@@ -540,7 +1033,7 @@ impl MpegTsDemuxer {
         // Length of the input, for the tail scan. A non-seekable or
         // zero-length source gives up (no end to scan toward).
         let psize = self.layout.packet_size as u64;
-        let len = self.input.seek(std::io::SeekFrom::End(0)).ok()?;
+        let len = self.reader.raw().seek(std::io::SeekFrom::End(0)).ok()?;
         if len < 2 * psize {
             return None;
         }
@@ -549,7 +1042,7 @@ impl MpegTsDemuxer {
         // First PCR from the head: align to a packet boundary and scan
         // forward. Real BD/broadcast streams carry a PCR within the
         // first handful of packets on the PCR_PID.
-        let (first_pcr, first_off) = self.scan_pcr_forward(0, len)?;
+        let (first_pcr, first_off) = self.scan_pcr_forward(0, len.min(PCR_ANCHOR_SCAN_BYTES))?;
         self.first_pcr = Some((first_pcr, first_off));
 
         // Last PCR from the tail: walk a trailing window backward in
@@ -567,8 +1060,9 @@ impl MpegTsDemuxer {
             if let Some(found) = self.scan_pcr_backward(start, aligned_len) {
                 break found;
             }
-            if start == 0 {
-                // Scanned the whole stream and found at most one PCR.
+            if start == 0 || window >= PCR_ANCHOR_SCAN_BYTES {
+                // Scanned the whole stream (or the largest tail window)
+                // and found at most one PCR.
                 return None;
             }
             window = window.saturating_mul(2);
@@ -727,89 +1221,87 @@ impl MpegTsDemuxer {
     /// One-pass builder for [`Self::random_access_points`].
     fn scan_random_access_points(&mut self) -> CoreResult<Vec<RandomAccessPoint>> {
         use std::io::SeekFrom;
-        // Remember the exact streaming cursor; the scan is an
-        // out-of-band probe.
-        let resume = {
-            use std::io::Seek;
-            self.input.stream_position().map_err(CoreError::Io)?
-        };
         let psize = self.layout.packet_size as u64;
-        let len = self.input.seek(SeekFrom::End(0)).map_err(CoreError::Io)?;
+        let base = self.base_offset;
+        let len = self
+            .reader
+            .raw()
+            .seek(SeekFrom::End(0))
+            .map_err(CoreError::Io)?;
         let aligned_len = (len / psize) * psize;
-        self.input.seek(SeekFrom::Start(0)).map_err(CoreError::Io)?;
 
         let mut out: Vec<RandomAccessPoint> = Vec::new();
-        // Indices into `out` of RAPs on a PID whose announced PES
-        // start (the next PUSI=1 packet on that PID) hasn't been seen
-        // yet.
-        let mut unresolved: HashMap<u16, Vec<usize>> = HashMap::new();
-        // Per-PID reference time for the out-of-order-tolerant PTS
+        // Per slot: indices into `out` of indicator points whose
+        // announced PES start (the next PUSI=1 packet on the PID)
+        // hasn't been seen yet.
+        let mut unresolved: Vec<Vec<usize>> = vec![Vec::new(); self.slots.len()];
+        // Per-slot reference time for the out-of-order-tolerant PTS
         // unwrap: each PES start's raw 33-bit PTS extends to the epoch
         // nearest the previous one on the PID (`extend_near`), exactly
-        // tracking the wraps the streaming PtsTracker would count while
+        // tracking the wraps the streaming unwrapper counts while
         // shrugging off B-picture reordering.
-        let mut pts_ref: HashMap<u16, u64> = HashMap::new();
-        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
-        let mut off = 0u64;
-        while off + psize <= aligned_len {
-            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
+        let mut pts_ref: Vec<Option<u64>> = vec![None; self.slots.len()];
+        let mut scan =
+            GridScan::new(self.reader.raw(), self.layout, 0, aligned_len).map_err(CoreError::Io)?;
+        while let Some((off, window)) = scan.next_packet() {
+            if out.len() >= MAX_INDEX_ENTRIES {
                 break;
             }
             // A stray mid-stream corruption shouldn't abort the index;
             // skip unparseable packets (the streaming path has its own
             // resync story).
-            if let Ok(pkt) = TsPacket::parse(self.layout.window(&buf))
-                && let Some(&stream_index) = self.pid_to_stream.get(&pkt.pid)
-            {
-                let rai = pkt
-                    .adaptation_field
-                    .as_ref()
-                    .is_some_and(|af| af.random_access_indicator);
-                if rai {
-                    unresolved.entry(pkt.pid).or_default().push(out.len());
+            let Ok(pkt) = TsPacket::parse(window) else {
+                continue;
+            };
+            let slot = match self.pid_slot[pkt.pid as usize] {
+                0 => continue,
+                n => n as usize - 1,
+            };
+            let stream_index = slot as u32;
+            let rai = pkt
+                .adaptation_field
+                .as_ref()
+                .is_some_and(|af| af.random_access_indicator);
+            if rai {
+                unresolved[slot].push(out.len());
+                out.push(RandomAccessPoint {
+                    byte_offset: off + base,
+                    pid: pkt.pid,
+                    stream_index,
+                    pts_90k: None,
+                    kind: AccessPointKind::RandomAccessIndicator,
+                });
+            }
+            if pkt.payload_unit_start {
+                let pes = PesPacket::parse_header(pkt.payload).ok().map(|(p, _)| p);
+                let pts = pes.as_ref().and_then(|p| p.pts_90k).map(|raw| {
+                    let ext = match pts_ref[slot] {
+                        Some(r) => crate::clock::extend_near(raw, r),
+                        None => raw,
+                    };
+                    pts_ref[slot] = Some(ext);
+                    ext
+                });
+                if !unresolved[slot].is_empty() {
+                    // This PES start is the one the pending
+                    // indicator(s) announced; lift its PTS.
+                    for i in unresolved[slot].drain(..) {
+                        out[i].pts_90k = pts;
+                    }
+                } else if pes.is_some_and(|p| p.data_alignment_indicator) && pts.is_some() {
+                    // No indicator announced this PES, but its
+                    // payload starts data-aligned (§2.4.3.7) —
+                    // the fallback access-point tier.
                     out.push(RandomAccessPoint {
-                        byte_offset: off,
+                        byte_offset: off + base,
                         pid: pkt.pid,
                         stream_index,
-                        pts_90k: None,
-                        kind: AccessPointKind::RandomAccessIndicator,
+                        pts_90k: pts,
+                        kind: AccessPointKind::DataAligned,
                     });
-                }
-                if pkt.payload_unit_start {
-                    let pes = PesPacket::parse(pkt.payload).ok();
-                    let pts = pes.as_ref().and_then(|p| p.pts_90k).map(|raw| {
-                        let ext = match pts_ref.get(&pkt.pid) {
-                            Some(&r) => crate::clock::extend_near(raw, r),
-                            None => raw,
-                        };
-                        pts_ref.insert(pkt.pid, ext);
-                        ext
-                    });
-                    if let Some(pending) = unresolved.remove(&pkt.pid) {
-                        // This PES start is the one the pending
-                        // indicator(s) announced; lift its PTS.
-                        for i in pending {
-                            out[i].pts_90k = pts;
-                        }
-                    } else if pes.is_some_and(|p| p.data_alignment_indicator) && pts.is_some() {
-                        // No indicator announced this PES, but its
-                        // payload starts data-aligned (§2.4.3.7) —
-                        // the fallback access-point tier.
-                        out.push(RandomAccessPoint {
-                            byte_offset: off,
-                            pid: pkt.pid,
-                            stream_index,
-                            pts_90k: pts,
-                            kind: AccessPointKind::DataAligned,
-                        });
-                    }
                 }
             }
-            off += psize;
         }
-        self.input
-            .seek(SeekFrom::Start(resume))
-            .map_err(CoreError::Io)?;
         Ok(out)
     }
 
@@ -874,7 +1366,7 @@ impl MpegTsDemuxer {
                 "mpegts: stream carries no random_access_indicator with a PTS to seek against",
             )
         })?;
-        self.reposition(offset, Some(pts as i64));
+        self.reposition(offset - self.base_offset, Some(pts as i64));
         Ok(pts as i64)
     }
 
@@ -911,9 +1403,9 @@ impl MpegTsDemuxer {
     /// PCR-granular landing of the plain `Demuxer::seek_to` fallback.
     pub fn seek_to_access_point(&mut self, stream_index: u32, target_90k: i64) -> CoreResult<i64> {
         let pid = self
-            .pid_to_stream
-            .iter()
-            .find_map(|(&pid, &idx)| (idx == stream_index).then_some(pid))
+            .slots
+            .get(stream_index as usize)
+            .map(|slot| slot.pid)
             .ok_or_else(|| {
                 CoreError::invalid(format!("mpegts: no stream with index {stream_index}"))
             })?;
@@ -1000,9 +1492,7 @@ impl MpegTsDemuxer {
         /// B-picture reorder window.
         const REORDER_GRACE_90K: i64 = 90_000;
 
-        let psize = self.layout.packet_size as u64;
-        self.input
-            .seek(std::io::SeekFrom::Start(from_off))
+        let mut scan = GridScan::new(self.reader.raw(), self.layout, from_off, u64::MAX)
             .map_err(CoreError::Io)?;
 
         let mut best_rai: Option<(u64, i64)> = None;
@@ -1014,15 +1504,9 @@ impl MpegTsDemuxer {
         // resolved PES time; seeded by the PCR landing time.
         let mut pts_ref = from_time.max(0) as u64;
 
-        let mut off = from_off;
-        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
-        loop {
-            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
-                break; // end of stream — window exhausted
-            }
-            let pkt_off = off;
-            off += psize;
-            let Ok(pkt) = TsPacket::parse(self.layout.window(&buf)) else {
+        // Ends with the window, or with the stream.
+        while let Some((pkt_off, window)) = scan.next_packet() {
+            let Ok(pkt) = TsPacket::parse(window) else {
                 continue; // stray corruption: skip, as the index scan does
             };
             if pkt.pid != pid {
@@ -1038,8 +1522,8 @@ impl MpegTsDemuxer {
             if !pkt.payload_unit_start {
                 continue;
             }
-            let pes = match PesPacket::parse(pkt.payload) {
-                Ok(p) => p,
+            let pes = match PesPacket::parse_header(pkt.payload) {
+                Ok((p, _)) => p,
                 Err(_) => continue,
             };
             let Some(raw_pts) = pes.pts_90k else {
@@ -1099,7 +1583,7 @@ impl MpegTsDemuxer {
                      data-aligned PES start) with a PTS to seek against",
                 )
             })?;
-        self.reposition(offset, Some(pts as i64));
+        self.reposition(offset - self.base_offset, Some(pts as i64));
         Ok(pts as i64)
     }
 
@@ -1119,49 +1603,27 @@ impl MpegTsDemuxer {
     /// the caller seeked along rather than re-anchoring at their raw
     /// 33-bit values ([`PtsTracker::seed`]).
     fn reposition(&mut self, offset: u64, time_hint_90k: Option<i64>) {
-        let _ = self.input.seek(std::io::SeekFrom::Start(offset));
-        self.bytes_read = offset;
-        self.putback.clear();
+        self.reader.seek(offset);
         self.pending.clear();
         self.eof_reached = false;
         self.pcr_tracker.reset();
-        for r in self.reassemblers.values_mut() {
-            *r = PesReassembler::new();
-        }
-        for s in self.splitters.values_mut() {
-            s.reset();
-        }
         let hint = time_hint_90k.and_then(|t| u64::try_from(t).ok());
-        for t in self
-            .pts_trackers
-            .values_mut()
-            .chain(self.dts_trackers.values_mut())
-        {
-            match hint {
-                Some(h) => t.seed(h),
-                None => t.reset(),
-            }
+        for slot in &mut self.slots {
+            slot.rehome(hint);
         }
     }
 
     /// Scan forward from byte offset `from` (must be packet-aligned)
     /// toward `len`, returning the first PCR on the selected `PCR_PID`
-    /// and the byte offset of the packet that carried it. Restores the
-    /// input cursor to where it found the match is *not* required — the
-    /// caller treats this as an out-of-band probe.
+    /// and the byte offset of the packet that carried it — an
+    /// out-of-band probe that leaves the streaming position alone.
     fn scan_pcr_forward(&mut self, from: u64, len: u64) -> Option<(Pcr, u64)> {
-        let psize = self.layout.packet_size as u64;
-        self.input.seek(std::io::SeekFrom::Start(from)).ok()?;
-        let mut off = from;
-        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
-        while off + psize <= len {
-            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
-                return None;
-            }
-            if let Some(pcr) = pcr_from_packet(self.layout.window(&buf), self.pcr_pid) {
+        let pcr_pid = self.pcr_pid;
+        let mut scan = GridScan::new(self.reader.raw(), self.layout, from, len).ok()?;
+        while let Some((off, window)) = scan.next_packet() {
+            if let Some(pcr) = pcr_from_packet(window, pcr_pid) {
                 return Some((pcr, off));
             }
-            off += psize;
         }
         None
     }
@@ -1170,42 +1632,33 @@ impl MpegTsDemuxer {
     /// return the **last** PCR on the selected `PCR_PID` together with
     /// its packet offset. `from` and `to` must be packet-aligned.
     fn scan_pcr_backward(&mut self, from: u64, to: u64) -> Option<(Pcr, u64)> {
-        let psize = self.layout.packet_size as u64;
-        self.input.seek(std::io::SeekFrom::Start(from)).ok()?;
-        let mut off = from;
-        let mut buf = [0u8; MAX_PHYSICAL_PACKET];
+        let pcr_pid = self.pcr_pid;
+        let mut scan = GridScan::new(self.reader.raw(), self.layout, from, to).ok()?;
         let mut found: Option<(Pcr, u64)> = None;
-        while off + psize <= to {
-            if read_exact_packet(&mut self.input, &mut buf[..psize as usize]).is_err() {
-                break;
-            }
-            if let Some(pcr) = pcr_from_packet(self.layout.window(&buf), self.pcr_pid) {
+        while let Some((off, window)) = scan.next_packet() {
+            if let Some(pcr) = pcr_from_packet(window, pcr_pid) {
                 found = Some((pcr, off));
             }
-            off += psize;
         }
         found
     }
 
-    /// Unwrap a freshly reassembled PES into a [`Packet`], carrying the
-    /// monotonic 64-bit extended PTS/DTS (§2.4.3.7) rather than the raw
-    /// 33-bit ring value, and record the stream's `start_time` on its
-    /// first timestamped packet.
     /// Turn a reassembled PES into output packets on `self.pending`:
     /// one per PES, or — for a stream with an [`crate::AudioFrameSplitter`]
-    /// — one per audio access unit the payload completes. Returns the
-    /// number of packets queued.
-    fn emit_pes(&mut self, pid: u16, stream_idx: u32, mut pes: PesPacket) -> usize {
-        if !self.splitters.contains_key(&pid) {
-            let pkt = self.finish_pes(pid, stream_idx, pes);
+    /// — one per audio access unit the payload completes. `corrupt`
+    /// marks packets cut from a PES that lost transport packets.
+    /// Returns the number of packets queued.
+    fn emit_pes(&mut self, slot: usize, mut pes: PesPacket, corrupt: bool) -> usize {
+        if self.slots[slot].splitter.is_none() {
+            let pkt = self.finish_pes(slot, pes).with_corrupt(corrupt);
             self.pending.push_back(pkt);
             return 1;
         }
         let payload = std::mem::take(&mut pes.payload);
         let random_access = pes.random_access;
         // Timestamps through the same unwrap path as whole-PES packets.
-        let head = self.finish_pes(pid, stream_idx, pes);
-        let splitter = self.splitters.get_mut(&pid).expect("checked above");
+        let head = self.finish_pes(slot, pes).with_corrupt(corrupt);
+        let splitter = self.slots[slot].splitter.as_mut().expect("checked above");
         let was_locked = splitter.is_locked();
         let frames = splitter.push(&payload, head.pts);
         if frames.is_empty() && !was_locked {
@@ -1221,7 +1674,9 @@ impl MpegTsDemuxer {
         }
         let n = frames.len();
         for (k, f) in frames.into_iter().enumerate() {
-            let pkt = self.audio_frame_packet(stream_idx, f, k == 0 && random_access);
+            let pkt = self
+                .audio_frame_packet(slot as u32, f, k == 0 && random_access)
+                .with_corrupt(corrupt);
             self.pending.push_back(pkt);
         }
         n
@@ -1247,49 +1702,43 @@ impl MpegTsDemuxer {
         pkt
     }
 
-    fn finish_pes(&mut self, pid: u16, stream_idx: u32, mut pes: PesPacket) -> Packet {
+    /// Unwrap a freshly reassembled PES into a [`Packet`], carrying the
+    /// monotonic 64-bit extended PTS/DTS (§2.4.3.7) rather than the raw
+    /// 33-bit ring value, and record the stream's `start_time` on its
+    /// first timestamped packet.
+    fn finish_pes(&mut self, slot: usize, mut pes: PesPacket) -> Packet {
         let tb = TimeBase::new(1, 90_000);
-        let mut pkt = Packet::new(stream_idx, tb, std::mem::take(&mut pes.payload));
+        let mut pkt = Packet::new(slot as u32, tb, std::mem::take(&mut pes.payload));
         // A TS-level random_access_indicator (§2.4.3.5) announced this
         // PES as beginning at an elementary-stream access point — the
         // container-level keyframe signal.
         if pes.random_access {
             pkt = pkt.with_keyframe(true);
         }
+        let state = &mut self.slots[slot];
         let mut pts_ext: Option<u64> = None;
         if let Some(raw) = pes.pts_90k {
-            let ext = if let Some(t) = self.pts_trackers.get_mut(&pid) {
-                t.observe(raw);
-                t.extended().unwrap_or(raw)
-            } else {
-                raw
-            };
+            let ext = state.pts.extend(raw);
             pts_ext = Some(ext);
             pkt = pkt.with_pts(ext as i64);
-            let info = &mut self.streams[stream_idx as usize];
+            let info = &mut self.streams[slot];
             if info.start_time.is_none() {
                 info.start_time = Some(ext as i64);
             }
         }
         if let Some(raw) = pes.dts_90k {
-            let ext = if let Some(t) = self.dts_trackers.get_mut(&pid) {
-                // §2.4.3.7: DTS and PTS share one time base. A stream
-                // whose first coded DTS only appears after a 2^33 wrap
-                // must not anchor an independent epoch at the raw ring
-                // value — seed the tracker with this PES's extended
-                // PTS so both fields stay on the same 64-bit axis
-                // (found by the mux_roundtrip fuzz target on a
-                // wrap-crossing timeline).
-                if t.extended().is_none()
-                    && let Some(hint) = pts_ext
-                {
-                    t.seed(hint);
-                }
-                t.observe(raw);
-                t.extended().unwrap_or(raw)
-            } else {
-                raw
-            };
+            // §2.4.3.7: DTS and PTS share one time base. A stream
+            // whose first coded DTS only appears after a 2^33 wrap
+            // must not anchor an independent epoch at the raw ring
+            // value — place it next to this PES's extended PTS so both
+            // fields stay on the same 64-bit axis (found by the
+            // mux_roundtrip fuzz target on a wrap-crossing timeline).
+            if !state.dts.is_anchored()
+                && let Some(hint) = pts_ext
+            {
+                state.dts.seed(hint);
+            }
+            let ext = state.dts.extend(raw);
             pkt = pkt.with_dts(ext as i64);
         }
         pkt
@@ -1302,141 +1751,170 @@ impl MpegTsDemuxer {
     /// sequence header for video, the first syncframe header for audio
     /// (which also refines MPEG-audio layer and AC-3 vs E-AC-3).
     ///
-    /// Reads at most [`PARAM_PROBE_BYTES`] past the PMT, then restores
-    /// the streaming cursor (input position and resync put-back) so the
-    /// first `next_packet` resumes exactly where the header scan
-    /// stopped.
+    /// Reads at most [`PARAM_PROBE_BYTES`] past the PMT; the caller
+    /// restores the streaming position.
     fn probe_stream_params(&mut self) {
-        use std::collections::HashSet;
-        let Ok(resume) = self.input.stream_position() else {
-            return;
-        };
-        let saved_putback = self.putback.clone();
-        let mut need: HashSet<u16> = HashSet::new();
-        for (&pid, &idx) in &self.pid_to_stream {
-            let id = self.streams[idx as usize].params.codec_id.as_str();
-            if self.splitters.contains_key(&pid)
-                || matches!(id, "h264" | "mpeg1video" | "mpeg2video")
-            {
-                need.insert(pid);
-            }
+        let n = self.slots.len();
+        let mut need = vec![false; n];
+        for (i, slot) in self.slots.iter().enumerate() {
+            let id = self.streams[i].params.codec_id.as_str();
+            // Only the slot a PID actually routes to can be probed.
+            need[i] = self.slot_of(slot.pid) == Some(i)
+                && (slot.splitter.is_some() || matches!(id, "h264" | "mpeg1video" | "mpeg2video"));
         }
-        let mut asm: HashMap<u16, PesReassembler> =
-            need.iter().map(|&p| (p, PesReassembler::new())).collect();
-        let mut video_bytes: HashMap<u16, Vec<u8>> = HashMap::new();
-        let psize = self.layout.packet_size as u64;
-        let start = self.bytes_read;
-        let mut off = start;
-        while !need.is_empty() && off - start < PARAM_PROBE_BYTES {
-            let buf = match read_one_packet(&mut self.input, &mut self.putback, off, self.layout) {
-                Ok(Some(b)) => b,
-                _ => break,
+        let mut wanted = need.iter().filter(|&&w| w).count();
+        let mut asm: Vec<PesReassembler> = (0..n)
+            .map(|_| PesReassembler::new().with_max_bytes(PARAM_PROBE_VIDEO_BYTES))
+            .collect();
+        let mut video_bytes: Vec<Vec<u8>> = vec![Vec::new(); n];
+        // Accumulated size at which a video stream's headers are next
+        // looked for: every PES while the buffer is small, then at
+        // doublings, so the total scan work stays linear.
+        let mut retry_at = vec![0usize; n];
+        let start = self.reader.position();
+        while wanted > 0 && self.reader.position() - start < PARAM_PROBE_BYTES {
+            let Ok(Some((_, raw))) = self.reader.next_packet() else {
+                break;
             };
-            off += psize;
-            let Ok(pkt) = TsPacket::parse(&buf) else {
+            let Ok(pkt) = TsPacket::parse(&raw) else {
                 continue;
             };
-            if !need.contains(&pkt.pid) {
+            let Some(i) = self.slot_of(pkt.pid) else {
+                continue;
+            };
+            if !need[i] || pkt.transport_error {
                 continue;
             }
-            let Some(r) = asm.get_mut(&pkt.pid) else {
+            let Ok(Some(pes)) = asm[i].feed(&pkt) else {
                 continue;
             };
-            let Ok(Some(pes)) = r.feed(&pkt) else {
-                continue;
-            };
-            let idx = self.pid_to_stream[&pkt.pid] as usize;
-            if let Some(sp) = self.splitters.get(&pkt.pid) {
+            if let Some(sp) = &self.slots[i].splitter {
                 let mut probe = crate::AudioFrameSplitter::new(sp.syntax());
                 if let Some(f) = probe.push(&pes.payload, None).first() {
-                    crate::es_params::apply_audio(&mut self.streams[idx].params, &f.info);
-                    need.remove(&pkt.pid);
+                    crate::es_params::apply_audio(&mut self.streams[i].params, &f.info);
+                    need[i] = false;
+                    wanted -= 1;
                 }
                 continue;
             }
-            let acc = video_bytes.entry(pkt.pid).or_default();
+            let acc = &mut video_bytes[i];
             acc.extend_from_slice(&pes.payload);
-            let params = &mut self.streams[idx].params;
+            if acc.len() < retry_at[i] {
+                continue;
+            }
+            retry_at[i] = if acc.len() < PARAM_PROBE_RESCAN_BYTES {
+                0
+            } else {
+                acc.len().saturating_mul(2)
+            };
+            let params = &mut self.streams[i].params;
             let found = match params.codec_id.as_str() {
                 "h264" => crate::es_params::h264_params(acc),
                 _ => crate::es_params::mpeg12_params(acc),
             };
             if let Some(v) = found {
                 crate::es_params::apply_video(params, &v);
-                need.remove(&pkt.pid);
+                need[i] = false;
+                wanted -= 1;
             } else if acc.len() > PARAM_PROBE_VIDEO_BYTES {
-                need.remove(&pkt.pid);
+                need[i] = false;
+                wanted -= 1;
             }
         }
-        let _ = self.input.seek(std::io::SeekFrom::Start(resume));
-        self.putback = saved_putback;
     }
 
-    /// Feed a TS packet's adaptation field into the PCR clock recovery
-    /// when it lands on the selected program's `PCR_PID`.
-    fn observe_pcr(&mut self, pkt: &TsPacket<'_>, byte_offset: u64) {
-        if pkt.pid != self.pcr_pid {
+    /// Route one transport packet read at stream offset `offset`:
+    /// PCR recovery on the `PCR_PID`, continuity bookkeeping and PES
+    /// reassembly on the elementary PIDs. Nothing here fails — damage
+    /// is skipped and counted (see [`TsDemuxStats`]).
+    fn route(&mut self, offset: u64, raw: &[u8; TS_PACKET_LEN]) {
+        if raw[1] & 0x80 != 0 {
+            // transport_error_indicator: any field of the packet may
+            // be wrong, the PID included.
+            self.stats.transport_errors += 1;
             return;
         }
-        if let Some(af) = &pkt.adaptation_field {
-            self.pcr_tracker.observe(af, byte_offset);
+        // Most packets of a multi-program stream belong to PIDs this
+        // demuxer does not follow: decide that from the two PID bytes
+        // before parsing anything else.
+        let pid = (u16::from(raw[1] & 0x1F) << 8) | u16::from(raw[2]);
+        if self.pid_slot[pid as usize] == 0 && pid != self.pcr_pid {
+            return;
         }
-    }
-
-    /// Pull one TS packet from the input and, if it's for a stream we
-    /// track, feed the per-PID reassembler. Returns the number of
-    /// `Packet`s pushed into `self.pending` by this call.
-    fn read_one_into_pending(&mut self) -> CoreResult<usize> {
-        let buf = match read_one_packet(
-            &mut self.input,
-            &mut self.putback,
-            self.bytes_read,
-            self.layout,
-        )? {
-            Some(b) => b,
-            None => return Ok(0),
+        let Ok(pkt) = TsPacket::parse(raw) else {
+            self.stats.malformed_packets += 1;
+            return;
         };
-        let pkt_offset = self.bytes_read;
-        self.bytes_read += self.layout.packet_size as u64;
-        let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
         // PCR recovery runs on the PCR_PID regardless of whether that
         // PID also carries an elementary stream we track.
-        self.observe_pcr(&pkt, pkt_offset);
-        let stream_idx = match self.pid_to_stream.get(&pkt.pid).copied() {
-            Some(i) => i,
-            None => return Ok(0),
+        if pkt.pid == self.pcr_pid
+            && let Some(af) = &pkt.adaptation_field
+        {
+            self.pcr_tracker.observe(af, offset);
+        }
+        let Some(i) = self.slot_of(pkt.pid) else {
+            return;
         };
-        let reassembler = self
-            .reassemblers
-            .get_mut(&pkt.pid)
-            .expect("pid_to_stream and reassemblers are kept in sync");
-        let emitted = reassembler.feed(&pkt).map_err(map_ts_err)?;
-        let pushed = match emitted {
-            Some(pes) => self.emit_pes(pkt.pid, stream_idx, pes),
-            None => 0,
-        };
-        Ok(pushed)
+        let slot = &mut self.slots[i];
+        // §2.4.3.3: the counter increments on packets with a payload
+        // (adaptation_field_control '01' / '11'); the same value twice
+        // is a duplicate; any other step means packets were lost —
+        // unless the adaptation field announces the discontinuity.
+        let has_payload = raw[3] & 0x10 != 0;
+        if has_payload {
+            let cc = pkt.continuity_counter;
+            let announced = pkt
+                .adaptation_field
+                .as_ref()
+                .is_some_and(|af| af.discontinuity_indicator);
+            if let Some(prev) = slot.last_cc
+                && !announced
+            {
+                if cc == prev && !slot.duplicate_seen {
+                    slot.duplicate_seen = true;
+                    self.stats.duplicate_packets += 1;
+                    return;
+                }
+                if cc != (prev + 1) & 0x0F {
+                    self.stats.continuity_errors += 1;
+                    slot.damaged = true;
+                }
+            }
+            slot.last_cc = Some(cc);
+            slot.duplicate_seen = false;
+        }
+        match slot.reassembler.feed(&pkt) {
+            Ok(Some(pes)) => {
+                let corrupt = std::mem::take(&mut slot.damaged);
+                self.emit_pes(i, pes, corrupt);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                slot.damaged = false;
+                self.stats.damaged_pes += 1;
+            }
+        }
     }
 
     /// Flush every per-PID reassembler — used once the input runs
     /// dry. Pushes a final `Packet` per stream that had a buffered
-    /// in-flight PES at end-of-stream.
+    /// in-flight PES at end-of-stream, in ascending PID order.
     fn flush_reassemblers(&mut self) {
-        let mut pids: Vec<u16> = self.reassemblers.keys().copied().collect();
-        pids.sort_unstable();
-        for pid in pids {
-            let stream_idx = self.pid_to_stream[&pid];
-            let flushed = self
-                .reassemblers
-                .get_mut(&pid)
-                .and_then(|r| r.flush().ok().flatten());
-            if let Some(pes) = flushed {
-                self.emit_pes(pid, stream_idx, pes);
+        let mut order: Vec<usize> = (0..self.slots.len()).collect();
+        order.sort_by_key(|&i| self.slots[i].pid);
+        for i in order {
+            match self.slots[i].reassembler.flush() {
+                Ok(Some(pes)) => {
+                    let corrupt = std::mem::take(&mut self.slots[i].damaged);
+                    self.emit_pes(i, pes, corrupt);
+                }
+                Ok(None) => {}
+                Err(_) => self.stats.damaged_pes += 1,
             }
             // A trailing partial audio frame (truncated stream) still
             // reaches the decoder, which decides whether it is usable.
-            if let Some(f) = self.splitters.get_mut(&pid).and_then(|s| s.flush()) {
-                let pkt = self.audio_frame_packet(stream_idx, f, false);
+            if let Some(f) = self.slots[i].splitter.as_mut().and_then(|s| s.flush()) {
+                let pkt = self.audio_frame_packet(i as u32, f, false);
                 self.pending.push_back(pkt);
             }
         }
@@ -1481,49 +1959,28 @@ impl Demuxer for MpegTsDemuxer {
             if self.eof_reached {
                 return Err(CoreError::Eof);
             }
-            let pushed = self.read_one_into_pending()?;
-            if pushed == 0 {
-                // Check eof directly: read_one_packet returns Ok(None)
-                // when there are no more 188-byte chunks. We need a
-                // signal here without re-reading; do a single
-                // try-read and on `None` set eof + flush.
-                match read_one_packet(
-                    &mut self.input,
-                    &mut self.putback,
-                    self.bytes_read,
-                    self.layout,
-                )? {
-                    None => {
-                        self.eof_reached = true;
-                        self.flush_reassemblers();
-                    }
-                    Some(buf) => {
-                        let pkt_offset = self.bytes_read;
-                        self.bytes_read += self.layout.packet_size as u64;
-                        // We've already advanced past an EOF earlier
-                        // when this branch was taken with pushed=0 but
-                        // there ARE more bytes — that means the prior
-                        // packet was a non-stream PID (silently
-                        // dropped). Re-parse + feed and loop.
-                        let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
-                        self.observe_pcr(&pkt, pkt_offset);
-                        if let Some(stream_idx) = self.pid_to_stream.get(&pkt.pid).copied() {
-                            let emitted = self
-                                .reassemblers
-                                .get_mut(&pkt.pid)
-                                .and_then(|r| r.feed(&pkt).transpose())
-                                .transpose()
-                                .map_err(map_ts_err)?;
-                            if let Some(pes) = emitted {
-                                self.emit_pes(pkt.pid, stream_idx, pes);
-                            }
-                        }
-                    }
+            match self.reader.next_packet()? {
+                Some((offset, raw)) => self.route(offset, &raw),
+                None => {
+                    self.eof_reached = true;
+                    self.flush_reassemblers();
                 }
             }
         }
     }
 }
+
+/// Head bytes examined to find the packet layout and the first whole
+/// packet.
+const LAYOUT_PROBE_BYTES: usize = 64 << 10;
+
+/// Input bytes read past the first PAT section while waiting for the
+/// remaining sections of a multi-section PAT.
+const PAT_COMPLETION_BYTES: u64 = 4 << 20;
+
+/// Input bytes read past a PMT section that is not (yet) the selected
+/// program's applicable one before settling for it.
+const PMT_FALLBACK_BYTES: u64 = 4 << 20;
 
 /// Input bytes the open-time parameter probe reads past the PMT
 /// before giving up on streams whose first access unit never arrived.
@@ -1533,7 +1990,20 @@ const PARAM_PROBE_BYTES: u64 = 8 << 20;
 /// a sequence parameter set / sequence header.
 const PARAM_PROBE_VIDEO_BYTES: usize = 2 << 20;
 
-/// Maximum packet-sized chunks we'll skip while resyncing after a bad
+/// Below this many accumulated bytes the header hunt re-runs on every
+/// PES packet; above it only when the buffer has doubled.
+const PARAM_PROBE_RESCAN_BYTES: usize = 64 << 10;
+
+/// Input bytes scanned from the head of the stream for the first PCR,
+/// and the largest tail window scanned for the last one. §2.7.2 spaces
+/// PCRs at most 0,1 s apart, so both sit within a fraction of this at
+/// any realistic rate.
+const PCR_ANCHOR_SCAN_BYTES: u64 = 64 << 20;
+
+/// Ceiling on the entries of the access-point index (32 bytes each).
+const MAX_INDEX_ENTRIES: usize = 4 << 20;
+
+/// Bytes, in packets, one read may examine while resyncing after a bad
 /// sync byte. We've observed real BD M2TS streams with ~2 AACS units
 /// (~12 KB ≈ 64 TS packets) of undecryptable bytes at chapter
 /// boundaries — an independent decryption of the same disc reproduces
@@ -1542,185 +2012,6 @@ const PARAM_PROBE_VIDEO_BYTES: usize = 2 << 20;
 /// packets gives a comfortable ceiling without silently swallowing a
 /// longer corruption that the caller should know about.
 const RESYNC_PACKET_LIMIT: usize = 256;
-
-/// Largest physical packet size the demuxer tolerates (the 204-byte
-/// trailer-appended form; see [`crate::packet::TsPacketLayout`]).
-const MAX_PHYSICAL_PACKET: usize = 204;
-
-/// Read exactly one physical packet (per `layout`) from the input and
-/// return its logical 188-byte TS window.
-///
-/// Drains from `putback` first (used by the resync path to feed peeked
-/// bytes back to the caller) and then from `input`.
-///
-/// Returns `Ok(None)` cleanly when fewer than a packet's bytes remain —
-/// the caller treats that as end-of-stream. A short read mid-packet
-/// (e.g. the stream is truncated) surfaces as `Err`.
-///
-/// On a sync-byte mismatch we **resync** by discarding packet-sized
-/// chunks until we find one with `0x47` at the layout's sync offset
-/// AND another `0x47` one packet stride later (the next packet's
-/// sync). The probed bytes are buffered in `putback` so the next call
-/// sees them as the head of a fresh packet — without that, every
-/// subsequent read would land misaligned and re-trigger resync.
-fn read_one_packet(
-    input: &mut Box<dyn ReadSeek>,
-    putback: &mut VecDeque<u8>,
-    bytes_read: u64,
-    layout: crate::packet::TsPacketLayout,
-) -> CoreResult<Option<[u8; TS_PACKET_LEN]>> {
-    use std::io::Read;
-    let psize = layout.packet_size;
-    let mut buf = [0u8; MAX_PHYSICAL_PACKET];
-    let mut filled = 0;
-    // Drain putback first.
-    while filled < psize {
-        match putback.pop_front() {
-            Some(b) => {
-                buf[filled] = b;
-                filled += 1;
-            }
-            None => break,
-        }
-    }
-    while filled < psize {
-        match input.read(&mut buf[filled..psize]) {
-            Ok(0) => {
-                if filled == 0 {
-                    return Ok(None);
-                }
-                return Err(CoreError::invalid(format!(
-                    "mpegts: short read at packet boundary ({filled}/{psize} bytes, offset {bytes_read})"
-                )));
-            }
-            Ok(n) => filled += n,
-            Err(e) => return Err(CoreError::Io(e)),
-        }
-    }
-    if buf[layout.sync_offset] != TS_SYNC_BYTE {
-        return resync(input, putback, buf[layout.sync_offset], bytes_read, layout).map(Some);
-    }
-    let mut out = [0u8; TS_PACKET_LEN];
-    out.copy_from_slice(layout.window(&buf));
-    Ok(Some(out))
-}
-
-/// Resync after a bad sync byte. Read one fresh packet-sized chunk; if
-/// it carries `0x47` at the layout's sync offset, accept it as the
-/// recovered packet — but **only** after confirming the byte one
-/// packet stride later is also `0x47` (the next packet's sync). The
-/// double-sync check is what rejects random `0x47` bytes inside
-/// garbage data.
-///
-/// We don't try to recover the failing packet itself; we just skip it
-/// (and any further failing chunks) until a clean packet boundary
-/// appears. After at most [`RESYNC_PACKET_LIMIT`] failed chunks,
-/// surface as `Err`.
-///
-/// `bad_byte` is the byte that failed the sync check, kept for
-/// diagnostics.
-fn resync(
-    input: &mut Box<dyn ReadSeek>,
-    putback: &mut VecDeque<u8>,
-    bad_byte: u8,
-    bytes_read: u64,
-    layout: crate::packet::TsPacketLayout,
-) -> CoreResult<[u8; TS_PACKET_LEN]> {
-    use std::io::Read;
-    let psize = layout.packet_size;
-    let mut buf = [0u8; MAX_PHYSICAL_PACKET];
-    // To verify the NEXT packet's sync we must read past its framing
-    // prefix: `sync_offset + 1` probe bytes.
-    let probe_len = layout.sync_offset + 1;
-    let mut probe = [0u8; MAX_PHYSICAL_PACKET];
-    for _ in 0..RESYNC_PACKET_LIMIT {
-        // Read one fresh packet-sized chunk.
-        let mut filled = 0;
-        while filled < psize {
-            match input.read(&mut buf[filled..psize]) {
-                Ok(0) => {
-                    return Err(CoreError::invalid(format!(
-                        "mpegts: bad sync byte 0x{bad_byte:02X} at offset {bytes_read} \
-                         and EOF reached during resync"
-                    )));
-                }
-                Ok(n) => filled += n,
-                Err(e) => return Err(CoreError::Io(e)),
-            }
-        }
-        if buf[layout.sync_offset] != TS_SYNC_BYTE {
-            continue;
-        }
-        // Candidate passes single-sync; probe up to the next packet's
-        // sync byte for a double-sync.
-        let mut probed = 0;
-        let mut hit_eof = false;
-        while probed < probe_len {
-            match input.read(&mut probe[probed..probe_len]) {
-                Ok(0) => {
-                    hit_eof = true;
-                    break;
-                }
-                Ok(n) => probed += n,
-                Err(e) => return Err(CoreError::Io(e)),
-            }
-        }
-        if hit_eof {
-            // EOF while probing after a clean candidate. Trust the
-            // single sync byte; we can't double-check, but the packet
-            // itself parsed (any partially probed bytes are a
-            // truncated tail and are dropped).
-            let mut out = [0u8; TS_PACKET_LEN];
-            out.copy_from_slice(layout.window(&buf));
-            return Ok(out);
-        }
-        if probe[probe_len - 1] == TS_SYNC_BYTE {
-            // Push the probed bytes back so the next call sees them as
-            // the head of a fresh packet.
-            for &b in &probe[..probe_len] {
-                putback.push_back(b);
-            }
-            let mut out = [0u8; TS_PACKET_LEN];
-            out.copy_from_slice(layout.window(&buf));
-            return Ok(out);
-        }
-        // Single 0x47 not confirmed by a sync one stride later; treat
-        // as coincidence inside garbage data and keep scanning. The
-        // probed bytes are also part of the corrupt span — drop them.
-    }
-    Err(CoreError::invalid(format!(
-        "mpegts: bad sync byte 0x{bad_byte:02X} at offset {bytes_read} (packet {}), \
-         resync failed after {RESYNC_PACKET_LIMIT} {psize}-byte chunks",
-        bytes_read / psize as u64,
-    )))
-}
-
-fn map_ts_err(e: crate::TsError) -> CoreError {
-    CoreError::invalid(format!("mpegts: {e}"))
-}
-
-/// Read exactly `buf.len()` bytes (one physical packet) from `input`,
-/// retrying on short reads. Used by the seek / duration probes, which
-/// always start on a packet boundary and want a hard error rather than
-/// the streaming reader's resync behaviour.
-fn read_exact_packet(input: &mut Box<dyn ReadSeek>, buf: &mut [u8]) -> std::io::Result<()> {
-    use std::io::Read;
-    let mut filled = 0;
-    while filled < buf.len() {
-        match input.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "mpegts: short read during PCR probe",
-                ));
-            }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
 
 /// Extract the [`Pcr`] from a 188-byte TS packet window iff the packet
 /// is on `want_pid`, carries an adaptation field, and the field sets
@@ -1920,6 +2211,9 @@ pub(crate) fn codec_params_for_stream_type(st: u8) -> Option<CodecParameters> {
 /// * `100` — sync byte present at 4 consecutive grid positions.
 /// * `80`  — sync byte present at 3.
 /// * `60`  — sync byte present at 2.
+/// * `50`  — no grid from byte 0, but one of five consecutive packets
+///   starts further into the buffer (a capture cut mid-packet; see
+///   [`crate::packet::locate_packet_layout`]).
 /// * `0`   — otherwise.
 pub fn probe(p: &oxideav_core::ProbeData) -> oxideav_core::ProbeScore {
     use crate::packet::TsPacketLayout;
@@ -1944,6 +2238,7 @@ pub fn probe(p: &oxideav_core::ProbeData) -> oxideav_core::ProbeScore {
         4 => 100,
         3 => 80,
         2 => 60,
+        _ if crate::packet::locate_packet_layout(p.buf).is_some() => 50,
         _ => 0,
     }
 }
@@ -2398,40 +2693,23 @@ mod tests {
         buf.extend_from_slice(&vec![0xAAu8; 11 * TS_PACKET_LEN]);
         buf.extend_from_slice(&p1);
         buf.extend_from_slice(&p2);
-        let mut cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
-        let mut putback = VecDeque::new();
+        let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let mut reader = PacketReader::new(cursor, crate::packet::TsPacketLayout::STANDARD);
         // First read: clean.
-        let r0 = read_one_packet(
-            &mut cursor,
-            &mut putback,
-            0,
-            crate::packet::TsPacketLayout::STANDARD,
-        )
-        .expect("first")
-        .expect("Some");
-        assert_eq!(r0[3] & 0x0F, 0);
+        let (o0, r0) = reader.next_packet().expect("first").expect("Some");
+        assert_eq!((o0, r0[3] & 0x0F), (0, 0));
         // Second read: bytes start at offset 188 (inside garbage), so
-        // resync triggers. It should land on p1.
-        let r1 = read_one_packet(
-            &mut cursor,
-            &mut putback,
-            188,
-            crate::packet::TsPacketLayout::STANDARD,
-        )
-        .expect("resync")
-        .expect("Some");
+        // resync triggers. It should land on p1 and report where p1
+        // really sits.
+        let (o1, r1) = reader.next_packet().expect("resync").expect("Some");
         assert_eq!(r1[3] & 0x0F, 1, "expected CC=1, got CC={}", r1[3] & 0x0F);
-        // Third read: should pick up p2 thanks to the probe-byte
-        // putback — no second resync needed.
-        let r2 = read_one_packet(
-            &mut cursor,
-            &mut putback,
-            376,
-            crate::packet::TsPacketLayout::STANDARD,
-        )
-        .expect("p2")
-        .expect("Some");
+        assert_eq!(o1, 12 * TS_PACKET_LEN as u64);
+        // Third read: p2 follows without a second resync.
+        let (o2, r2) = reader.next_packet().expect("p2").expect("Some");
         assert_eq!(r2[3] & 0x0F, 2, "expected CC=2, got CC={}", r2[3] & 0x0F);
+        assert_eq!(o2, 13 * TS_PACKET_LEN as u64);
+        assert!(reader.next_packet().expect("eof").is_none());
+        assert_eq!(reader.resync_bytes, 11 * TS_PACKET_LEN as u64);
     }
 
     #[test]

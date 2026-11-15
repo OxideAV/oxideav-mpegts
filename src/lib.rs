@@ -164,6 +164,9 @@ mod seek_roundtrip;
 #[cfg(all(test, feature = "registry"))]
 mod audio_split_roundtrip;
 
+#[cfg(all(test, feature = "registry"))]
+mod demux_hardening;
+
 #[cfg(feature = "registry")]
 pub mod demuxer;
 #[cfg(feature = "registry")]
@@ -185,7 +188,7 @@ pub use build::{
     stream_identifier_descriptor, subtitling_descriptor, teletext_descriptor,
 };
 pub use clock::{
-    ContinuityEvent, ContinuityTracker, DiscontinuityReason, PCR_MODULUS_27MHZ,
+    ContinuityEvent, ContinuityTracker, DiscontinuityReason, NearestEpochUnwrap, PCR_MODULUS_27MHZ,
     PCR_TOLERANCE_27MHZ, Pcr, PcrEvent, PcrTracker, PtsTracker, TIMESTAMP_MODULUS_90KHZ,
     TimestampEvent, extend_near,
 };
@@ -213,11 +216,11 @@ pub use error::TsError;
 pub use packet::{
     AdaptationField, AdaptationFieldExtension, AdaptationFieldExtensionSpec, AdaptationFieldSpec,
     MAX_ADAPTATION_FIELD_LEN, TS_PACKET_LEN, TS_SYNC_BYTE, TsPacket, TsPacketIter, TsPacketLayout,
-    detect_packet_layout, encode_clock_reference, iter_packets,
+    detect_packet_layout, encode_clock_reference, iter_packets, locate_packet_layout,
 };
 pub use pes::{
-    CoefficientSelection, DsmTrickMode, FieldId, PStdBuffer, PesExtension, PesHeaderSpec,
-    PesPacket, PesReassembler, ProgramPacketSequenceCounter,
+    CoefficientSelection, DEFAULT_MAX_PES_BYTES, DsmTrickMode, FieldId, PStdBuffer, PesExtension,
+    PesHeaderSpec, PesPacket, PesReassembler, ProgramPacketSequenceCounter,
 };
 pub use psi::{
     BAT_PID, BAT_TABLE_ID, BatTransportStream, BouquetAssociationTable, CAT_PID, CAT_TABLE_ID,
@@ -245,8 +248,8 @@ pub use validate::{
 
 #[cfg(feature = "registry")]
 pub use demuxer::{
-    AccessPointKind, MpegTsDemuxer, RandomAccessPoint, TsProgram, open as open_demuxer,
-    probe as probe_mpegts,
+    AccessPointKind, MpegTsDemuxer, RandomAccessPoint, TsDemuxStats, TsProgram,
+    open as open_demuxer, probe as probe_mpegts,
 };
 
 #[cfg(feature = "registry")]

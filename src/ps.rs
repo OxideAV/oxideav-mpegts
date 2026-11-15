@@ -58,7 +58,8 @@ use oxideav_core::{
     Result as CoreResult, StreamInfo, TimeBase,
 };
 
-use crate::{AudioFrameSplitter, AudioSyntax, PesPacket, PtsTracker};
+use crate::clock::NearestEpochUnwrap;
+use crate::{AudioFrameSplitter, AudioSyntax, PesPacket};
 
 /// `pack_start_code` (§2.5.3.4).
 const PACK_START: u8 = 0xBA;
@@ -123,8 +124,8 @@ struct EsState {
     /// prefix).
     strip: usize,
     framing: Framing,
-    pts: PtsTracker,
-    dts: PtsTracker,
+    pts: NearestEpochUnwrap,
+    dts: NearestEpochUnwrap,
 }
 
 /// MPEG-2 program stream demuxer.
@@ -393,8 +394,8 @@ impl MpegPsDemuxer {
             self.states.push(EsState {
                 strip: private_prefix(key.1),
                 framing,
-                pts: PtsTracker::new(),
-                dts: PtsTracker::new(),
+                pts: NearestEpochUnwrap::default(),
+                dts: NearestEpochUnwrap::default(),
             });
         }
         Ok(())
@@ -435,18 +436,16 @@ impl MpegPsDemuxer {
         };
         let st = &mut self.states[idx as usize];
         let payload = pes.payload.get(st.strip..).unwrap_or(&[]);
-        let pts = pes.pts_90k.map(|raw| {
-            st.pts.observe(raw);
-            st.pts.extended().unwrap_or(raw) as i64
-        });
+        // 33-bit unwrap onto one 64-bit axis, tolerant of the backward
+        // steps B-picture reordering puts into presentation times.
+        let pts = pes.pts_90k.map(|raw| st.pts.extend(raw) as i64);
         let dts = pes.dts_90k.map(|raw| {
-            if st.dts.extended().is_none()
+            if !st.dts.is_anchored()
                 && let Some(p) = pts
             {
                 st.dts.seed(p as u64);
             }
-            st.dts.observe(raw);
-            st.dts.extended().unwrap_or(raw) as i64
+            st.dts.extend(raw) as i64
         });
         let tb = TimeBase::new(1, 90_000);
         match &mut st.framing {

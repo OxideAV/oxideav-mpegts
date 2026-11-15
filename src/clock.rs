@@ -731,6 +731,57 @@ pub fn extend_near(raw_timestamp: u64, reference: u64) -> u64 {
     nearest_epoch(raw, reference) * TIMESTAMP_MODULUS_90KHZ + raw
 }
 
+/// Reorder-tolerant 33-bit timestamp unwrapper: every raw value extends
+/// to the wrap epoch nearest the previous extended value on the same
+/// stream ([`extend_near`]).
+///
+/// Presentation times of a video stream with B-pictures step backward
+/// by a few frame periods all the time; treating such a step as a
+/// discontinuity (as the event-classifying [`PtsTracker`] does) would
+/// drop the accumulated wraps and pull the timeline back by 2^33 ticks
+/// right after a wrap. Extending to the nearest epoch keeps one
+/// continuous 64-bit axis across wraps and reordering alike, and a
+/// genuine jump (a splice) simply lands where its raw value puts it
+/// within half a ring of the previous timestamp.
+#[derive(Debug, Default, Clone)]
+pub struct NearestEpochUnwrap {
+    reference: Option<u64>,
+}
+
+impl NearestEpochUnwrap {
+    /// Build an unwrapper with no reference yet: the first value
+    /// extends to itself.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Extend `raw` and make the result the new reference.
+    pub fn extend(&mut self, raw: u64) -> u64 {
+        let ext = match self.reference {
+            Some(r) => extend_near(raw, r),
+            None => raw & (TIMESTAMP_MODULUS_90KHZ - 1),
+        };
+        self.reference = Some(ext);
+        ext
+    }
+
+    /// Install an extended-timeline reference (after a seek, or to
+    /// place a first DTS next to its PTS).
+    pub fn seed(&mut self, hint: u64) {
+        self.reference = Some(hint);
+    }
+
+    /// `true` once a reference exists.
+    pub fn is_anchored(&self) -> bool {
+        self.reference.is_some()
+    }
+
+    /// Forget the reference.
+    pub fn reset(&mut self) {
+        self.reference = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,5 +1190,30 @@ mod tests {
         t.reset();
         t.observe(500);
         assert_eq!(t.extended(), Some(500), "reset must discard the hint");
+    }
+
+    /// B-picture reordering after a 2^33 wrap must not pull the
+    /// timeline back an epoch.
+    #[test]
+    fn nearest_unwrap_survives_reordering_across_and_after_a_wrap() {
+        let m = TIMESTAMP_MODULUS_90KHZ;
+        let mut u = NearestEpochUnwrap::default();
+        // Decode order I P B B around the wrap, 3600-tick pictures.
+        let seq: [i64; 9] = [-7200, 3600, -3600, 0, 14_400, 7200, 10_800, 25_200, 18_000];
+        for want in seq {
+            let ext = (m as i64 + want) as u64;
+            // The first value sits in epoch 0, so everything is
+            // relative to it.
+            let got = u.extend(ext & (m - 1));
+            assert_eq!(got as i64 - (m as i64 - 7200), want + 7200, "pts {want}");
+        }
+        // A seed places a first raw value in the right epoch.
+        let mut u = NearestEpochUnwrap::default();
+        assert!(!u.is_anchored());
+        u.seed(3 * m + 10);
+        assert_eq!(u.extend(5), 3 * m + 5);
+        assert_eq!(u.extend(m - 5), 3 * m - 5);
+        u.reset();
+        assert_eq!(u.extend(m - 5), m - 5);
     }
 }
