@@ -2169,19 +2169,33 @@ pub(crate) fn parse_section_header(
 /// MPEG-2 CRC-32 (poly 0x04C11DB7, init 0xFFFFFFFF, MSB-first, no
 /// reflect, no final XOR).
 pub fn mpeg2_crc32(bytes: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in bytes {
-        crc ^= (b as u32) << 24;
-        for _ in 0..8 {
-            if (crc & 0x8000_0000) != 0 {
-                crc = (crc << 1) ^ 0x04C1_1DB7;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
+    bytes.iter().fold(0xFFFF_FFFF, |crc, &b| {
+        (crc << 8) ^ CRC_BYTE_STEP[((crc >> 24) as u8 ^ b) as usize]
+    })
 }
+
+/// `CRC_BYTE_STEP[v]` is the register after shifting the byte `v`
+/// through the generator polynomial 0x04C11DB7 bit by bit, MSB first —
+/// the eight per-bit steps of the CRC folded into one lookup.
+const CRC_BYTE_STEP: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut v = 0usize;
+    while v < 256 {
+        let mut reg = (v as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
+            reg = if reg & 0x8000_0000 != 0 {
+                (reg << 1) ^ 0x04C1_1DB7
+            } else {
+                reg << 1
+            };
+            bit += 1;
+        }
+        table[v] = reg;
+        v += 1;
+    }
+    table
+};
 
 /// Iterate the long-form PSI sections carried in one TS-packet payload.
 ///
@@ -2312,6 +2326,37 @@ mod tests {
         let crc = mpeg2_crc32(&s);
         s.extend_from_slice(&crc.to_be_bytes());
         s
+    }
+
+    /// The byte-at-a-time table form equals the bit-serial definition
+    /// (shift each message bit through the register, XOR the
+    /// polynomial on a carry) on arbitrary data.
+    #[test]
+    fn mpeg2_crc32_matches_the_bit_serial_definition() {
+        fn bit_serial(bytes: &[u8]) -> u32 {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for &b in bytes {
+                crc ^= (b as u32) << 24;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 != 0 {
+                        (crc << 1) ^ 0x04C1_1DB7
+                    } else {
+                        crc << 1
+                    };
+                }
+            }
+            crc
+        }
+        let data: Vec<u8> = (0..5000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        for len in [0usize, 1, 2, 3, 7, 188, 1024, 4096, 5000] {
+            assert_eq!(
+                mpeg2_crc32(&data[..len]),
+                bit_serial(&data[..len]),
+                "len {len}"
+            );
+        }
     }
 
     #[test]

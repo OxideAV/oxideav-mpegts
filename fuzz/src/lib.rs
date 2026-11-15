@@ -917,8 +917,9 @@ impl MuxPlan {
 
 /// Apply a bounded, fuzz-directed mutation program to a writer-shaped
 /// fixture: sync-byte kills, header flips, PSI-payload / CRC-region
-/// flips, packet drops and duplicates, truncation, and 192/204
-/// reframing. Returns the mutant.
+/// flips, packet drops and duplicates, byte insertions and deletions,
+/// truncation, 192/204 reframing, and leading bytes. Returns the
+/// mutant.
 pub fn mutate(base: &[u8], ops: &mut Recipe) -> Vec<u8> {
     let mut m = base.to_vec();
     let n_ops = 1 + (ops.u8() % 8) as usize;
@@ -927,7 +928,7 @@ pub fn mutate(base: &[u8], ops: &mut Recipe) -> Vec<u8> {
             break;
         }
         let n_pkts = m.len() / TS_PACKET_LEN;
-        match ops.u8() % 8 {
+        match ops.u8() % 10 {
             // Arbitrary byte flip.
             0 => {
                 let pos = ops.u32() as usize % m.len();
@@ -982,6 +983,20 @@ pub fn mutate(base: &[u8], ops: &mut Recipe) -> Vec<u8> {
                 let at = (k + 1) * TS_PACKET_LEN;
                 m.splice(at..at, pkt);
             }
+            // Insert a few bytes anywhere: everything behind them
+            // leaves the packet grid (byte-granular resync).
+            7 if m.len() < 1 << 20 => {
+                let at = ops.u32() as usize % (m.len() + 1);
+                let n = 1 + (ops.u8() % 15) as usize;
+                let fill = ops.u8();
+                m.splice(at..at, std::iter::repeat_n(fill, n));
+            }
+            // Delete a few bytes anywhere (grid shifts the other way).
+            8 => {
+                let at = ops.u32() as usize % m.len();
+                let n = (1 + (ops.u8() % 15) as usize).min(m.len() - at);
+                m.drain(at..at + n);
+            }
             // Truncate to an arbitrary (usually unaligned) length.
             _ => {
                 let cut = ops.u32() as usize % (m.len() + 1);
@@ -990,6 +1005,21 @@ pub fn mutate(base: &[u8], ops: &mut Recipe) -> Vec<u8> {
         }
     }
     // Optional physical reframing of whatever survived the mutations.
+    let framed = reframe(m, ops);
+    // Optional leading bytes: the stream no longer starts on a packet
+    // boundary and the grid has to be located.
+    let lead = ops.u8();
+    if lead % 4 == 0 && lead > 0 {
+        let fill = ops.u8();
+        let mut out = vec![fill; lead as usize];
+        out.extend_from_slice(&framed);
+        return out;
+    }
+    framed
+}
+
+/// Wrap the 188-byte packets of `m` in one of the physical framings.
+fn reframe(m: Vec<u8>, ops: &mut Recipe) -> Vec<u8> {
     match ops.u8() % 4 {
         1 => {
             // 192-byte source packets: 4-byte prefix per packet.

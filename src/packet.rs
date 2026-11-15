@@ -623,8 +623,14 @@ const LOCATE_MIN_RUN: usize = 5;
 /// suffice there). Any later offset needs the sync byte `0x47` at the
 /// layout's position in five consecutive packets, which chance bytes
 /// meet about once in 2^32 candidates. The search covers the whole
-/// buffer; the earliest offset wins, and at one offset the layouts are
-/// tried in the order 188 / 192 / 204.
+/// buffer; the earliest such run wins, and at one offset the layouts
+/// are tried in the order 188 / 192 / 204.
+///
+/// The run fixes the grid's phase; the offset returned is the earliest
+/// position on that phase that holds a sync byte. A stream whose
+/// third packet is damaged therefore still starts at its first packet
+/// (a reader steps over the damaged one), while leading bytes that are
+/// not packets are skipped.
 pub fn locate_packet_layout(buf: &[u8]) -> Option<(TsPacketLayout, usize)> {
     if let Some(layout) = detect_packet_layout(buf) {
         return Some((layout, 0));
@@ -643,7 +649,11 @@ pub fn locate_packet_layout(buf: &[u8]) -> Option<(TsPacketLayout, usize)> {
             if (0..LOCATE_MIN_RUN)
                 .all(|k| buf[start + k * layout.packet_size + layout.sync_offset] == TS_SYNC_BYTE)
             {
-                return Some((layout, start));
+                let mut first = start % layout.packet_size;
+                while buf[first + layout.sync_offset] != TS_SYNC_BYTE {
+                    first += layout.packet_size;
+                }
+                return Some((layout, first));
             }
         }
     }
@@ -1744,5 +1754,45 @@ mod tests {
             TsError::Truncated { .. } => {}
             other => panic!("expected Truncated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn locate_packet_layout_finds_offset_grids_and_keeps_early_packets() {
+        fn stream(layout: TsPacketLayout, packets: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            for _ in 0..packets {
+                let mut p = vec![0x11u8; layout.packet_size];
+                p[layout.sync_offset] = TS_SYNC_BYTE;
+                out.extend(p);
+            }
+            out
+        }
+        for layout in [
+            TsPacketLayout::STANDARD,
+            TsPacketLayout::PREFIXED_192,
+            TsPacketLayout::TRAILER_204,
+        ] {
+            let clean = stream(layout, 12);
+            assert_eq!(locate_packet_layout(&clean), Some((layout, 0)));
+            for lead in [1usize, 3, 187, 188, 205, 700] {
+                let mut buf = vec![0x22u8; lead];
+                buf.extend_from_slice(&clean);
+                assert_eq!(
+                    locate_packet_layout(&buf),
+                    Some((layout, lead)),
+                    "lead {lead}"
+                );
+            }
+            // A damaged third packet does not cost the first two.
+            let mut damaged = clean.clone();
+            damaged[2 * layout.packet_size + layout.sync_offset] = 0x00;
+            assert_eq!(locate_packet_layout(&damaged), Some((layout, 0)));
+            // Too few packets behind the lead to be sure.
+            let mut short = vec![0x22u8; 9];
+            short.extend_from_slice(&clean[..4 * layout.packet_size]);
+            assert_eq!(locate_packet_layout(&short), None);
+        }
+        assert_eq!(locate_packet_layout(&[0x47u8; 100]), None);
+        assert_eq!(locate_packet_layout(&[]), None);
     }
 }
