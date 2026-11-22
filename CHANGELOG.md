@@ -29,7 +29,7 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 - Program-stream seeking: `MpegPsDemuxer::seek_to` lands on the last
   key frame at or before the target (SCR bisection over the pack
   headers, then a forward read; any audio frame is an entry point).
-- Streams added by a later program map: the maps in the first 8 MiB
+- Streams added by a later program map: the maps in the first 2 MiB
   are read at open and an elementary stream one of them adds is in the
   stream list from the start; past that window
   `MpegTsDemuxer::set_admit_new_streams(true)` lets the list grow while

@@ -289,7 +289,7 @@ keeps the entry on its PID when that still names its codec, so a map
 that merely lists the same streams in another order moves nothing; a
 stream whose codec the new PMT no longer lists stops.
 
-Streams a later PMT **adds**: the program maps in the first 8 MiB are
+Streams a later PMT **adds**: the program maps in the first 2 MiB are
 read at open, and an elementary stream one of them adds is in the
 stream list from the start (its packets begin where its map takes
 effect). Past that window the list stays as opened — `streams()` never

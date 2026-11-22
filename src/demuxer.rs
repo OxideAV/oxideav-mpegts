@@ -532,7 +532,7 @@ impl PidSlot {
 /// whose codec the new PMT no longer lists stops.
 /// [`TsDemuxStats::program_map_changes`] counts the changes.
 ///
-/// Streams a later PMT **adds**: the program maps in the first 8 MiB
+/// Streams a later PMT **adds**: the program maps in the first 2 MiB
 /// are read at open, and an entry one of them adds is in the stream
 /// list from the start (its packets begin where its map takes effect;
 /// its parameters are the ones the map's descriptors give). Beyond
@@ -952,7 +952,7 @@ impl MpegTsDemuxer {
             let mut known: Vec<SlotKey> = slots.iter().map(PidSlot::key).collect();
             let mut watch = PsiSectionAssembler::new();
             reader.seek(0);
-            while reader.position() < PARAM_PROBE_BYTES && streams.len() < MAX_STREAMS {
+            while reader.position() < MAP_LOOKAHEAD_BYTES && streams.len() < MAX_STREAMS {
                 let Ok(Some((_, raw))) = reader.next_packet() else {
                     break;
                 };
@@ -1054,7 +1054,7 @@ impl MpegTsDemuxer {
 
     /// Let a program map met while streaming add streams. Off by
     /// default: [`Demuxer::streams`] then never changes after open
-    /// (streams a map within the first 8 MiB adds are already in the
+    /// (streams a map within the first 2 MiB adds are already in the
     /// list, see the type docs). When on, an entry of a later map that
     /// no stream takes is appended as a new stream — `streams()` grows
     /// and packets carry the new index —
@@ -2395,6 +2395,12 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
     }
     None
 }
+
+/// Head of the stream whose program maps are read at open for the
+/// elementary streams they add. Read from every source at every open,
+/// so kept small: a map that completes a provisional first one follows
+/// it closely.
+const MAP_LOOKAHEAD_BYTES: u64 = 2 << 20;
 
 /// Ceiling on the streams of one demuxer, however many entries later
 /// program maps bring.

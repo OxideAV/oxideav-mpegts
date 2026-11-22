@@ -541,7 +541,7 @@ fn stream_added_by_a_late_map_needs_admission() {
     let mut ts = TsBuilder::default();
     ts.tables(std::slice::from_ref(&video));
     ts.pes(0x100, 0xE0, Some(9000), None, &[1; 20], true);
-    ts.nulls((8 << 20) / TS_PACKET_LEN + 8);
+    ts.nulls((2 << 20) / TS_PACKET_LEN + 8);
     ts.map_version(1, 0x100, &[video, audio]);
     ts.pes(0x101, 0xBD, Some(11_160), None, &[7; 50], false);
     ts.pes(0x100, 0xE0, Some(12_600), None, &[2; 20], false);
