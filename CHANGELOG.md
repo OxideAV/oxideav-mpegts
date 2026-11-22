@@ -9,6 +9,29 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.4...v0.0.5) - 2026-11-22
+
+### Other
+
+- read program maps of the first 2 MiB at open, not 8
+- program streams: seeking
+- program-stream demux 1.8x faster; bench on any stream
+- streams added by a later program map
+- black-box matrix as a test; muxer output every reader accepts
+- layouts other multiplexers write
+- demux output is independent of the source's read granularity
+- damaged-input behaviour, program-map following, measured throughput
+- duplicate packets must repeat the payload, not just the counter
+- packet grid location keeps early packets; table-driven CRC; fuzz grid-shift mutations
+- follow PAT / PMT changes of the selected program while streaming
+- one sink write per call, frames fragmented without an intermediate copy
+- block reads, direct PID table, and a streaming path that survives damage
+- section assembler handles straddled headers, duplicates, 4096-byte private sections
+- bounded, single-copy reassembly that survives a damaged header
+- overflow-free SPS probe, bounded video re-framing buffers
+- clamp the cursor when pack stuffing runs past the end of input
+- API hygiene: non_exhaustive enums, muxer specs and parsed records
+
 ### Added
 
 - Audio framing for two more syntaxes: LOAS / LATM (`parse_loas_header`,
