@@ -99,6 +99,19 @@ pub enum StreamType {
     HevcTemporalSubset,
     /// `0x26` MVCD video sub-bitstream of an AVC stream.
     MvcdVideo,
+    /// `0x32` JPEG XS video (ISO/IEC 21122-2).
+    JpegXsVideo,
+    /// `0x33` ITU-T H.266 | ISO/IEC 23090-3 video (VVC), or a VVC
+    /// temporal video sub-bitstream.
+    VvcVideo,
+    /// `0x34` VVC temporal video subset.
+    VvcTemporalSubset,
+    /// `0x35` ISO/IEC 23094-1 video (EVC), or an EVC temporal video
+    /// sub-bitstream.
+    EvcVideo,
+    /// `0x87` E-AC-3 in the ATSC system (A/52 Annex G §3.1; the user
+    /// private value the ATSC assigns — Blu-ray uses `0x84`).
+    AtscEAc3Audio,
     /// `0x42` Chinese AVS video (GB/T 20090.2 / AVS1-P2).
     AvsVideo,
     /// `0xEA` SMPTE VC-1 (Microsoft Windows Media Video 9).
@@ -173,6 +186,11 @@ impl StreamType {
             0x24 => Self::HevcVideo,
             0x25 => Self::HevcTemporalSubset,
             0x26 => Self::MvcdVideo,
+            0x32 => Self::JpegXsVideo,
+            0x33 => Self::VvcVideo,
+            0x34 => Self::VvcTemporalSubset,
+            0x35 => Self::EvcVideo,
+            0x87 => Self::AtscEAc3Audio,
             0x42 => Self::AvsVideo,
             0xEA => Self::Vc1Video,
             0x80 => Self::LpcmAudio,
@@ -232,6 +250,11 @@ impl StreamType {
             Self::HevcVideo => 0x24,
             Self::HevcTemporalSubset => 0x25,
             Self::MvcdVideo => 0x26,
+            Self::JpegXsVideo => 0x32,
+            Self::VvcVideo => 0x33,
+            Self::VvcTemporalSubset => 0x34,
+            Self::EvcVideo => 0x35,
+            Self::AtscEAc3Audio => 0x87,
             Self::AvsVideo => 0x42,
             Self::Vc1Video => 0xEA,
             Self::LpcmAudio => 0x80,
@@ -267,6 +290,10 @@ impl StreamType {
                 | Self::HevcVideo
                 | Self::HevcTemporalSubset
                 | Self::MvcdVideo
+                | Self::JpegXsVideo
+                | Self::VvcVideo
+                | Self::VvcTemporalSubset
+                | Self::EvcVideo
                 | Self::AvsVideo
                 | Self::Vc1Video
         )
@@ -286,6 +313,7 @@ impl StreamType {
                 | Self::DtsAudio
                 | Self::TruehdAudio
                 | Self::EAc3Audio
+                | Self::AtscEAc3Audio
                 | Self::DtsHdAudio
                 | Self::DtsHdMaAudio
                 | Self::EAc3SecondaryAudio
@@ -333,8 +361,9 @@ mod tests {
         for raw in [
             0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
             0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
-            0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x42, 0xEA, 0x80, 0x81,
-            0x82, 0x83, 0x84, 0x85, 0x86, 0x90, 0x91, 0x92, 0xA1, 0xA2,
+            0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x32, 0x33, 0x34, 0x35,
+            0x42, 0xEA, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x90, 0x91, 0x92, 0xA1,
+            0xA2,
         ] {
             assert_eq!(
                 StreamType::from_raw(raw).as_raw(),
@@ -351,7 +380,7 @@ mod tests {
 
     #[test]
     fn reserved_range_passes_through_as_other() {
-        // 0x27..=0x41 and 0x43..=0x7F are reserved; surface the raw byte.
+        // Values this enum does not name surface the raw byte.
         for raw in [0x27u8, 0x30, 0x41, 0x43, 0x77, 0x7F] {
             let s = StreamType::from_raw(raw);
             assert_eq!(s, StreamType::Other(raw));

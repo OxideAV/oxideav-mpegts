@@ -51,7 +51,19 @@
 //!   `number_of_raw_data_blocks_in_frame` (each raw_data_block is 1024
 //!   samples per channel).
 //!
-//! Formats whose framing is not staged (DTS, TrueHD, LPCM, MPEG-2.5
+//! * LOAS / LATM (ISO/IEC 14496-3 §1.7): `AudioSyncStream()`
+//!   Table 1.36 — 11-bit syncword `0x2B7` and 13-bit
+//!   `audioMuxLengthBytes`; the `StreamMuxConfig()` (Table 1.42) at the
+//!   head of an `AudioMuxElement()` names the sampling rate, channel
+//!   configuration and frame length.
+//! * DTS (ETSI TS 102 114): core frame header Table 5-1 — `SYNC`
+//!   0x7FFE8001, `NBLKS` (32 samples per block), `FSIZE`, `AMODE`
+//!   (Table 5-4), `SFREQ` (Table 5-5), `RATE` (Table 5-7), `LFF`;
+//!   extension substream header Table 7-2 — `SYNCEXTSSH` 0x64582025 and
+//!   `nuExtSSFsize`. A core frame and the extension substreams behind
+//!   it form one access unit (Annex F.3.3).
+//!
+//! Formats whose framing is not staged (TrueHD, LPCM, MPEG-2.5
 //! 11-bit-sync audio) are passed through by the splitter untouched —
 //! one PES payload stays one packet.
 
@@ -71,6 +83,15 @@ pub enum AudioFrameKind {
     MpegLayer3,
     /// ISO/IEC 13818-7 ADTS frame (one or more raw_data_blocks).
     AacAdts,
+    /// ISO/IEC 14496-3 LOAS `AudioSyncStream()` frame carrying one LATM
+    /// `AudioMuxElement()`.
+    AacLoas,
+    /// DTS core frame (ETSI TS 102 114 §5.3.1), with any extension
+    /// substreams of the same access unit appended.
+    Dts,
+    /// DTS extension substream (ETSI TS 102 114 §7.4.1) that follows no
+    /// core frame.
+    DtsExtension,
 }
 
 /// Header-derived facts about one audio access unit: its byte length
@@ -408,6 +429,220 @@ pub fn parse_adts_header(b: &[u8]) -> Option<AudioFrameInfo> {
     })
 }
 
+/// LOAS `AudioSyncStream()` syncword (ISO/IEC 14496-3 Table 1.36), the
+/// top 11 bits of the first two bytes.
+const LOAS_SYNCWORD: u16 = 0x2B7;
+
+/// MSB-first reader over the head of an `AudioMuxElement()`.
+struct BitCursor<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl BitCursor<'_> {
+    fn u(&mut self, n: u32) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | u32::from(read_bit(self.b, self.pos)?);
+            self.pos += 1;
+        }
+        Some(v)
+    }
+
+    /// `LatmGetValue()` (ISO/IEC 14496-3 Table 1.43).
+    fn latm_value(&mut self) -> Option<u32> {
+        let bytes = self.u(2)?;
+        let mut v = 0u32;
+        for _ in 0..=bytes {
+            v = (v << 8) | self.u(8)?;
+        }
+        Some(v)
+    }
+
+    /// `GetAudioObjectType()` (Table 1.16).
+    fn audio_object_type(&mut self) -> Option<u32> {
+        match self.u(5)? {
+            31 => Some(32 + self.u(6)?),
+            t => Some(t),
+        }
+    }
+}
+
+/// `(sample_rate, channels, samples_per_frame)` from the
+/// `StreamMuxConfig()` at the head of a LATM `AudioMuxElement()`
+/// (ISO/IEC 14496-3 Tables 1.41 / 1.42) — the first program's first
+/// layer, read through the head of its `AudioSpecificConfig()`
+/// (Table 1.15: object type, `samplingFrequencyIndex` per Table 1.18,
+/// `channelConfiguration`) and, for the general-audio object types,
+/// the `frameLengthFlag` of `GASpecificConfig()` (Table 4.1: 1024 or
+/// 960 samples). `None` when the element reuses the previous
+/// configuration (`useSameStreamMux`) or uses a layout this reader does
+/// not follow.
+fn latm_stream_config(mux_element: &[u8]) -> Option<(u32, u16, u32)> {
+    let mut r = BitCursor {
+        b: mux_element,
+        pos: 0,
+    };
+    if r.u(1)? == 1 {
+        // useSameStreamMux
+        return None;
+    }
+    let version = r.u(1)?;
+    if version == 1 {
+        if r.u(1)? != 0 {
+            // audioMuxVersionA: to be defined.
+            return None;
+        }
+        r.latm_value()?; // taraBufferFullness
+    }
+    r.u(1)?; // allStreamsSameTimeFraming
+    let sub_frames = r.u(6)? + 1;
+    r.u(4)?; // numProgram
+    r.u(3)?; // numLayer
+    if version == 1 {
+        r.latm_value()?; // ascLen
+    }
+    let object_type = r.audio_object_type()?;
+    let rate = match r.u(4)? {
+        0xF => r.u(24)?,
+        i => *ADTS_SAMPLE_RATE.get(i as usize)?,
+    };
+    let channel_configuration = r.u(4)? as usize;
+    let channels = ADTS_CHANNELS
+        .get(channel_configuration)
+        .copied()
+        .unwrap_or(0);
+    // The object types whose configuration is GASpecificConfig() and
+    // whose core frame is not rate-converted (Table 1.15 switch).
+    let frame = match object_type {
+        1..=4 | 6 | 7 | 17 | 19..=23 => {
+            if r.u(1)? == 1 {
+                960
+            } else {
+                AAC_SAMPLES_PER_BLOCK
+            }
+        }
+        // Explicit SBR / PS signalling: the core coder still frames
+        // 1024 samples at the rate just read.
+        5 | 29 => AAC_SAMPLES_PER_BLOCK,
+        _ => return Some((rate, channels, 0)),
+    };
+    Some((rate, channels, frame * sub_frames))
+}
+
+/// Parse a LOAS `AudioSyncStream()` frame head (ISO/IEC 14496-3
+/// Table 1.36): the 11-bit syncword `0x2B7` and the 13-bit
+/// `audioMuxLengthBytes`. Needs 3 bytes to size the frame; the stream
+/// parameters are filled when the bytes behind them hold a
+/// `StreamMuxConfig()` and are left `0` otherwise (the frame then
+/// follows the configuration sent before it).
+pub fn parse_loas_header(b: &[u8]) -> Option<AudioFrameInfo> {
+    if b.len() < 3 || (u16::from(b[0]) << 3) | u16::from(b[1] >> 5) != LOAS_SYNCWORD {
+        return None;
+    }
+    let mux_len = (usize::from(b[1] & 0x1F) << 8) | usize::from(b[2]);
+    let frame_len = 3 + mux_len;
+    let element = &b[3..b.len().min(frame_len)];
+    let (sample_rate, channels, samples_per_frame) =
+        latm_stream_config(element).unwrap_or((0, 0, 0));
+    Some(AudioFrameInfo {
+        kind: AudioFrameKind::AacLoas,
+        frame_len,
+        samples_per_frame,
+        sample_rate,
+        channels,
+        bit_rate: None,
+    })
+}
+
+/// DTS core frame sync word (ETSI TS 102 114 Table 5-1 `SYNC`).
+const DTS_CORE_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
+
+/// DTS extension substream sync word (Table 7-2 `SYNCEXTSSH`).
+const DTS_EXTENSION_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];
+
+/// ETSI TS 102 114 Table 5-5 — core sampling frequency per `SFREQ`
+/// (`0` = invalid).
+const DTS_SAMPLE_RATE: [u32; 16] = [
+    0, 8_000, 16_000, 32_000, 0, 0, 11_025, 22_050, 44_100, 0, 0, 12_000, 24_000, 48_000, 0, 0,
+];
+
+/// ETSI TS 102 114 Table 5-4 — channel count `CHS` per `AMODE`
+/// (user-defined modes from 16 up carry no count).
+const DTS_CHANNELS: [u16; 16] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5, 6, 6, 6, 7, 8, 8];
+
+/// ETSI TS 102 114 Table 5-7 — targeted bit rate (bit/s) per `RATE`
+/// for the fixed-rate codes; the open / variable / lossless codes
+/// carry none.
+const DTS_BIT_RATE: [u32; 25] = [
+    32_000, 56_000, 64_000, 96_000, 112_000, 128_000, 192_000, 224_000, 256_000, 320_000, 384_000,
+    448_000, 512_000, 576_000, 640_000, 768_000, 960_000, 1_024_000, 1_152_000, 1_280_000,
+    1_344_000, 1_408_000, 1_411_200, 1_472_000, 1_536_000,
+];
+
+/// Parse the head of a DTS frame: a core frame header (ETSI TS 102 114
+/// Table 5-1 — `NBLKS`, `FSIZE`, `AMODE`, `SFREQ`, `RATE`, `LFF`;
+/// needs 11 bytes) or an extension substream header (Table 7-2 —
+/// `nuExtSSFsize`; needs 10 bytes). A core frame holds
+/// `(NBLKS + 1) × 32` samples per channel and `FSIZE + 1` bytes; the
+/// LFE channel (`LFF` 1 or 2) counts as a channel. An extension
+/// substream reports its byte size only.
+pub fn parse_dts_header(b: &[u8]) -> Option<AudioFrameInfo> {
+    if b.len() < 10 {
+        return None;
+    }
+    if b[..4] == DTS_EXTENSION_SYNC {
+        // UserDefinedBits(8) nExtSSIndex(2) bHeaderSizeType(1), then
+        // the header size in 8 or 12 bits and the substream size in 16
+        // or 20 bits, each coded minus one.
+        let mut r = BitCursor { b, pos: 32 + 8 + 2 };
+        let (header_bits, size_bits) = if r.u(1)? == 0 { (8, 16) } else { (12, 20) };
+        r.u(header_bits)?;
+        let frame_len = r.u(size_bits)? as usize + 1;
+        return Some(AudioFrameInfo {
+            kind: AudioFrameKind::DtsExtension,
+            frame_len,
+            samples_per_frame: 0,
+            sample_rate: 0,
+            channels: 0,
+            bit_rate: None,
+        });
+    }
+    if b.len() < 11 || b[..4] != DTS_CORE_SYNC {
+        return None;
+    }
+    let mut r = BitCursor { b, pos: 32 };
+    r.u(1)?; // FTYPE
+    r.u(5)?; // SHORT
+    r.u(1)?; // CPF
+    let nblks = r.u(7)?;
+    let fsize = r.u(14)?;
+    let amode = r.u(6)? as usize;
+    let sfreq = r.u(4)? as usize;
+    let rate = r.u(5)? as usize;
+    // FixedBit DYNF TIMEF AUXF HDCD EXT_AUDIO_ID(3) EXT_AUDIO ASPF
+    r.u(10)?;
+    let lff = r.u(2)?;
+    let sample_rate = DTS_SAMPLE_RATE[sfreq];
+    // NBLKS below 5 and FSIZE below 95 are invalid (§5.3.1).
+    if nblks < 5 || fsize < 95 || sample_rate == 0 || lff == 3 {
+        return None;
+    }
+    let channels = DTS_CHANNELS.get(amode).copied().unwrap_or(0);
+    Some(AudioFrameInfo {
+        kind: AudioFrameKind::Dts,
+        frame_len: fsize as usize + 1,
+        samples_per_frame: (nblks + 1) * 32,
+        sample_rate,
+        channels: if channels == 0 {
+            0
+        } else {
+            channels + u16::from(lff != 0)
+        },
+        bit_rate: DTS_BIT_RATE.get(rate).copied(),
+    })
+}
+
 /// Which header parser an [`AudioFrameSplitter`] applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -418,6 +653,10 @@ pub enum AudioSyntax {
     MpegAudio,
     /// AAC in ADTS transport (13818-7 §6.2).
     AacAdts,
+    /// MPEG-4 audio in the LOAS / LATM transport (14496-3 §1.7).
+    AacLoas,
+    /// DTS core frames and extension substreams (ETSI TS 102 114).
+    Dts,
 }
 
 impl AudioSyntax {
@@ -427,6 +666,8 @@ impl AudioSyntax {
             AudioSyntax::Ac3 => parse_ac3_frame(b),
             AudioSyntax::MpegAudio => parse_mpeg_audio_header(b),
             AudioSyntax::AacAdts => parse_adts_header(b),
+            AudioSyntax::AacLoas => parse_loas_header(b),
+            AudioSyntax::Dts => parse_dts_header(b),
         }
     }
 
@@ -437,6 +678,8 @@ impl AudioSyntax {
             AudioSyntax::Ac3 => 8,
             AudioSyntax::MpegAudio => 4,
             AudioSyntax::AacAdts => 7,
+            AudioSyntax::AacLoas => 3,
+            AudioSyntax::Dts => 11,
         }
     }
 }
@@ -490,6 +733,10 @@ pub struct AudioFrameSplitter {
     discarded: u64,
     /// Set once a complete, validated frame has been emitted.
     locked: bool,
+    /// `(samples_per_frame, sample_rate, channels)` of the last frame
+    /// whose header carried them — what a frame that only refers to an
+    /// earlier configuration (LATM `useSameStreamMux`) is timed with.
+    geometry: Option<(u32, u32, u16)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -522,6 +769,7 @@ impl AudioFrameSplitter {
             anchor: None,
             discarded: 0,
             locked: false,
+            geometry: None,
         }
     }
 
@@ -585,11 +833,13 @@ impl AudioFrameSplitter {
         let mut new_pts_pending = pes_pts;
         let mut pos = 0usize;
         let hdr = self.syntax.header_len();
+        // End offset of the frame emitted last in this call.
+        let mut emitted_end = usize::MAX;
         loop {
             if buf.len() - pos < hdr {
                 break;
             }
-            let Some(info) = self.syntax.parse(&buf[pos..]) else {
+            let Some(mut info) = self.syntax.parse(&buf[pos..]) else {
                 // Not a frame start: drop one byte and re-sync. A
                 // residual we believed was a frame tail turned out not
                 // to be one; its PTS is void.
@@ -625,6 +875,27 @@ impl AudioFrameSplitter {
                 self.residual_pts = None;
                 continue;
             }
+            // A DTS extension substream directly behind a core frame
+            // belongs to that frame's access unit (ETSI TS 102 114
+            // §F.3.3, Figure F-1).
+            if info.kind == AudioFrameKind::DtsExtension
+                && pos == emitted_end
+                && let Some(prev) = out.last_mut()
+                && matches!(prev.info.kind, AudioFrameKind::Dts)
+            {
+                prev.data.extend_from_slice(&buf[pos..end]);
+                prev.info.frame_len += info.frame_len;
+                pos = end;
+                emitted_end = end;
+                continue;
+            }
+            if info.sample_rate != 0 {
+                self.geometry = Some((info.samples_per_frame, info.sample_rate, info.channels));
+            } else if let Some((spf, rate, channels)) = self.geometry {
+                info.samples_per_frame = spf;
+                info.sample_rate = rate;
+                info.channels = channels;
+            }
             let pts = if pos < carried {
                 // Completes the frame carried in from the previous
                 // payload: that frame's stamp was fixed when buffered.
@@ -646,6 +917,7 @@ impl AudioFrameSplitter {
                 info,
             });
             pos = end;
+            emitted_end = end;
         }
         // Whatever is left is shorter than a header: carry it over. It
         // commences in this payload (or is an unverifiable tail).
@@ -703,6 +975,8 @@ impl AudioFrameSplitter {
                 AudioSyntax::Ac3 => AudioFrameKind::Ac3,
                 AudioSyntax::MpegAudio => AudioFrameKind::MpegLayer2,
                 AudioSyntax::AacAdts => AudioFrameKind::AacAdts,
+                AudioSyntax::AacLoas => AudioFrameKind::AacLoas,
+                AudioSyntax::Dts => AudioFrameKind::Dts,
             },
             frame_len: 0,
             samples_per_frame: spf,

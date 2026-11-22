@@ -167,6 +167,9 @@ mod audio_split_roundtrip;
 #[cfg(all(test, feature = "registry"))]
 mod demux_hardening;
 
+#[cfg(all(test, feature = "registry"))]
+mod foreign_layouts;
+
 #[cfg(feature = "registry")]
 pub mod demuxer;
 #[cfg(feature = "registry")]
@@ -178,7 +181,7 @@ pub mod registry;
 
 pub use audio_frame::{
     AudioFrame, AudioFrameInfo, AudioFrameKind, AudioFrameSplitter, AudioSyntax, parse_ac3_frame,
-    parse_adts_header, parse_mpeg_audio_header,
+    parse_adts_header, parse_dts_header, parse_loas_header, parse_mpeg_audio_header,
 };
 pub use build::{
     EitEventEntry, NitTsEntry, PmtStreamEntry, SdtServiceEntry, aac_descriptor, ac3_descriptor,

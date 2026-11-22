@@ -306,6 +306,90 @@ pub(crate) fn looks_like_h264(es: &[u8]) -> bool {
     })
 }
 
+/// Bytes of an access unit examined for its first coded picture when
+/// deciding whether it is a random-access point.
+const KEYFRAME_SCAN_BYTES: usize = 4096;
+
+/// Does the access unit at the head of `es` start with an intra-coded
+/// random-access picture? Decided at the first coded-picture unit found
+/// in the leading [`KEYFRAME_SCAN_BYTES`]:
+///
+/// * H.264: the first VCL NAL unit is an IDR slice (`nal_unit_type` 5,
+///   H.264 Table 7-1);
+/// * H.265: the first VCL NAL unit is an IRAP slice segment
+///   (`nal_unit_type` 16..=23, H.265 Table 7-1);
+/// * H.266: the first VCL NAL unit is an IDR or CRA slice
+///   (`nal_unit_type` 7..=9, H.266 Table 5);
+/// * MPEG-1/2 video: the first `picture_header()` has
+///   `picture_coding_type` 1 (H.262 Table 6-12);
+/// * MPEG-4 Visual: the first VOP has `vop_coding_type` '00'
+///   (ISO/IEC 14496-2 Table 6-20).
+///
+/// Used for streams whose multiplexer did not set the §2.4.3.5
+/// `random_access_indicator`.
+pub(crate) fn es_starts_with_keyframe(codec_id: &str, es: &[u8]) -> bool {
+    let es = &es[..es.len().min(KEYFRAME_SCAN_BYTES)];
+    let mut i = 0;
+    while i + 5 <= es.len() {
+        if es[i] != 0 || es[i + 1] != 0 || es[i + 2] != 1 {
+            i += 1;
+            continue;
+        }
+        let (b0, b1) = (es[i + 3], es[i + 4]);
+        let verdict = match codec_id {
+            "h264" => match b0 & 0x1F {
+                5 => Some(true),
+                1..=4 => Some(false),
+                _ => None,
+            },
+            "h265" => match (b0 >> 1) & 0x3F {
+                16..=23 => Some(true),
+                0..=31 => Some(false),
+                _ => None,
+            },
+            "h266" => match b1 >> 3 {
+                7..=9 => Some(true),
+                0..=11 => Some(false),
+                _ => None,
+            },
+            "mpeg1video" | "mpeg2video" => match b0 {
+                // temporal_reference(10) picture_coding_type(3)
+                0x00 => es.get(i + 5).map(|b| (b >> 3) & 0x07 == 1),
+                _ => None,
+            },
+            "mpeg4video" => match b0 {
+                0xB6 => Some(b1 >> 6 == 0),
+                _ => None,
+            },
+            _ => return false,
+        };
+        if let Some(v) = verdict {
+            return v;
+        }
+        i += 3;
+    }
+    false
+}
+
+/// `true` when the stream opens the way an ISO/IEC 14496-2 visual
+/// stream does (Table 6-3 start codes): a
+/// `visual_object_sequence_start_code` (`B0`) as its first start code,
+/// or a `video_object_start_code` (`00..=1F`) immediately followed by a
+/// `video_object_layer_start_code` (`20..=2F`).
+pub(crate) fn looks_like_mpeg4_visual(es: &[u8]) -> bool {
+    let Some(i) = es.windows(3).position(|w| w == [0, 0, 1]) else {
+        return false;
+    };
+    match es.get(i + 3) {
+        Some(0xB0) => true,
+        Some(0x00..=0x1F) => {
+            es.get(i + 4..i + 7) == Some(&[0, 0, 1])
+                && es.get(i + 7).is_some_and(|c| (0x20..=0x2F).contains(c))
+        }
+        _ => false,
+    }
+}
+
 /// H.262 Table 6-4 frame_rate_value (also ISO/IEC 11172-2 picture_rate).
 const FRAME_RATES: [(u32, u32); 9] = [
     (0, 0),
@@ -450,6 +534,8 @@ pub(crate) fn audio_syntax_for(codec_id: &str) -> Option<crate::audio_frame::Aud
     match codec_id {
         "mp1" | "mp2" | "mp3" => Some(AudioSyntax::MpegAudio),
         "ac3" | "eac3" => Some(AudioSyntax::Ac3),
+        "aac_latm" => Some(AudioSyntax::AacLoas),
+        "dts" => Some(AudioSyntax::Dts),
         _ => None,
     }
 }

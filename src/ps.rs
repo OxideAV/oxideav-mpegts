@@ -126,6 +126,11 @@ struct EsState {
     framing: Framing,
     pts: NearestEpochUnwrap,
     dts: NearestEpochUnwrap,
+    /// For a 16-bit LPCM stream: bytes per second, and the
+    /// presentation time the next packet starts at when its PES packet
+    /// codes none (the samples are contiguous).
+    pcm_rate: Option<i64>,
+    pcm_next: Option<i64>,
 }
 
 /// MPEG-2 program stream demuxer.
@@ -383,6 +388,14 @@ impl MpegPsDemuxer {
                 continue;
             };
             let idx = self.streams.len() as u32;
+            let pcm_rate = match (
+                params.codec_id.as_str(),
+                params.sample_rate,
+                params.channels,
+            ) {
+                ("pcm_s16be", Some(rate), Some(ch)) => Some(i64::from(rate) * i64::from(ch) * 2),
+                _ => None,
+            };
             self.streams.push(StreamInfo {
                 index: idx,
                 time_base: TimeBase::new(1, 90_000),
@@ -396,6 +409,8 @@ impl MpegPsDemuxer {
                 framing,
                 pts: NearestEpochUnwrap::default(),
                 dts: NearestEpochUnwrap::default(),
+                pcm_rate,
+                pcm_next: None,
             });
         }
         Ok(())
@@ -454,9 +469,9 @@ impl MpegPsDemuxer {
                 let frames = sp.push(payload, pts);
                 if frames.is_empty() && !was_locked {
                     sp.unlock();
-                    let mut p = Packet::new(idx, tb, payload.to_vec());
+                    let mut p = Packet::new(idx, tb, payload.to_vec()).with_keyframe(true);
                     if let Some(t) = pts {
-                        p = p.with_pts(t);
+                        p = p.with_pts(t).with_dts(t);
                     }
                     self.pending.push_back(p);
                     return;
@@ -471,11 +486,20 @@ impl MpegPsDemuxer {
                 }
             }
             Framing::Whole => {
-                let mut p = Packet::new(idx, tb, payload.to_vec());
+                // Audio and sub-picture units are each an entry point;
+                // a video stream passed through whole has no known
+                // picture boundaries.
+                let key =
+                    self.streams[idx as usize].params.media_type != oxideav_core::MediaType::Video;
+                let pts = pts.or(st.pcm_next);
+                if let (Some(t), Some(rate)) = (pts, st.pcm_rate) {
+                    st.pcm_next = Some(t + payload.len() as i64 * 90_000 / rate);
+                }
+                let mut p = Packet::new(idx, tb, payload.to_vec()).with_keyframe(key);
                 if let Some(t) = pts {
                     p = p.with_pts(t);
                 }
-                if let Some(t) = dts {
+                if let Some(t) = dts.or(pts) {
                     p = p.with_dts(t);
                 }
                 self.pending.push_back(p);
@@ -620,7 +644,14 @@ fn classify(
                 }
                 (p, Framing::Audio(sp))
             }
-            0x88..=0x8F => (CodecParameters::audio(CodecId::new("dts")), Framing::Whole),
+            0x88..=0x8F => {
+                let mut p = CodecParameters::audio(CodecId::new("dts"));
+                let sp = AudioFrameSplitter::new(AudioSyntax::Dts);
+                if let Some(i) = crate::parse_dts_header(data) {
+                    apply_audio(&mut p, &i);
+                }
+                (p, Framing::Audio(sp))
+            }
             0xA0..=0xA7 => {
                 // mpucoder-lpcm.html byte 5: quantisation_word_length(2)
                 // audio_sample_frequency(2) reserved(1)
@@ -656,7 +687,11 @@ fn classify(
                 None => {
                     // An MPEG-1/2 sequence header wins: its slice start
                     // codes (0x01..=0xAF) overlap H.264 NAL header bytes.
+                    // An ISO/IEC 14496-2 stream is told by how it opens:
+                    // its group_of_vop_start_code shares the value of
+                    // the MPEG-1/2 sequence_header_code.
                     let id = match mpeg12_params(data) {
+                        _ if crate::es_params::looks_like_mpeg4_visual(data) => "mpeg4video",
                         Some(v) if !v.mpeg2 => "mpeg1video",
                         Some(_) => "mpeg2video",
                         None if looks_like_h264(data) => "h264",
@@ -668,16 +703,25 @@ fn classify(
             let kind = match p.codec_id.as_str() {
                 "h264" => VideoKind::H264,
                 "mpeg1video" | "mpeg2video" => VideoKind::Mpeg12,
+                "mpeg4video" => VideoKind::Mpeg4,
                 _ => return Some((p, Framing::Whole)),
             };
             let v = match kind {
                 VideoKind::H264 => h264_params(data),
                 VideoKind::Mpeg12 => mpeg12_params(data),
+                VideoKind::Mpeg4 => None,
             };
             if let Some(v) = v {
                 apply_video(&mut p, &v);
             }
-            Some((p, Framing::Video(VideoAuSplitter::new(kind))))
+            let mut splitter = VideoAuSplitter::new(kind);
+            if let Some(r) = p.frame_rate
+                && r.num > 0
+                && r.den > 0
+            {
+                splitter.period = Some((90_000 * r.den + r.num / 2) / r.num);
+            }
+            Some((p, Framing::Video(splitter)))
         }
         0xC0..=0xDF => {
             let from_psm = psm_type
@@ -744,6 +788,7 @@ const MAX_ANCHORS: usize = 1024;
 enum VideoKind {
     Mpeg12,
     H264,
+    Mpeg4,
 }
 
 /// One cut video access unit.
@@ -787,9 +832,32 @@ struct VideoAuSplitter {
     has_picture: bool,
     /// Whether the current access unit is a keyframe.
     key: bool,
+    /// Whether the current access unit is a bidirectionally predicted
+    /// picture (presented when decoded).
+    bidirectional: bool,
     /// `(absolute payload offset, pts, dts)` of PES packets awaiting
     /// their access unit.
     anchors: VecDeque<(u64, Option<i64>, Option<i64>)>,
+    /// Decoding-time step between successive access units in 90 kHz
+    /// ticks: the frame period of the stream's headers, else the
+    /// spacing measured between coded timestamps.
+    period: Option<i64>,
+    /// Decoding time of the access unit handed out last.
+    last_dts: Option<i64>,
+    /// The last coded decoding time and the access units handed out
+    /// since, for measuring `period`.
+    coded: Option<(i64, i64)>,
+    /// MPEG-1/2 `temporal_reference` of the current access unit's
+    /// picture.
+    temporal_reference: Option<u16>,
+    /// The current access unit holds a group_of_pictures header, which
+    /// restarts the `temporal_reference` count.
+    group_start: bool,
+    /// `(temporal_reference, pts)` of the last picture of the current
+    /// group whose presentation time was coded.
+    display_anchor: Option<(u16, i64)>,
+    /// Latest presentation time handed out.
+    display_end: Option<i64>,
 }
 
 impl VideoAuSplitter {
@@ -802,7 +870,15 @@ impl VideoAuSplitter {
             au_start: None,
             has_picture: false,
             key: false,
+            bidirectional: false,
             anchors: VecDeque::new(),
+            period: None,
+            last_dts: None,
+            coded: None,
+            temporal_reference: None,
+            group_start: false,
+            display_anchor: None,
+            display_end: None,
         }
     }
 
@@ -825,8 +901,11 @@ impl VideoAuSplitter {
             let code = self.buf[i + 3];
             let next = self.buf[i + 4];
             let starts_au = self.classify(code, next);
-            // A 4-byte start code's leading zero belongs to the unit.
-            let at = if i > 0 && self.buf[i - 1] == 0 {
+            // H.264 Annex B: the zero_byte ahead of a start code prefix
+            // belongs to the unit it introduces. H.262 §5.2.3 /
+            // ISO/IEC 14496-2 next_start_code(): stuffing zero bytes
+            // end the element before the start code.
+            let at = if self.kind == VideoKind::H264 && i > 0 && self.buf[i - 1] == 0 {
                 i - 1
             } else {
                 i
@@ -841,6 +920,7 @@ impl VideoAuSplitter {
                     self.au_start = Some(0);
                     self.has_picture = false;
                     self.key = false;
+                    self.bidirectional = false;
                     i -= cut;
                     self.note_picture(code, i);
                     i += 4;
@@ -908,6 +988,10 @@ impl VideoAuSplitter {
         match self.kind {
             // sequence_header / group_start / picture_start.
             VideoKind::Mpeg12 => matches!(code, 0xB3 | 0xB8 | 0x00),
+            // ISO/IEC 14496-2 Table 6-3: visual_object_sequence /
+            // visual_object / video_object / video_object_layer /
+            // group_of_vop / vop start codes.
+            VideoKind::Mpeg4 => matches!(code, 0xB0 | 0xB5 | 0x00..=0x2F | 0xB3 | 0xB6),
             VideoKind::H264 => {
                 let t = code & 0x1F;
                 match t {
@@ -924,8 +1008,15 @@ impl VideoAuSplitter {
     fn note_picture(&mut self, code: u8, at: usize) {
         match self.kind {
             VideoKind::Mpeg12 => {
+                if code == 0xB8 {
+                    self.group_start = true;
+                }
                 if code == 0x00 {
                     self.has_picture = true;
+                    if let Some(b) = self.buf.get(at + 4..at + 6) {
+                        self.temporal_reference =
+                            Some((u16::from(b[0]) << 2) | u16::from(b[1] >> 6));
+                    }
                     // picture_header: temporal_reference(10)
                     // picture_coding_type(3) — 1 = I (H.262 Table 6-12).
                     if let Some(b) = self.buf.get(at + 5) {
@@ -933,6 +1024,19 @@ impl VideoAuSplitter {
                         if pct == 1 {
                             self.key = true;
                         }
+                        self.bidirectional = pct == 3;
+                    }
+                }
+            }
+            VideoKind::Mpeg4 => {
+                if code == 0xB6 {
+                    self.has_picture = true;
+                    // vop_coding_type(2): '00' = intra (Table 6-20).
+                    if let Some(b) = self.buf.get(at + 4) {
+                        if b >> 6 == 0 {
+                            self.key = true;
+                        }
+                        self.bidirectional = b >> 6 == 2;
                     }
                 }
             }
@@ -964,6 +1068,65 @@ impl VideoAuSplitter {
                 break;
             }
         }
+        // §2.4.3.7: an access unit with a PTS and no DTS decodes at
+        // its PTS.
+        let mut dts = dts.or(pts);
+        match dts {
+            Some(t) => {
+                // Measure the access-unit spacing between two coded
+                // decoding times when the headers did not give one.
+                if let Some((at, units)) = self.coded
+                    && units > 0
+                    && t > at
+                    && self.period.is_none()
+                {
+                    self.period = Some((t - at) / units);
+                }
+                self.coded = Some((t, 0));
+            }
+            None => {
+                // Annex D (timing model): an access unit following one
+                // with a coded time stamp decodes one period later.
+                if let (Some(prev), Some(step)) = (self.last_dts, self.period) {
+                    dts = Some(prev + step);
+                }
+            }
+        }
+        // H.262 §6.3.9: temporal_reference counts coded frames in
+        // display order within a group of pictures, so a picture
+        // without a coded PTS is presented that many frame periods
+        // from one of its group that has one.
+        if std::mem::take(&mut self.group_start) {
+            // The frame a new group displays first (temporal_reference
+            // 0) follows the last frame displayed so far.
+            self.display_anchor = match (self.display_end, self.period) {
+                (Some(end), Some(step)) => Some((0, end + step)),
+                _ => None,
+            };
+        }
+        if let Some(tr) = self.temporal_reference.take() {
+            match (pts, self.display_anchor, self.period) {
+                (Some(t), _, _) => self.display_anchor = Some((tr, t)),
+                (None, Some((at, t)), Some(step)) => {
+                    // Modulo-1024 difference, taken as the nearer way
+                    // round.
+                    let d = (i64::from(tr) - i64::from(at) + 512).rem_euclid(1024) - 512;
+                    pts = Some(t + d * step);
+                }
+                _ => {}
+            }
+        }
+        // A bidirectional picture is presented as it is decoded.
+        if pts.is_none() && self.bidirectional {
+            pts = dts;
+        }
+        if let Some(t) = pts {
+            self.display_end = Some(self.display_end.map_or(t, |e| e.max(t)));
+        }
+        if let Some((_, units)) = &mut self.coded {
+            *units += 1;
+        }
+        self.last_dts = dts;
         let au = VideoAu {
             data,
             pts,
@@ -985,6 +1148,7 @@ impl VideoAuSplitter {
         let au = self.cut(s, e);
         self.has_picture = false;
         self.key = false;
+        self.bidirectional = false;
         Some(au)
     }
 }
@@ -1051,6 +1215,11 @@ mod tests {
     /// MPEG-2 video: sequence header (+ extension) then pictures of the
     /// given coding types, each a picture header + one slice.
     fn mpeg2_es(types: &[u8]) -> (Vec<u8>, Vec<usize>) {
+        // temporal_reference of each picture: the display position.
+        let display: Vec<u16> = match types {
+            [1, 3, 2, 2] => vec![1, 0, 2, 3],
+            _ => (0..types.len() as u16).collect(),
+        };
         let mut es = vec![
             0, 0, 1, 0xB3, 0x14, 0x00, 0xB4, 0x13, 0xFF, 0xFF, 0xE0, 0x18, // 320x180 25fps
             0, 0, 1, 0xB5, 0x14, 0x8A, 0x00, 0x01, 0x00, 0x00,
@@ -1060,7 +1229,17 @@ mod tests {
             if k > 0 {
                 starts.push(es.len());
             }
-            es.extend_from_slice(&[0, 0, 1, 0x00, 0x00, t << 3, 0xFF, 0xF8]);
+            let tr = display[k];
+            es.extend_from_slice(&[
+                0,
+                0,
+                1,
+                0x00,
+                (tr >> 2) as u8,
+                ((tr & 3) as u8) << 6 | t << 3,
+                0xFF,
+                0xF8,
+            ]);
             es.extend_from_slice(&[0, 0, 1, 0x01, 0x12, 0x34, 0x56, 0x78, 0x9A]);
         }
         (es, starts)
@@ -1150,8 +1329,13 @@ mod tests {
             assert_eq!(p.data, es[starts[k]..end], "AU {k}");
         }
         assert!(v[0].is_keyframe() && !v[1].is_keyframe());
-        assert_eq!(v[0].pts, Some(9000));
-        assert_eq!(v[1].pts, None);
+        assert_eq!((v[0].pts, v[0].dts), (Some(9000), Some(9000)));
+        // The pictures behind the first carry no time stamp of their
+        // own: decoding times step by the 25 Hz frame period, and
+        // presentation times follow temporal_reference.
+        assert_eq!((v[1].pts, v[1].dts), (Some(5400), Some(12_600)));
+        assert_eq!((v[2].pts, v[2].dts), (Some(12_600), Some(16_200)));
+        assert_eq!((v[3].pts, v[3].dts), (Some(16_200), Some(19_800)));
         let a: Vec<&Packet> = pk.iter().filter(|p| p.stream_index == 1).collect();
         assert_eq!(a.len(), 6);
         for (k, p) in a.iter().enumerate() {

@@ -11,6 +11,59 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- Audio framing for two more syntaxes: LOAS / LATM (`parse_loas_header`,
+  `AudioSyntax::AacLoas` — one packet per `AudioSyncStream()` frame,
+  sampling rate / channels / frame length from the `StreamMuxConfig()`)
+  and DTS (`parse_dts_header`, `AudioSyntax::Dts` — core frame header
+  and extension substream size; a core frame and the extension
+  substreams behind it leave as one access unit).
+- `StreamType` names `0x32` JPEG XS, `0x33` / `0x34` VVC, `0x35` EVC and
+  the ATSC E-AC-3 value `0x87`.
+- Private-data PES streams (`stream_type` 0x06) are identified by the
+  DVB `DTS_descriptor`, `subtitling_descriptor` (`dvb_subtitle`),
+  `teletext_descriptor` / `VBI_teletext_descriptor` (`dvb_teletext`) and
+  the "EAC3" / "DTS1" / "DTS2" / "DTS3" / "DTSH" registration
+  identifiers, next to the AC-3 ones; one that no descriptor names is
+  identified by its payload when that frames as MPEG audio, AC-3, AAC
+  (ADTS / LATM) or DTS.
+- `examples/tsdump.rs` — prints the streams and packets either demuxer
+  delivers, the PAT / PMT sections of a transport stream, or remuxes a
+  file.
+
+### Changed
+
+- Codec ids follow the names the decoder crates register: `h265` (was
+  `hevc`), `mpeg4video` (was `mpeg4`); `stream_type` 0x11 is `aac_latm`
+  (it is not ADTS). The muxer accepts the old spellings too.
+- Every audio, subtitle and data packet is flagged a keyframe (each
+  access unit is an entry point of its stream); before, only the ones
+  the multiplexer marked with the `random_access_indicator` were.
+
+### Fixed
+
+- A PES packet with a PTS and no DTS now reports `dts = pts`
+  (§2.4.3.7) in both demuxers; it reported no DTS.
+- Video access points of streams written without the
+  `random_access_indicator` are found from the first coded picture
+  (H.264 IDR, H.265 IRAP, H.266 IDR / CRA, MPEG-1/2 intra picture,
+  MPEG-4 intra VOP); such streams had no keyframe at all.
+- Elementary-stream packets ahead of the first PAT / PMT of a capture
+  cut mid-stream are delivered; they were skipped.
+- A stream consisting of a single PES packet gets its picture / audio
+  parameters at open.
+- `stream_type` 0x02 carrying ISO/IEC 11172-2 video is reported as
+  `mpeg1video`.
+- E-AC-3 signalled the ATSC way (`stream_type` 0x87) is demuxed.
+- Program streams: DTS sub-streams leave one frame per packet with
+  parameters; ISO/IEC 14496-2 video is recognised and split into VOPs
+  (it was taken for MPEG-2); stuffing zero bytes stay with the picture
+  they follow (H.262 §5.2.3); pictures whose PES packet codes no time
+  stamp get a decoding time one frame period after the previous one
+  and, for MPEG-1/2, a presentation time from `temporal_reference`;
+  16-bit LPCM packets without a PTS continue from the previous one.
+
+### Added (earlier in this cycle)
+
 - Demuxer follows program-map changes while streaming: when the PAT
   moves the selected program to another `program_map_PID`, or its PMT
   assigns different elementary PIDs or a different `PCR_PID`, each

@@ -2447,10 +2447,13 @@ fn stream_type_for_codec(codec_id: &str) -> Option<(u8, u8, bool)> {
     Some(match codec_id {
         "mpeg1video" => (0x01, 0xE0, true),
         "mpeg2video" => (0x02, 0xE0, true),
-        "mpeg4" => (0x10, 0xE0, true),
+        "mpeg4video" | "mpeg4" => (0x10, 0xE0, true),
         "jpeg2000" => (0x21, 0xE0, true),
         "h264" => (0x1B, 0xE0, true),
-        "hevc" => (0x24, 0xE0, true),
+        "h265" | "hevc" => (0x24, 0xE0, true),
+        "h266" | "vvc" => (0x33, 0xE0, true),
+        "evc" => (0x35, 0xE0, true),
+        "jpegxs" => (0x32, 0xE0, true),
         "vc1" => (0xEA, 0xE0, true),
         // ISO/IEC 11172-3 audio (layers I-III, stream_type 0x03). The
         // demuxer maps 0x03 and 0x04 to "mp2"; accept all three MPEG
@@ -2459,6 +2462,8 @@ fn stream_type_for_codec(codec_id: &str) -> Option<(u8, u8, bool)> {
         "mp1" | "mp2" | "mp3" => (0x03, 0xC0, false),
         // ISO/IEC 13818-7 ADTS AAC.
         "aac" => (0x0F, 0xC0, false),
+        // ISO/IEC 14496-3 audio in the LATM transport syntax.
+        "aac_latm" => (0x11, 0xC0, false),
         "pcm_s16be" => (0x80, 0xBD, false),
         "ac3" => (0x81, 0xBD, false),
         "dts" => (0x82, 0xBD, false),
@@ -2625,7 +2630,7 @@ mod tests {
         let streams = vec![
             stream_info(0, "h264", true),
             stream_info(1, "ac3", false),
-            stream_info(2, "hevc", true),
+            stream_info(2, "h265", true),
             stream_info(3, "eac3", false),
         ];
         let config = MpegTsMuxConfig {
@@ -2691,7 +2696,7 @@ mod tests {
             .iter()
             .map(|s| s.params.codec_id.as_str())
             .collect();
-        assert!(codecs.contains(&"hevc"), "codecs={codecs:?}");
+        assert!(codecs.contains(&"h265"), "codecs={codecs:?}");
         assert!(codecs.contains(&"eac3"), "codecs={codecs:?}");
     }
 
@@ -2923,7 +2928,7 @@ mod tests {
         let streams = vec![
             stream_info(0, "h264", true),
             stream_info(1, "ac3", false),
-            stream_info(2, "hevc", true),
+            stream_info(2, "h265", true),
         ];
         let config = MpegTsMuxConfig {
             transport_stream_id: 0x0100,
@@ -4090,7 +4095,7 @@ mod tests {
     /// alive, not just the one owning the frame being written.
     #[test]
     fn cbr_multi_program_keeps_idle_programs_pcr_cadence() {
-        let streams = vec![stream_info(0, "h264", true), stream_info(1, "hevc", true)];
+        let streams = vec![stream_info(0, "h264", true), stream_info(1, "h265", true)];
         let sink = SharedSink::new();
         {
             let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
@@ -4982,9 +4987,13 @@ mod tests {
 
         let demuxed1 = demux_all(gen1);
         assert_eq!(
-            demuxed1.iter().filter(|r| r.3).count(),
+            demuxed1.iter().filter(|r| r.0 == 0 && r.3).count(),
             6,
-            "RAI must fold back into 6 keyframe flags"
+            "RAI must fold back into 6 video keyframe flags"
+        );
+        assert!(
+            demuxed1.iter().filter(|r| r.0 == 1).all(|r| r.3),
+            "every audio access unit is an entry point"
         );
 
         // Generation 2: remux exactly what the demuxer produced.

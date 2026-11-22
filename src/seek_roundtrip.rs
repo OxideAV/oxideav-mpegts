@@ -196,7 +196,7 @@ fn roundtrip_seek_exact_on_vbr_mux() {
 /// (5 000 000 ticks away) would land wildly elsewhere.
 #[test]
 fn roundtrip_multi_program_seek_uses_selected_programs_pcr() {
-    let streams = vec![stream_info(0, "h264", true), stream_info(1, "hevc", true)];
+    let streams = vec![stream_info(0, "h264", true), stream_info(1, "h265", true)];
     let sink = SharedSink::new();
     {
         let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
@@ -252,7 +252,7 @@ fn roundtrip_multi_program_seek_uses_selected_programs_pcr() {
     // Program 2: keyframe grid 36_000 starting at 5_000_000.
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
     let mut dmx = MpegTsDemuxer::open_program(input, 2).expect("open p2");
-    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "hevc");
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h265");
     let landed = dmx.seek_to(0, 5_360_000).expect("seek p2");
     assert_eq!(
         landed, 5_360_000,

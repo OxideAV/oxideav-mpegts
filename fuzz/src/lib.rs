@@ -558,7 +558,7 @@ pub struct MuxPlan {
     pub discontinuity_before: Option<(u16, usize)>,
 }
 
-const VIDEO_CODECS: [&str; 4] = ["mpeg2video", "h264", "hevc", "vc1"];
+const VIDEO_CODECS: [&str; 4] = ["mpeg2video", "h264", "h265", "vc1"];
 const AUDIO_CODECS: [&str; 5] = ["pcm_s16be", "ac3", "dts", "truehd", "eac3"];
 
 fn stream_info(idx: u32, codec_id: &str, is_video: bool) -> StreamInfo {
@@ -893,10 +893,14 @@ impl MuxPlan {
                 ));
             }
             for (di, &slot) in prog.stream_slots.iter().enumerate() {
+                // A frame written without a DTS decodes at its PTS
+                // (§2.4.3.7), and every non-video access unit is an
+                // entry point of its stream.
+                let is_video = self.streams[slot].is_video;
                 let want: Vec<(i64, Option<i64>, usize, bool)> = self.streams[slot]
                     .frames
                     .iter()
-                    .map(|f| (f.pts, f.dts, f.len, f.keyframe))
+                    .map(|f| (f.pts, f.dts.or(Some(f.pts)), f.len, f.keyframe || !is_video))
                     .collect();
                 assert_eq!(
                     got[di], want,

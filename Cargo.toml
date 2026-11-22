@@ -29,3 +29,8 @@ thiserror = "2"
 name = "throughput"
 harness = false
 required-features = ["registry"]
+
+# Packet / table dump and remux tool the black-box matrix drives.
+[[example]]
+name = "tsdump"
+required-features = ["registry"]
