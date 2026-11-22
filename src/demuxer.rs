@@ -443,6 +443,8 @@ struct PidSlot {
     /// Codec the PMT entry names (before any refinement from the
     /// elementary stream) — what a later PMT's entries are matched on.
     pmt_codec: CodecId,
+    /// The PMT entry this stream was opened from.
+    pmt_entry: crate::PmtStream,
     reassembler: PesReassembler,
     /// 33-bit PTS / DTS unwrappers (§2.4.3.7) onto one monotonic
     /// 64-bit timeline; reorder-tolerant.
@@ -645,7 +647,7 @@ impl std::fmt::Debug for MpegTsDemuxer {
 
 impl MpegTsDemuxer {
     /// Open a demuxer on the **first** program the PAT advertises.
-    fn new(input: Box<dyn ReadSeek>) -> CoreResult<Self> {
+    pub fn new(input: Box<dyn ReadSeek>) -> CoreResult<Self> {
         Self::with_selector(input, None)
     }
 
@@ -931,6 +933,7 @@ impl MpegTsDemuxer {
                 pid,
                 mapped: true,
                 pmt_codec,
+                pmt_entry: pmt_stream.clone(),
                 reassembler: PesReassembler::new(),
                 pts: NearestEpochUnwrap::default(),
                 dts: NearestEpochUnwrap::default(),
@@ -1001,6 +1004,16 @@ impl MpegTsDemuxer {
         }
 
         Ok(demuxer)
+    }
+
+    /// The program map entry stream `stream_index` was opened from: its
+    /// `stream_type`, PID and `ES_info` descriptor loop. A remultiplexer
+    /// hands the descriptors on (see
+    /// [`crate::muxer::ProgramSpec::with_es_descriptors`]) so that
+    /// streams identified by descriptors alone — DVB subtitles,
+    /// teletext, AC-3 / DTS on private-data PES — stay identified.
+    pub fn pmt_entry(&self, stream_index: u32) -> Option<&crate::PmtStream> {
+        self.slots.get(stream_index as usize).map(|s| &s.pmt_entry)
     }
 
     /// What the streaming path has skipped or repaired so far.

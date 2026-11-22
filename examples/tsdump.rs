@@ -110,23 +110,51 @@ fn dump(path: &str, program: Option<u16>) -> Result<(), Error> {
 }
 
 fn remux(src: &str, dst: &str, rate: Option<u64>) -> Result<(), Error> {
+    // The source's ES_info descriptor loops travel with the streams.
+    let mut descriptors = Vec::new();
+    if let Ok(ts) = MpegTsDemuxer::new(Box::new(File::open(src)?)) {
+        for s in ts.streams() {
+            if let Some(e) = ts.pmt_entry(s.index) {
+                descriptors.push((s.index, e.descriptors.clone()));
+            }
+        }
+    }
     let mut dmx = open(src, None)?;
     let streams = dmx.streams().to_vec();
     let out = Box::new(File::create(dst)?);
-    let mut mux = oxideav_mpegts::MpegTsMuxer::with_config(
-        out,
-        &streams,
-        oxideav_mpegts::muxer::MpegTsMuxConfig::default(),
-    )?;
+    use oxideav_mpegts::muxer::{MpegTsMuxConfig, ProgramSpec};
+    let program = ProgramSpec::new(1, 0x0100)
+        .with_stream_indices(streams.iter().map(|s| s.index).collect())
+        .with_es_descriptors(descriptors);
+    let config = MpegTsMuxConfig::default().with_programs(vec![program]);
+    let mut mux = oxideav_mpegts::MpegTsMuxer::with_config(out, &streams, config)?;
     mux.set_mux_rate(rate);
     use oxideav_core::Muxer;
     mux.write_header()?;
+    let mut packets = Vec::new();
     loop {
         match dmx.next_packet() {
-            Ok(p) => mux.write_packet(&p)?,
+            Ok(p) => packets.push(p),
             Err(Error::Eof) => break,
             Err(e) => return Err(e),
         }
+    }
+    if rate.is_some() {
+        // The paced writer wants frames in decoding order across
+        // streams; a source interleaves them as it saw fit.
+        let mut last = 0;
+        let mut keyed: Vec<(i64, _)> = packets
+            .into_iter()
+            .map(|p| {
+                last = p.dts.or(p.pts).unwrap_or(last);
+                (last, p)
+            })
+            .collect();
+        keyed.sort_by_key(|&(t, _)| t);
+        packets = keyed.into_iter().map(|(_, p)| p).collect();
+    }
+    for p in &packets {
+        mux.write_packet(p)?;
     }
     mux.write_trailer()
 }

@@ -201,6 +201,67 @@ indicator.
 enforcement (max one repeat per CC) is built in: a second identical
 CC reads as a drop, not a second duplicate.
 
+## Checked against a black-box multiplexer and reader
+
+`tests/blackbox_matrix.rs` (runs when `ffmpeg` / `ffprobe` are on the
+`PATH`, skips otherwise) writes 64 files with a black-box multiplexer
+and compares, stream by stream and packet by packet — payload hash,
+size, PTS, DTS, key-frame flag, codec, picture size, sample rate,
+channels, language — what this crate's demuxers deliver with what a
+black-box reader reports. Each file is then remultiplexed with this
+crate's writer, unpaced and at a constant rate, and the reader must
+report the same packets for the result with no new warning.
+
+| Direction | Result |
+|-----------|--------|
+| foreign → this crate (60 generated files that are in scope, three cut / re-framed variants) | 63 / 63 |
+| this crate → foreign reader (remux, unpaced + constant rate) | 118 / 118 |
+| in the matrix and **not** carried (pinned as failing) | 4 |
+
+The sweep: every video / audio codec the multiplexer writes into a
+transport stream; 188 / 192 / 204-byte packets; PCR periods; PAT / PMT
+/ SDT periods; header resending, System B, initial discontinuity, NIT;
+no `random_access_indicator`; constant rate with null stuffing; one
+frame, many frames or 300 bytes per PES packet; time stamps starting
+0,3 s below the 2^33 wrap and at one hour; custom PIDs; two audio
+languages; two programs; audio-only and video-only; a file cut
+mid-packet and one cut mid-stream; and program streams in the `vob`,
+`dvd` and `svcd` layouts. Lost, error-flagged and sync-damaged packets
+injected into a foreign stream cost the PES packets they hit and
+nothing else, and seeking lands on the key frames the reader marks.
+
+Per codec, for streams this crate did not write:
+
+| Codec | Transport stream: demuxed as | Remuxed by this crate | Program stream |
+|-------|------------------------------|-----------------------|----------------|
+| MPEG-1 / MPEG-2 video | `mpeg1video` / `mpeg2video` (told apart by the sequence extension), size + frame rate | yes | yes; time stamps filled for pictures whose PES packet has none |
+| MPEG-4 Visual | `mpeg4video`, no picture size | yes | yes (told from MPEG-2 by its start codes); PTS only where coded |
+| H.264 | `h264`, size + frame rate | yes | yes; PTS only where coded |
+| H.265 | `h265`, no picture size | yes | by program stream map only, unsplit |
+| H.266, EVC, JPEG XS, JPEG 2000, VC-1 | by `stream_type`; **never checked against an outside stream** | by `stream_type` | — |
+| MPEG audio layers I–III | `mp1` / `mp2` / `mp3`, one frame per packet, rate + channels | yes | yes |
+| AAC ADTS | `aac`, one frame per packet | yes | by program stream map |
+| AAC LATM | `aac_latm`, one `AudioSyncStream()` frame per packet | yes | — |
+| AC-3 / E-AC-3 | `ac3` / `eac3` (ATSC, DVB and Blu-ray signalling) | yes | AC-3 yes |
+| DTS | `dts` (DVB descriptor / registration, Blu-ray type), one access unit per packet; **extension substreams never checked against an outside stream** | yes | yes |
+| LPCM | Blu-ray `stream_type` 0x80 as `pcm_s16be` *with its 4-byte header in every packet* and no parameters (header layout not staged) | yes (bytes unchanged) | DVD LPCM 16-bit: samples only; cannot be remuxed into a transport stream |
+| DVB subtitles, teletext | `dvb_subtitle` / `dvb_teletext`, one PES packet per packet; **demux never checked against an outside stream** (the reader accepts what this crate writes) | yes | — |
+| TrueHD, PGS, TextST | by Blu-ray `stream_type`; not in the matrix | by `stream_type` | — |
+| Opus, SMPTE 302M, AV1, SCTE-35, KLV, timed ID3 | **not carried** — their transport-stream carriage is not staged | no | — |
+| MPEG-1 system streams (`.mpg` written as ISO/IEC 11172-1) | — | — | **refused** — 11172-1 is not staged |
+
+Notes on what the comparison found to be a matter of convention rather
+than an error: a stream starting below the 2^33 wrap is reported from
+its raw time stamps upwards (the reader starts it below zero); inside a
+PES packet with several audio frames the per-frame times are exact
+multiples of the frame duration from the PES time stamp; the reader
+keeps three header bytes with DVD LPCM packets.
+
+A remultiplexer passes each stream's source descriptors on
+(`MpegTsDemuxer::pmt_entry` → `ProgramSpec::with_es_descriptors`), so
+streams identified only by a descriptor stay identified. The paced
+writer takes frames in decoding order across streams.
+
 ## Damaged input
 
 The streaming path of `MpegTsDemuxer` skips damage and keeps going;

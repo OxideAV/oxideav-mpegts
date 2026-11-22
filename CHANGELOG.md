@@ -26,6 +26,17 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   identifiers, next to the AC-3 ones; one that no descriptor names is
   identified by its payload when that frames as MPEG audio, AC-3, AAC
   (ADTS / LATM) or DTS.
+- `tests/blackbox_matrix.rs` — 64 files from a black-box multiplexer
+  compared packet by packet with a black-box reader, each remuxed with
+  this crate's writer and read back by it (skips without the tools).
+- `MpegTsDemuxer::new` (first program, concrete type) and
+  `MpegTsDemuxer::pmt_entry` (a stream's `stream_type`, PID and
+  descriptor loop, for handing on to a muxer).
+- Muxer: `dvb_subtitle` / `dvb_teletext` streams (private-data PES with
+  a default `subtitling_descriptor` / `teletext_descriptor` when none
+  is supplied); AC-3 / E-AC-3 / DTS go out the DVB way (`stream_type`
+  0x06) when the caller supplies their DVB descriptor; H.266, EVC,
+  JPEG XS and LATM `stream_type`s.
 - `examples/tsdump.rs` — prints the streams and packets either demuxer
   delivers, the PAT / PMT sections of a transport stream, or remuxes a
   file.
@@ -41,6 +52,13 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Fixed
 
+- Muxer: a program using the Blu-ray `stream_type` assignments (LPCM,
+  DTS, TrueHD, E-AC-3 0x84, PGS, TextST) now carries the "HDMV"
+  registration descriptor (§2.6.8); without it a reader took the LPCM
+  stream for something else.
+- Muxer: a frame with a DTS and no PTS was refused; it is written
+  without time stamps. Caller-supplied descriptor loops no longer
+  duplicate the stream_identifier / language descriptors.
 - A PES packet with a PTS and no DTS now reports `dts = pts`
   (§2.4.3.7) in both demuxers; it reported no DTS.
 - Video access points of streams written without the

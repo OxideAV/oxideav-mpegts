@@ -923,7 +923,7 @@ impl MpegTsMuxer {
                         "mpegts muxer: stream_index {sidx} assigned to more than one program"
                     )));
                 }
-                let (stream_type, stream_id, is_video) =
+                let (mut stream_type, mut stream_id, is_video) =
                     stream_type_for_codec(s.params.codec_id.as_str()).ok_or_else(|| {
                         CoreError::unsupported(format!(
                             "mpegts muxer: no MPEG-TS stream_type for codec_id '{}'",
@@ -937,12 +937,59 @@ impl MpegTsMuxer {
                 };
                 // component_tag = 1-based ordinal within the program.
                 let component_tag = (track_indices.len() as u8).wrapping_add(1);
-                let extra_es_descriptors = spec
+                let mut extra_es_descriptors = spec
                     .es_descriptors
                     .iter()
                     .find(|(idx, _)| *idx == sidx)
                     .map(|(_, d)| d.clone())
                     .unwrap_or_default();
+                // The loop carries its own stream_identifier and
+                // language descriptors: drop the ones handed in (a
+                // remultiplexer passes a source loop on whole).
+                extra_es_descriptors = crate::descriptor::iter_descriptors(&extra_es_descriptors)
+                    .flatten()
+                    .filter(|d| !matches!(d.tag, 0x52 | 0x0A))
+                    .flat_map(|d| {
+                        [d.tag, d.data.len() as u8]
+                            .into_iter()
+                            .chain(d.data.iter().copied())
+                    })
+                    .collect();
+                let has = |tags: &[u8]| {
+                    crate::descriptor::iter_descriptors(&extra_es_descriptors)
+                        .flatten()
+                        .any(|d| tags.contains(&d.tag))
+                };
+                // A DVB descriptor that identifies a private-data PES
+                // stream (AC-3 0x6A, E-AC-3 0x7A, DTS 0x7B) selects that
+                // carriage: stream_type 0x06, private_stream_1.
+                if matches!(s.params.codec_id.as_str(), "ac3" | "eac3" | "dts")
+                    && has(&[0x6A, 0x7A, 0x7B])
+                {
+                    (stream_type, stream_id) = (0x06, 0xBD);
+                }
+                // DVB subtitles and teletext exist on a private-data PES
+                // stream only through their descriptor (EN 300 468
+                // §6.2.41 / §6.2.43): write a one-entry default when the
+                // caller supplied none.
+                let code = language.unwrap_or(*b"und");
+                match s.params.codec_id.as_str() {
+                    "dvb_subtitle" if !has(&[0x59]) => {
+                        // subtitling_type 0x10 (normal, no aspect ratio
+                        // criticality), composition / ancillary page 1.
+                        extra_es_descriptors.extend_from_slice(&[0x59, 8]);
+                        extra_es_descriptors.extend_from_slice(&code);
+                        extra_es_descriptors.extend_from_slice(&[0x10, 0, 1, 0, 1]);
+                    }
+                    "dvb_teletext" if !has(&[0x56, 0x46]) => {
+                        // teletext_type 1 (initial page), magazine 1,
+                        // page 00.
+                        extra_es_descriptors.extend_from_slice(&[0x56, 5]);
+                        extra_es_descriptors.extend_from_slice(&code);
+                        extra_es_descriptors.extend_from_slice(&[(1 << 3) | 1, 0x00]);
+                    }
+                    _ => {}
+                }
                 let track_idx = tracks.len();
                 tracks.push(TrackState {
                     pid: next_pid,
@@ -1568,11 +1615,23 @@ impl MpegTsMuxer {
                     }
                 })
                 .collect();
+            // §2.6.8: stream_type values from the user-private range
+            // mean what the registered format says they mean. The ones
+            // written here beyond AC-3 (0x81, the ATSC assignment)
+            // are the HDMV assignments, so the program says so.
+            let program_info = if streams
+                .iter()
+                .any(|e| e.stream_type >= 0x80 && !matches!(e.stream_type, 0x81 | 0x87 | 0xEA))
+            {
+                crate::build::registration_descriptor(*b"HDMV", &[])
+            } else {
+                Vec::new()
+            };
             let section = crate::build::build_pmt(
                 self.programs[pi].program_number,
                 0,
                 self.programs[pi].pcr_pid,
-                &[],
+                &program_info,
                 &streams,
             );
             let pmt_pid = self.programs[pi].pmt_pid;
@@ -2361,7 +2420,12 @@ fn build_pes(stream_id: u8, packet: &Packet) -> CoreResult<Vec<(Vec<u8>, std::op
     let len = packet.data.len();
     // Compare on the ring: two timestamps that coincide there must
     // collapse to the PTS-only form (§2.7.5 forbids DTS == PTS).
-    let has_dts = packet.dts.is_some() && packet.dts.map(ring) != packet.pts.map(ring);
+    // A decoding time alone cannot be coded (Table 2-21 forbids
+    // PTS_DTS_flags '01'): such a frame goes out without time stamps
+    // and the receiver steps from the previous one.
+    let has_dts = packet.pts.is_some()
+        && packet.dts.is_some()
+        && packet.dts.map(ring) != packet.pts.map(ring);
     let first_spec = crate::pes::PesHeaderSpec {
         stream_id,
         pts_90k: packet.pts.map(ring),
@@ -2469,6 +2533,8 @@ fn stream_type_for_codec(codec_id: &str) -> Option<(u8, u8, bool)> {
         "dts" => (0x82, 0xBD, false),
         "truehd" => (0x83, 0xBD, false),
         "eac3" => (0x84, 0xBD, false),
+        // PES private data, named by the descriptors of its PMT entry.
+        "dvb_subtitle" | "dvb_teletext" => (0x06, 0xBD, false),
         "hdmv_pgs_subtitle" => (0x90, 0xBD, false),
         "hdmv_textst_subtitle" => (0x92, 0xBD, false),
         _ => return None,
@@ -2533,6 +2599,176 @@ mod tests {
         }
     }
 
+    /// Mux `streams` (one program, the given extra ES descriptors) with
+    /// one frame each and return the transport stream.
+    fn mux_one_frame_each(streams: &[StreamInfo], descriptors: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let program = ProgramSpec::new(1, 0x0100)
+                .with_stream_indices(streams.iter().map(|s| s.index).collect())
+                .with_es_descriptors(descriptors);
+            let config = MpegTsMuxConfig::default().with_programs(vec![program]);
+            let mut mx = MpegTsMuxer::with_config(output, streams, config).expect("open");
+            mx.write_header().unwrap();
+            for s in streams {
+                let p =
+                    Packet::new(s.index, TimeBase::new(1, 90_000), vec![0x5A; 64]).with_pts(90_000);
+                mx.write_packet(&p).unwrap();
+            }
+            mx.write_trailer().unwrap();
+        }
+        sink.into_bytes()
+    }
+
+    /// The first PMT of a muxed stream.
+    fn first_pmt(bytes: &[u8]) -> crate::ProgramMapTable {
+        let mut asm = crate::PsiSectionAssembler::new();
+        for pkt in crate::packet::iter_packets(bytes).flatten() {
+            if pkt.pid == 0x0100
+                && let Ok(sections) =
+                    asm.feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+                && let Some(section) = sections.first()
+            {
+                return crate::ProgramMapTable::parse(section).expect("PMT");
+            }
+        }
+        panic!("no PMT");
+    }
+
+    /// §2.6.8: a program using the HDMV stream_type assignments says so
+    /// with a registration descriptor; one that stays inside Table 2-34
+    /// (plus the ATSC AC-3 value) carries none.
+    #[test]
+    fn user_private_stream_types_are_registered() {
+        let hdmv = |codecs: &[&str]| {
+            let streams: Vec<StreamInfo> = codecs
+                .iter()
+                .enumerate()
+                .map(|(i, c)| stream_info(i as u32, c, i == 0))
+                .collect();
+            let pmt = first_pmt(&mux_one_frame_each(&streams, Vec::new()));
+            pmt.iter_program_descriptors().flatten().any(|d| {
+                matches!(
+                    d.body,
+                    crate::DescriptorBody::Registration {
+                        format_identifier: [b'H', b'D', b'M', b'V'],
+                        ..
+                    }
+                )
+            })
+        };
+        assert!(hdmv(&["h264", "pcm_s16be"]));
+        assert!(hdmv(&["h264", "dts"]));
+        assert!(hdmv(&["h264", "hdmv_pgs_subtitle"]));
+        assert!(!hdmv(&["h264", "ac3", "aac", "mp2"]));
+        assert!(!hdmv(&["h265", "aac_latm"]));
+    }
+
+    /// DVB carriage on private-data PES: chosen by the descriptor the
+    /// caller hands in, defaulted for subtitles and teletext, and read
+    /// back as the same codecs.
+    #[test]
+    fn dvb_private_pes_carriage_round_trips() {
+        let mut streams = vec![
+            stream_info(0, "h264", true),
+            stream_info(1, "dts", false),
+            stream_info(2, "ac3", false),
+            stream_info(3, "dvb_subtitle", false),
+            stream_info(4, "dvb_teletext", false),
+            stream_info(5, "dts", false),
+        ];
+        streams[3].params = CodecParameters::subtitle(CodecId::new("dvb_subtitle"));
+        streams[3].params.language = Some("fra".into());
+        streams[4].params = CodecParameters::subtitle(CodecId::new("dvb_teletext"));
+        let source_loop = [
+            // A source loop passed on whole: its stream_identifier and
+            // language descriptors are replaced by the muxer's own.
+            vec![0x52, 1, 0x77],
+            crate::build::iso639_language_descriptor(&[(*b"deu", 0)]),
+            vec![0x7B, 5, 0x12, 0x34, 0x56, 0x78, 0x9A],
+        ]
+        .concat();
+        let bytes = mux_one_frame_each(&streams, vec![(1, source_loop), (2, vec![0x6A, 1, 0x00])]);
+        let pmt = first_pmt(&bytes);
+        let types: Vec<u8> = pmt.streams.iter().map(|e| e.stream_type).collect();
+        assert_eq!(types, [0x1B, 0x06, 0x06, 0x06, 0x06, 0x82]);
+        let tags = |k: usize| -> Vec<u8> {
+            pmt.streams[k]
+                .iter_descriptors()
+                .flatten()
+                .map(|d| d.tag)
+                .collect()
+        };
+        assert_eq!(tags(1), [0x52, 0x7B]);
+        assert_eq!(tags(2), [0x52, 0x6A]);
+        assert_eq!(tags(3), [0x52, 0x0A, 0x59]);
+        assert_eq!(tags(4), [0x52, 0x56]);
+        assert_eq!(
+            pmt.streams[3].descriptors[pmt.streams[3].descriptors.len() - 8..],
+            [b'f', b'r', b'a', 0x10, 0, 1, 0, 1]
+        );
+
+        use oxideav_core::Demuxer as _;
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        let dmx = crate::demuxer::MpegTsDemuxer::new(input).expect("open");
+        let codecs: Vec<&str> = dmx
+            .streams()
+            .iter()
+            .map(|s| s.params.codec_id.as_str())
+            .collect();
+        assert_eq!(
+            codecs,
+            ["h264", "dts", "ac3", "dvb_subtitle", "dvb_teletext", "dts"]
+        );
+        assert_eq!(dmx.pmt_entry(1).unwrap().stream_type, 0x06);
+        assert_eq!(dmx.pmt_entry(3).unwrap().descriptors.len(), 3 + 6 + 10);
+        assert!(dmx.pmt_entry(9).is_none());
+    }
+
+    /// A frame with a decoding time and no presentation time cannot
+    /// code either (Table 2-21): it is written without time stamps.
+    #[test]
+    fn decoding_time_alone_is_written_without_time_stamps() {
+        let streams = vec![stream_info(0, "h264", true)];
+        let sink = SharedSink::new();
+        {
+            let output: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+            let mut mx = MpegTsMuxer::new(output, &streams).expect("open");
+            mx.write_header().unwrap();
+            let tb = TimeBase::new(1, 90_000);
+            mx.write_packet(
+                &Packet::new(0, tb, vec![1; 40])
+                    .with_pts(9000)
+                    .with_dts(5400),
+            )
+            .unwrap();
+            mx.write_packet(&Packet::new(0, tb, vec![2; 40]).with_dts(9000))
+                .unwrap();
+            mx.write_packet(
+                &Packet::new(0, tb, vec![3; 40])
+                    .with_pts(16_200)
+                    .with_dts(12_600),
+            )
+            .unwrap();
+            mx.write_trailer().unwrap();
+        }
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(sink.into_bytes()));
+        let mut dmx = crate::demuxer::open(input, &oxideav_core::NullCodecResolver).unwrap();
+        let mut got = Vec::new();
+        while let Ok(p) = dmx.next_packet() {
+            got.push((p.pts, p.dts, p.data[0]));
+        }
+        assert_eq!(
+            got,
+            [
+                (Some(9000), Some(5400), 1),
+                (None, None, 2),
+                (Some(16_200), Some(12_600), 3)
+            ]
+        );
+    }
+
     /// Build a tiny TS file via the muxer and round-trip it through
     /// the demuxer in the same crate.
     #[test]
@@ -2586,6 +2822,17 @@ mod tests {
             Some((0x01, 0xE0, true))
         );
         assert_eq!(stream_type_for_codec("mpeg4"), Some((0x10, 0xE0, true)));
+        assert_eq!(
+            stream_type_for_codec("mpeg4video"),
+            Some((0x10, 0xE0, true))
+        );
+        assert_eq!(stream_type_for_codec("h265"), stream_type_for_codec("hevc"));
+        assert_eq!(stream_type_for_codec("h266"), Some((0x33, 0xE0, true)));
+        assert_eq!(stream_type_for_codec("aac_latm"), Some((0x11, 0xC0, false)));
+        assert_eq!(
+            stream_type_for_codec("dvb_subtitle"),
+            Some((0x06, 0xBD, false))
+        );
         assert_eq!(stream_type_for_codec("jpeg2000"), Some((0x21, 0xE0, true)));
 
         let streams = vec![stream_info(0, "h264", true), stream_info(1, "mp2", false)];
