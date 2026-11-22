@@ -282,11 +282,19 @@ The streaming path of `MpegTsDemuxer` skips damage and keeps going;
 The PAT and the selected program's PMT are followed while streaming:
 when the program moves to another `program_map_PID`, or its PMT assigns
 different elementary PIDs or a different `PCR_PID` (spliced captures, a
-remultiplexed service), every stream is re-pointed at the first
-not-yet-taken PMT entry of its codec and the PES packet in flight on
-the old PID is handed out first (`program_map_changes`). The stream
-list is fixed at open — a stream whose codec the new PMT no longer
-lists stops, entries beyond the opened set are not picked up.
+remultiplexed service), the streams are re-pointed and the PES packet in flight on
+the old PID is handed out first (`program_map_changes`). A stream
+keeps the entry on its PID when that still names its codec, so a map
+that merely lists the same streams in another order moves nothing; a
+stream whose codec the new PMT no longer lists stops.
+
+Streams a later PMT **adds**: the program maps in the first 8 MiB are
+read at open, and an elementary stream one of them adds is in the
+stream list from the start (its packets begin where its map takes
+effect). Past that window the list stays as opened — `streams()` never
+changes behind a consumer's back — unless
+`MpegTsDemuxer::set_admit_new_streams(true)` lets it grow
+(`TsDemuxStats::streams_added`).
 
 Memory is bounded whatever the input: the per-PID PES ceiling above,
 4096 bytes per section assembler, 4 M entries in the access-point

@@ -136,6 +136,20 @@ impl TsBuilder {
         self.section(0x1000, &build_pmt(1, 0, pcr_pid, &[], entries));
     }
 
+    /// A later version of program 1's map, PCR on `pcr_pid`.
+    pub(crate) fn map_version(&mut self, version: u8, pcr_pid: u16, entries: &[PmtStreamEntry]) {
+        self.section(0x1000, &build_pmt(1, version, pcr_pid, &[], entries));
+    }
+
+    /// `count` null packets.
+    pub(crate) fn nulls(&mut self, count: usize) {
+        for _ in 0..count {
+            let mut pkt = [0xFFu8; TS_PACKET_LEN];
+            pkt[..4].copy_from_slice(&[TS_SYNC_BYTE, 0x1F, 0xFF, 0x10]);
+            self.out.extend_from_slice(&pkt);
+        }
+    }
+
     /// One PES packet, split over as many transport packets as needed.
     /// `indicator` sets the `random_access_indicator` on the first.
     pub(crate) fn pes(
@@ -482,4 +496,117 @@ fn dts_and_loas_headers_reject_what_the_tables_forbid() {
     // A frame cut right behind its length field still sizes.
     let head = crate::parse_loas_header(&[0x56, 0xE0, 0x10]).unwrap();
     assert_eq!((head.frame_len, head.sample_rate), (19, 0));
+}
+
+const LANGUAGE_ENG: [u8; 6] = [0x0A, 4, b'e', b'n', b'g', 0];
+const LANGUAGE_FRA: [u8; 6] = [0x0A, 4, b'f', b'r', b'a', 0];
+
+/// A program map early in the stream adds an elementary stream: it is
+/// in the stream list from the start, and its packets begin where the
+/// map takes effect.
+#[test]
+fn stream_added_by_an_early_map_is_listed_at_open() {
+    let video = entry(0x1B, 0x100, &[]);
+    let audio = entry(0x03, 0x101, &LANGUAGE_FRA);
+    let mut ts = TsBuilder::default();
+    ts.tables(std::slice::from_ref(&video));
+    ts.pes(0x100, 0xE0, Some(9000), None, &[1; 20], true);
+    // Not yet announced: not this program's.
+    ts.pes(0x101, 0xC0, Some(9000), None, &mp2_frame(1), false);
+    ts.map_version(1, 0x100, &[video, audio]);
+    ts.pes(0x100, 0xE0, Some(12_600), None, &[2; 20], false);
+    ts.pes(0x101, 0xC0, Some(11_160), None, &mp2_frame(2), false);
+    ts.pes(0x101, 0xC0, Some(13_320), None, &mp2_frame(3), false);
+    let mut d = open(ts.out);
+    assert_eq!(d.streams().len(), 2);
+    assert_eq!(d.streams()[1].params.codec_id.as_str(), "mp2");
+    assert_eq!(d.streams()[1].params.language.as_deref(), Some("fra"));
+    let pk = drain(&mut d);
+    let audio: Vec<Option<i64>> = pk
+        .iter()
+        .filter(|p| p.stream_index == 1)
+        .map(|p| p.pts)
+        .collect();
+    assert_eq!(audio, [Some(11_160), Some(13_320)]);
+    assert_eq!(pk.iter().filter(|p| p.stream_index == 0).count(), 2);
+    assert_eq!(d.stats().streams_added, 0);
+}
+
+/// Past the look-ahead window the stream list stays as opened unless
+/// the caller lets it grow.
+#[test]
+fn stream_added_by_a_late_map_needs_admission() {
+    let video = entry(0x1B, 0x100, &[]);
+    let audio = entry(0x81, 0x101, &LANGUAGE_ENG);
+    let mut ts = TsBuilder::default();
+    ts.tables(std::slice::from_ref(&video));
+    ts.pes(0x100, 0xE0, Some(9000), None, &[1; 20], true);
+    ts.nulls((8 << 20) / TS_PACKET_LEN + 8);
+    ts.map_version(1, 0x100, &[video, audio]);
+    ts.pes(0x101, 0xBD, Some(11_160), None, &[7; 50], false);
+    ts.pes(0x100, 0xE0, Some(12_600), None, &[2; 20], false);
+
+    let mut fixed = open(ts.out.clone());
+    assert_eq!(fixed.streams().len(), 1);
+    let pk = drain(&mut fixed);
+    assert!(pk.iter().all(|p| p.stream_index == 0));
+    assert_eq!(fixed.streams().len(), 1);
+
+    let mut growing = open(ts.out);
+    growing.set_admit_new_streams(true);
+    let pk = drain(&mut growing);
+    assert_eq!(growing.streams().len(), 2);
+    assert_eq!(growing.streams()[1].params.codec_id.as_str(), "ac3");
+    assert_eq!(growing.streams()[1].params.language.as_deref(), Some("eng"));
+    assert_eq!(growing.stats().streams_added, 1);
+    let added: Vec<&Packet> = pk.iter().filter(|p| p.stream_index == 1).collect();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].data, [7; 50]);
+}
+
+/// A map that lists the same streams in another order moves nothing:
+/// each stream keeps the entry on its PID.
+#[test]
+fn reordered_map_keeps_streams_on_their_pids() {
+    let video = entry(0x1B, 0x100, &[]);
+    let eng = entry(0x03, 0x101, &LANGUAGE_ENG);
+    let fra = entry(0x03, 0x102, &LANGUAGE_FRA);
+    let mut ts = TsBuilder::default();
+    ts.tables(&[video.clone(), eng.clone(), fra.clone()]);
+    ts.pes(0x100, 0xE0, Some(9000), None, &[1; 20], true);
+    ts.pes(0x101, 0xC0, Some(9000), None, &mp2_frame(0x10), false);
+    ts.pes(0x102, 0xC0, Some(9000), None, &mp2_frame(0x20), false);
+    ts.map_version(1, 0x100, &[fra, eng, video]);
+    ts.pes(0x101, 0xC0, Some(11_160), None, &mp2_frame(0x11), false);
+    ts.pes(0x102, 0xC0, Some(11_160), None, &mp2_frame(0x21), false);
+    let mut d = open(ts.out);
+    assert_eq!(d.streams().len(), 3);
+    let pk = drain(&mut d);
+    let fills = |index: u32| -> Vec<u8> {
+        pk.iter()
+            .filter(|p| p.stream_index == index)
+            .map(|p| p.data[100])
+            .collect()
+    };
+    assert_eq!(fills(1), [0x10, 0x11]);
+    assert_eq!(fills(2), [0x20, 0x21]);
+}
+
+/// A private-data PES stream identified by its payload stays routed
+/// across a new map version that still lists it without a descriptor.
+#[test]
+fn payload_identified_stream_survives_a_new_map_version() {
+    let entries = [entry(0x1B, 0x100, &[]), entry(0x06, 0x101, &[])];
+    let mut ts = TsBuilder::default();
+    ts.tables(&entries);
+    ts.pes(0x100, 0xE0, Some(9000), None, &[1; 20], true);
+    let pair = |fill: u8| [mp2_frame(fill), mp2_frame(fill + 1)].concat();
+    ts.pes(0x101, 0xBD, Some(9000), None, &pair(0x30), false);
+    // Same streams, the PCR moves to the audio PID.
+    ts.map_version(1, 0x101, &entries);
+    ts.pes(0x101, 0xBD, Some(13_320), None, &pair(0x40), false);
+    let mut d = open(ts.out);
+    let pk = drain(&mut d);
+    assert_eq!(d.stats().program_map_changes, 1);
+    assert_eq!(pk.iter().filter(|p| p.stream_index == 1).count(), 4);
 }

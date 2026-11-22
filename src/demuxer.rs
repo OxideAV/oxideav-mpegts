@@ -109,6 +109,9 @@ pub struct TsDemuxStats {
     /// elementary PIDs or a different `PCR_PID` — and the demuxer
     /// re-pointed its streams (see [`MpegTsDemuxer`]).
     pub program_map_changes: u64,
+    /// Streams a program map met while streaming added to the stream
+    /// list (only with [`MpegTsDemuxer::set_admit_new_streams`]).
+    pub streams_added: u64,
 }
 
 /// Bytes read from the input per block. Large enough that a plain
@@ -440,10 +443,8 @@ struct PidSlot {
     /// `false` once a later PMT no longer lists a stream of this
     /// slot's codec: no PID routes here any more.
     mapped: bool,
-    /// Codec the PMT entry names (before any refinement from the
-    /// elementary stream) — what a later PMT's entries are matched on.
-    pmt_codec: CodecId,
-    /// The PMT entry this stream was opened from.
+    /// The PMT entry this stream was opened from; what it names is
+    /// what a later PMT's entries are matched on.
     pmt_entry: crate::PmtStream,
     reassembler: PesReassembler,
     /// 33-bit PTS / DTS unwrappers (§2.4.3.7) onto one monotonic
@@ -466,7 +467,25 @@ struct PidSlot {
     damaged: bool,
 }
 
+/// What a later program map's entries are matched against for one
+/// stream.
+#[derive(Debug, Clone)]
+struct SlotKey {
+    /// Codec the stream's own map entry names, `None` for a
+    /// private-data PES stream identified by its payload.
+    codec: Option<CodecId>,
+    /// PID the stream is on under the map in effect, if any.
+    pid: Option<u16>,
+}
+
 impl PidSlot {
+    fn key(&self) -> SlotKey {
+        SlotKey {
+            codec: pmt_entry_codec(&self.pmt_entry).map(|p| p.codec_id),
+            pid: self.mapped.then_some(self.pid),
+        }
+    }
+
     /// Void everything that depends on stream position.
     fn rehome(&mut self, time_hint: Option<u64>) {
         self.reassembler.reset();
@@ -507,12 +526,18 @@ impl PidSlot {
 /// streaming. When the PAT moves the program to another
 /// `program_map_PID`, or the PMT assigns different elementary PIDs or a
 /// different `PCR_PID` (spliced captures, a remultiplexed service), each
-/// stream is re-pointed at the first not-yet-taken PMT entry of its
-/// codec, in order; the PES packet in flight on the old PID is handed
-/// out first. The stream list itself is fixed at open: a stream whose
-/// codec the new PMT no longer lists simply stops, and entries beyond
-/// the opened set are not picked up. [`TsDemuxStats::program_map_changes`]
-/// counts the changes.
+/// stream keeps the entry on its PID when that still names its codec
+/// and otherwise takes the first not-yet-taken entry of its codec; the
+/// PES packet in flight on the old PID is handed out first. A stream
+/// whose codec the new PMT no longer lists stops.
+/// [`TsDemuxStats::program_map_changes`] counts the changes.
+///
+/// Streams a later PMT **adds**: the program maps in the first 8 MiB
+/// are read at open, and an entry one of them adds is in the stream
+/// list from the start (its packets begin where its map takes effect;
+/// its parameters are the ones the map's descriptors give). Beyond
+/// that window the list stays as opened unless
+/// [`Self::set_admit_new_streams`] allows it to grow.
 pub struct MpegTsDemuxer {
     reader: PacketReader,
     /// Every non-network program the PAT advertised, in PAT order. The
@@ -580,6 +605,11 @@ pub struct MpegTsDemuxer {
     /// Every read strips the framing down to the logical 188-byte
     /// window.
     layout: crate::packet::TsPacketLayout,
+    /// In-flight PES ceiling each stream's reassembler was given.
+    per_pid_bytes: usize,
+    /// Whether a program map met while streaming may add streams (see
+    /// [`Self::set_admit_new_streams`]).
+    admit_new_streams: bool,
 }
 
 /// How an access point announced itself on the wire — the two
@@ -888,7 +918,6 @@ impl MpegTsDemuxer {
             .map(|e| e.elementary_pid & 0x1FFF)
             .collect();
         let sniffed = sniff_private_audio(&mut reader, &undescribed);
-        let tb = TimeBase::new(1, 90_000);
         let mut streams: Vec<StreamInfo> = Vec::new();
         let mut pid_slot = vec![0u16; PID_SPACE].into_boxed_slice();
         let mut slots: Vec<PidSlot> = Vec::new();
@@ -897,58 +926,73 @@ impl MpegTsDemuxer {
                 .iter()
                 .find(|(pid, _)| *pid == pmt_stream.elementary_pid & 0x1FFF)
                 .map(|&(_, id)| CodecParameters::audio(CodecId::new(id)));
-            let mut params = match pmt_entry_codec(pmt_stream).or(by_payload) {
+            let params = match pmt_entry_codec(pmt_stream).or(by_payload) {
                 Some(p) => p,
                 None => continue,
             };
-            let pmt_codec = params.codec_id.clone();
-            apply_descriptor_params(&mut params, pmt_stream);
-            let syntax = if StreamType::from_raw(pmt_stream.stream_type) == StreamType::AacAdts {
-                Some(crate::AudioSyntax::AacAdts)
-            } else {
-                crate::es_params::audio_syntax_for(params.codec_id.as_str())
-            };
-            // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
-            // §2.6.18) into the per-stream language tag so a demux →
-            // remux path keeps each track's audio/subtitle language.
-            // The first language entry wins (multi-language audio is
-            // rare and a single tag is what the core surface holds).
-            if params.language.is_none()
-                && let Some(code) = first_iso639_language(pmt_stream)
-            {
-                params = params.with_language(code);
-            }
-            let idx = streams.len() as u32;
-            streams.push(StreamInfo {
-                index: idx,
-                time_base: tb,
-                duration: None,
-                start_time: None,
-                params,
-            });
-            let pid = pmt_stream.elementary_pid & 0x1FFF;
+            let (info, slot) = open_entry(pmt_stream, params, streams.len() as u32, true);
             // A PID listed twice keeps its last entry, as a map would.
-            pid_slot[pid as usize] = idx as u16 + 1;
-            slots.push(PidSlot {
-                pid,
-                mapped: true,
-                pmt_codec,
-                pmt_entry: pmt_stream.clone(),
-                reassembler: PesReassembler::new(),
-                pts: NearestEpochUnwrap::default(),
-                dts: NearestEpochUnwrap::default(),
-                splitter: syntax.map(crate::AudioFrameSplitter::new),
-                last_cc: None,
-                duplicate_seen: false,
-                last_payload: Default::default(),
-                damaged: false,
-            });
+            pid_slot[slot.pid as usize] = info.index as u16 + 1;
+            streams.push(info);
+            slots.push(slot);
         }
         if streams.is_empty() {
             return Err(CoreError::invalid(
                 "mpegts: PMT advertised no streams we recognise (BD-relevant types: \
                  0x02/0x1B/0x24/0xEA video, 0x80-0x86 audio, 0x90/0x92 subtitle)",
             ));
+        }
+        // Streams a later program map adds: the maps within the
+        // look-ahead window are read now, so that the stream list is
+        // complete from the start for a stream whose program gains an
+        // elementary stream early on. Each added stream starts
+        // unrouted and is pointed at its PID when streaming reaches the
+        // map that lists it.
+        {
+            let mut known: Vec<SlotKey> = slots.iter().map(PidSlot::key).collect();
+            let mut watch = PsiSectionAssembler::new();
+            reader.seek(0);
+            while reader.position() < PARAM_PROBE_BYTES && streams.len() < MAX_STREAMS {
+                let Ok(Some((_, raw))) = reader.next_packet() else {
+                    break;
+                };
+                let Ok(pkt) = TsPacket::parse(&raw) else {
+                    continue;
+                };
+                if pkt.pid != pmt_pid || pkt.payload.is_empty() || pkt.transport_error {
+                    continue;
+                }
+                let Ok(sections) =
+                    watch.feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+                else {
+                    continue;
+                };
+                for section in &sections {
+                    let Ok(later) = ProgramMapTable::parse(section) else {
+                        continue;
+                    };
+                    if later.program_number != selected_program || !later.current_next_indicator {
+                        continue;
+                    }
+                    let (targets, extra) = assign_entries(&known, &later);
+                    for (key, target) in known.iter_mut().zip(&targets) {
+                        key.pid = target.map(|k| later.streams[k].elementary_pid & 0x1FFF);
+                    }
+                    for k in extra {
+                        let entry = &later.streams[k];
+                        let Some(params) = pmt_entry_codec(entry) else {
+                            continue;
+                        };
+                        if streams.len() >= MAX_STREAMS {
+                            break;
+                        }
+                        let (info, slot) = open_entry(entry, params, streams.len() as u32, false);
+                        known.push(slot.key());
+                        streams.push(info);
+                        slots.push(slot);
+                    }
+                }
+            }
         }
         // Share the in-flight budget between the PIDs.
         let per_pid = (MAX_INFLIGHT_BYTES / slots.len()).min(crate::pes::DEFAULT_MAX_PES_BYTES);
@@ -978,6 +1022,8 @@ impl MpegTsDemuxer {
             last_pcr: None,
             rap_index: None,
             layout,
+            per_pid_bytes: per_pid,
+            admit_new_streams: false,
         };
 
         // Probe the stream parameters and the container duration from
@@ -1004,6 +1050,17 @@ impl MpegTsDemuxer {
         }
 
         Ok(demuxer)
+    }
+
+    /// Let a program map met while streaming add streams. Off by
+    /// default: [`Demuxer::streams`] then never changes after open
+    /// (streams a map within the first 8 MiB adds are already in the
+    /// list, see the type docs). When on, an entry of a later map that
+    /// no stream takes is appended as a new stream — `streams()` grows
+    /// and packets carry the new index —
+    /// and [`TsDemuxStats::streams_added`] counts it.
+    pub fn set_admit_new_streams(&mut self, admit: bool) {
+        self.admit_new_streams = admit;
     }
 
     /// The program map entry stream `stream_index` was opened from: its
@@ -2085,28 +2142,21 @@ impl MpegTsDemuxer {
         }
     }
 
-    /// Re-point every stream at the first not-yet-taken entry of its
-    /// codec in `pmt`.
+    /// Re-point every stream at its entry in `pmt` (see
+    /// [`assign_entries`]); entries no stream takes become new streams
+    /// when that is allowed.
     fn apply_program_map(&mut self, pmt: &ProgramMapTable, entries: Vec<(u8, u16)>) {
         self.stats.program_map_changes += 1;
-        let codecs: Vec<Option<CodecId>> = pmt
-            .streams
+        let keys: Vec<SlotKey> = self.slots.iter().map(PidSlot::key).collect();
+        let (targets, extra) = assign_entries(&keys, pmt);
+        let target: Vec<Option<u16>> = targets
             .iter()
-            .map(|e| pmt_entry_codec(e).map(|p| p.codec_id))
+            .map(|t| t.map(|k| pmt.streams[k].elementary_pid & 0x1FFF))
             .collect();
-        let mut taken = vec![false; codecs.len()];
-        let mut target: Vec<Option<u16>> = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
-            let hit = (0..codecs.len())
-                .find(|&k| !taken[k] && codecs[k].as_ref() == Some(&slot.pmt_codec));
-            if let Some(k) = hit {
-                taken[k] = true;
-            }
-            target.push(hit.map(|k| pmt.streams[k].elementary_pid & 0x1FFF));
-        }
         for (i, new_pid) in target.iter().enumerate() {
             let slot = &mut self.slots[i];
-            let unchanged = slot.mapped && *new_pid == Some(slot.pid);
+            let unchanged = slot.mapped == new_pid.is_some()
+                && (new_pid.is_none() || *new_pid == Some(slot.pid));
             if unchanged {
                 continue;
             }
@@ -2129,6 +2179,24 @@ impl MpegTsDemuxer {
                 }
                 Ok(None) => {}
                 Err(_) => self.stats.damaged_pes += 1,
+            }
+        }
+        if self.admit_new_streams {
+            for k in extra {
+                let entry = &pmt.streams[k];
+                let Some(params) = pmt_entry_codec(entry) else {
+                    continue;
+                };
+                if self.streams.len() >= MAX_STREAMS {
+                    break;
+                }
+                let (mut info, mut slot) =
+                    open_entry(entry, params, self.streams.len() as u32, true);
+                info.duration = self.streams.first().and_then(|s| s.duration);
+                slot.reassembler = PesReassembler::new().with_max_bytes(self.per_pid_bytes);
+                self.streams.push(info);
+                self.slots.push(slot);
+                self.stats.streams_added += 1;
             }
         }
         // Old entries are cleared above before any new one is set, so
@@ -2326,6 +2394,99 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
         }
     }
     None
+}
+
+/// Ceiling on the streams of one demuxer, however many entries later
+/// program maps bring.
+const MAX_STREAMS: usize = 256;
+
+/// The stream record and demux state for one program map entry.
+/// `mapped` is `false` for a stream whose map is not yet in effect.
+fn open_entry(
+    entry: &crate::PmtStream,
+    mut params: CodecParameters,
+    index: u32,
+    mapped: bool,
+) -> (StreamInfo, PidSlot) {
+    apply_descriptor_params(&mut params, entry);
+    let syntax = if StreamType::from_raw(entry.stream_type) == StreamType::AacAdts {
+        Some(crate::AudioSyntax::AacAdts)
+    } else {
+        crate::es_params::audio_syntax_for(params.codec_id.as_str())
+    };
+    // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
+    // §2.6.18) into the per-stream language tag so a demux → remux
+    // path keeps each track's audio/subtitle language. The first
+    // language entry wins (multi-language audio is rare and a single
+    // tag is what the core surface holds).
+    if params.language.is_none()
+        && let Some(code) = first_iso639_language(entry)
+    {
+        params = params.with_language(code);
+    }
+    let info = StreamInfo {
+        index,
+        time_base: TimeBase::new(1, 90_000),
+        duration: None,
+        start_time: None,
+        params,
+    };
+    let slot = PidSlot {
+        pid: entry.elementary_pid & 0x1FFF,
+        mapped,
+        pmt_entry: entry.clone(),
+        reassembler: PesReassembler::new(),
+        pts: NearestEpochUnwrap::default(),
+        dts: NearestEpochUnwrap::default(),
+        splitter: syntax.map(crate::AudioFrameSplitter::new),
+        last_cc: None,
+        duplicate_seen: false,
+        last_payload: Default::default(),
+        damaged: false,
+    };
+    (info, slot)
+}
+
+/// Match the streams described by `keys` to the entries of `pmt`.
+///
+/// A stream keeps the entry on its current PID when that entry still
+/// names its codec; otherwise it takes the first entry of its codec no
+/// other stream has (a private-data PES stream identified by its
+/// payload takes an entry that, like its own, no descriptor names).
+/// Returns the entry index per stream — `None` for a stream the map no
+/// longer lists — and the entries no stream took, in map order.
+fn assign_entries(keys: &[SlotKey], pmt: &ProgramMapTable) -> (Vec<Option<usize>>, Vec<usize>) {
+    let codecs: Vec<Option<CodecId>> = pmt
+        .streams
+        .iter()
+        .map(|e| pmt_entry_codec(e).map(|p| p.codec_id))
+        .collect();
+    let fits = |key: &SlotKey, k: usize| match &key.codec {
+        Some(c) => codecs[k].as_ref() == Some(c),
+        None => codecs[k].is_none() && pmt.streams[k].stream_type == 0x06,
+    };
+    let mut taken = vec![false; codecs.len()];
+    let mut targets: Vec<Option<usize>> = vec![None; keys.len()];
+    for (key, target) in keys.iter().zip(&mut targets) {
+        let Some(pid) = key.pid else { continue };
+        let same = (0..codecs.len())
+            .find(|&k| !taken[k] && pmt.streams[k].elementary_pid & 0x1FFF == pid && fits(key, k));
+        if let Some(k) = same {
+            taken[k] = true;
+            *target = Some(k);
+        }
+    }
+    for (key, target) in keys.iter().zip(&mut targets) {
+        if target.is_some() {
+            continue;
+        }
+        if let Some(k) = (0..codecs.len()).find(|&k| !taken[k] && fits(key, k)) {
+            taken[k] = true;
+            *target = Some(k);
+        }
+    }
+    let extra = (0..codecs.len()).filter(|&k| !taken[k]).collect();
+    (targets, extra)
 }
 
 /// Input bytes examined while identifying private-data PES streams by

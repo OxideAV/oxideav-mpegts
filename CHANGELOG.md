@@ -26,6 +26,11 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   identifiers, next to the AC-3 ones; one that no descriptor names is
   identified by its payload when that frames as MPEG audio, AC-3, AAC
   (ADTS / LATM) or DTS.
+- Streams added by a later program map: the maps in the first 8 MiB
+  are read at open and an elementary stream one of them adds is in the
+  stream list from the start; past that window
+  `MpegTsDemuxer::set_admit_new_streams(true)` lets the list grow while
+  streaming (`TsDemuxStats::streams_added`).
 - `tests/blackbox_matrix.rs` — 64 files from a black-box multiplexer
   compared packet by packet with a black-box reader, each remuxed with
   this crate's writer and read back by it (skips without the tools).
@@ -52,6 +57,10 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Fixed
 
+- A program map that lists the same streams in another order no longer
+  swaps same-codec streams (each keeps the entry on its PID); a
+  private-data PES stream identified by its payload stays routed across
+  map versions.
 - Muxer: a program using the Blu-ray `stream_type` assignments (LPCM,
   DTS, TrueHD, E-AC-3 0x84, PGS, TextST) now carries the "HDMV"
   registration descriptor (§2.6.8); without it a reader took the LPCM

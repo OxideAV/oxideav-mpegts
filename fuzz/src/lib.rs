@@ -456,6 +456,8 @@ pub fn exercise_hostile(bytes: &[u8]) {
         oxideav_mpegts::AudioSyntax::Ac3,
         oxideav_mpegts::AudioSyntax::MpegAudio,
         oxideav_mpegts::AudioSyntax::AacAdts,
+        oxideav_mpegts::AudioSyntax::AacLoas,
+        oxideav_mpegts::AudioSyntax::Dts,
     ] {
         let mut sp = oxideav_mpegts::AudioFrameSplitter::new(syntax);
         let mut total = 0usize;
