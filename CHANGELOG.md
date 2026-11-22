@@ -26,12 +26,15 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   identifiers, next to the AC-3 ones; one that no descriptor names is
   identified by its payload when that frames as MPEG audio, AC-3, AAC
   (ADTS / LATM) or DTS.
+- Program-stream seeking: `MpegPsDemuxer::seek_to` lands on the last
+  key frame at or before the target (SCR bisection over the pack
+  headers, then a forward read; any audio frame is an entry point).
 - Streams added by a later program map: the maps in the first 8 MiB
   are read at open and an elementary stream one of them adds is in the
   stream list from the start; past that window
   `MpegTsDemuxer::set_admit_new_streams(true)` lets the list grow while
   streaming (`TsDemuxStats::streams_added`).
-- `tests/blackbox_matrix.rs` — 64 files from a black-box multiplexer
+- `tests/blackbox_matrix.rs` — 65 files from a black-box multiplexer
   compared packet by packet with a black-box reader, each remuxed with
   this crate's writer and read back by it (skips without the tools).
 - `MpegTsDemuxer::new` (first program, concrete type) and

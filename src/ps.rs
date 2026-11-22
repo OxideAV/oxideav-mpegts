@@ -496,7 +496,7 @@ impl MpegPsDemuxer {
                     self.streams[idx as usize].params.media_type != oxideav_core::MediaType::Video;
                 let pts = pts.or(st.pcm_next);
                 if let (Some(t), Some(rate)) = (pts, st.pcm_rate) {
-                    st.pcm_next = Some(t + payload.len() as i64 * 90_000 / rate);
+                    st.pcm_next = Some(t.saturating_add(payload.len() as i64 * 90_000 / rate));
                 }
                 let mut p = Packet::new(idx, tb, payload.to_vec()).with_keyframe(key);
                 if let Some(t) = pts {
@@ -542,9 +542,166 @@ fn audio_packet(idx: u32, f: crate::AudioFrame) -> Packet {
     p
 }
 
+/// Bytes read around a probe offset while looking for a pack header.
+const SEEK_PROBE_BYTES: usize = 256 << 10;
+
+/// How far ahead of its presentation a seek first looks for a key
+/// frame, in 90 kHz ticks: the §2.5.2.3 P-STD delay bound (one second)
+/// plus half a second of pictures. Doubled while nothing is found.
+const SEEK_LEAD_90K: i64 = 135_000;
+
+impl MpegPsDemuxer {
+    /// Offset and SCR base (90 kHz) of the first pack header at or
+    /// after `from`.
+    fn pack_from(&mut self, from: u64) -> Option<(u64, i64)> {
+        self.input.seek(SeekFrom::Start(from)).ok()?;
+        let mut window = vec![0u8; SEEK_PROBE_BYTES];
+        let mut filled = 0;
+        while filled < window.len() {
+            match self.input.read(&mut window[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        let window = &window[..filled];
+        let at = (0..window.len().saturating_sub(13))
+            .find(|&i| window[i..i + 4] == [0, 0, 1, PACK_START] && window[i + 4] & 0xC0 == 0x40)?;
+        let scr = find_scr(&window[at..], false)?;
+        Some((from + at as u64, (scr / 300) as i64))
+    }
+
+    /// Start reading at `offset` (a pack header, or 0) as if the stream
+    /// began there, with every time stamp unwrapped next to `hint`.
+    fn reposition(&mut self, offset: u64, hint: i64) -> CoreResult<()> {
+        self.input
+            .seek(SeekFrom::Start(offset))
+            .map_err(CoreError::Io)?;
+        self.buf.clear();
+        self.pos = 0;
+        self.drained = offset;
+        self.eof = false;
+        self.flushed = false;
+        self.pending.clear();
+        // Time stamps live on the 33-bit ring and are unwrapped next to
+        // the hint: a target outside the stream's own span must not
+        // move them to another turn of the ring.
+        let first = self
+            .streams
+            .iter()
+            .filter_map(|s| s.start_time)
+            .min()
+            .unwrap_or(0);
+        let span = self
+            .duration_micros
+            .map_or(1 << 32, |us| (us as i128 * 9 / 100) as i64);
+        let near = hint.clamp(first, first.saturating_add(span)).max(0) as u64;
+        for st in &mut self.states {
+            match &mut st.framing {
+                Framing::Audio(sp) => sp.reset(),
+                Framing::Video(v) => {
+                    let mut fresh = VideoAuSplitter::new(v.kind);
+                    fresh.period = v.period;
+                    *v = fresh;
+                }
+                Framing::Whole => {}
+            }
+            st.pts.seed(near);
+            st.dts.seed(near);
+            st.pcm_next = None;
+        }
+        Ok(())
+    }
+
+    /// The next packet of stream `index`, others dropped. `None` at end
+    /// of stream.
+    fn next_of(&mut self, index: u32) -> CoreResult<Option<Packet>> {
+        loop {
+            match self.next_packet() {
+                Ok(p) if p.stream_index == index => return Ok(Some(p)),
+                Ok(_) => {}
+                Err(CoreError::Eof) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 impl Demuxer for MpegPsDemuxer {
     fn format_name(&self) -> &str {
         "mpegps"
+    }
+
+    /// Land on the last key frame of `stream_index` at or before `pts`
+    /// (the first one of the stream when `pts` precedes it): a bisection
+    /// over the pack headers' SCR (§2.5.3.4) finds a pack far enough
+    /// ahead, and the stream is read forward from there. The next
+    /// packet of that stream is the key frame; other streams resume
+    /// from the same point in the multiplex.
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> CoreResult<i64> {
+        if stream_index as usize >= self.streams.len() {
+            return Err(CoreError::invalid(format!(
+                "mpegps: no stream {stream_index}"
+            )));
+        }
+        let len = self.input.seek(SeekFrom::End(0)).map_err(CoreError::Io)?;
+        let mut lead = SEEK_LEAD_90K;
+        loop {
+            // The last pack whose SCR is at or before `pts - lead`.
+            let want = pts.saturating_sub(lead);
+            let (mut lo, mut hi) = (0u64, len);
+            while hi - lo > SEEK_PROBE_BYTES as u64 / 2 {
+                let mid = lo + (hi - lo) / 2;
+                match self.pack_from(mid) {
+                    Some((at, scr)) if scr <= want && at < hi => lo = at.max(lo + 1),
+                    _ => hi = mid,
+                }
+            }
+            // A lead beyond any 33-bit time span means the whole
+            // stream.
+            let offset = match self.pack_from(lo) {
+                Some((at, scr)) if scr <= want && lead < 1 << 34 => at,
+                _ => 0,
+            };
+            // First pass: which key frame.
+            self.reposition(offset, pts)?;
+            let mut before = None;
+            let mut after = None;
+            while let Some(p) = self.next_of(stream_index)? {
+                let Some(t) = p.pts.or(p.dts) else { continue };
+                if !p.flags.keyframe {
+                    continue;
+                }
+                if t <= pts {
+                    before = Some(t);
+                } else {
+                    after = Some(t);
+                    break;
+                }
+            }
+            if before.is_none() && offset > 0 {
+                // A long group of pictures: start further back.
+                lead = lead.saturating_mul(2);
+                continue;
+            }
+            let Some(landing) = before.or(after) else {
+                return Err(CoreError::unsupported(
+                    "mpegps: the stream has no time-stamped key frame to seek to",
+                ));
+            };
+            // Second pass: stop on it.
+            self.reposition(offset, pts)?;
+            while let Some(p) = self.next_of(stream_index)? {
+                if p.flags.keyframe && p.pts.or(p.dts) == Some(landing) {
+                    self.pending.push_front(p);
+                    return Ok(landing);
+                }
+            }
+            return Err(CoreError::invalid(
+                "mpegps: key frame vanished between passes",
+            ));
+        }
     }
 
     fn streams(&self) -> &[StreamInfo] {
@@ -1100,7 +1257,7 @@ impl VideoAuSplitter {
                     && t > at
                     && self.period.is_none()
                 {
-                    self.period = Some((t - at) / units);
+                    self.period = Some(t.saturating_sub(at) / units);
                 }
                 self.coded = Some((t, 0));
             }
@@ -1108,7 +1265,7 @@ impl VideoAuSplitter {
                 // Annex D (timing model): an access unit following one
                 // with a coded time stamp decodes one period later.
                 if let (Some(prev), Some(step)) = (self.last_dts, self.period) {
-                    dts = Some(prev + step);
+                    dts = Some(prev.saturating_add(step));
                 }
             }
         }
@@ -1120,7 +1277,7 @@ impl VideoAuSplitter {
             // The frame a new group displays first (temporal_reference
             // 0) follows the last frame displayed so far.
             self.display_anchor = match (self.display_end, self.period) {
-                (Some(end), Some(step)) => Some((0, end + step)),
+                (Some(end), Some(step)) => Some((0, end.saturating_add(step))),
                 _ => None,
             };
         }
@@ -1131,7 +1288,7 @@ impl VideoAuSplitter {
                     // Modulo-1024 difference, taken as the nearer way
                     // round.
                     let d = (i64::from(tr) - i64::from(at) + 512).rem_euclid(1024) - 512;
-                    pts = Some(t + d * step);
+                    pts = Some(t.saturating_add(d.saturating_mul(step)));
                 }
                 _ => {}
             }
@@ -1298,6 +1455,85 @@ mod tests {
         out.extend(pack_header(90_000));
         out.extend([0, 0, 1, 0xB9]);
         out
+    }
+
+    /// 40 half-second groups — an intra picture and a predicted one,
+    /// 8 KiB each — with two audio frames per group.
+    fn build_long_ps() -> Vec<u8> {
+        let mut out = Vec::new();
+        for g in 0..40u64 {
+            let t = 90_000 + g * 45_000;
+            let mut es = vec![
+                0, 0, 1, 0xB3, 0x14, 0x00, 0xB4, 0x13, 0xFF, 0xFF, 0xE0, 0x18, //
+                0, 0, 1, 0xB8, 0, 0x08, 0, 0,
+            ];
+            for (tr, kind) in [(0u8, 1u8), (1, 2)] {
+                es.extend_from_slice(&[0, 0, 1, 0x00, 0x00, tr << 6 | kind << 3, 0xFF, 0xF8]);
+                es.extend_from_slice(&[0, 0, 1, 0x01]);
+                es.extend(std::iter::repeat_n(0x55 + g as u8, 8000));
+            }
+            out.extend(pack_header(t - 30_000));
+            out.extend(pes(0xE0, Some(t), &es));
+            out.extend(pack_header(t - 29_000));
+            let audio = [mp2_frame(g as u8), mp2_frame(g as u8 + 100)].concat();
+            out.extend(pes(0xC0, Some(t), &audio));
+        }
+        out.extend([0, 0, 1, 0xB9]);
+        out
+    }
+
+    #[test]
+    fn seek_lands_on_the_key_frame_at_or_before_the_target() {
+        let mut d = MpegPsDemuxer::new(Box::new(Cursor::new(build_long_ps()))).unwrap();
+        let key = |g: i64| 90_000 + g * 45_000;
+        for (target, group) in [
+            (key(17) + 1, 17),
+            (key(17), 17),
+            (key(17) - 1, 16),
+            (key(39) + 900_000, 39),
+            (0, 0),
+            (key(3) + 22_500, 3),
+            (key(30) + 44_999, 30),
+        ] {
+            assert_eq!(d.seek_to(0, target).unwrap(), key(group), "target {target}");
+            let first = d.next_packet().unwrap();
+            assert_eq!(first.stream_index, 0);
+            assert!(first.is_keyframe());
+            assert_eq!(first.pts, Some(key(group)));
+            assert_eq!(first.data[40], 0x55 + group as u8);
+            // The group's audio follows, then its predicted picture
+            // (complete once the next group begins).
+            let mut rest = Vec::new();
+            while let Ok(p) = d.next_packet() {
+                rest.push(p);
+                if rest.len() == 3 {
+                    break;
+                }
+            }
+            assert_eq!(rest[0].stream_index, 1);
+            assert_eq!(rest[0].pts, Some(key(group)));
+            assert_eq!(rest[0].data, mp2_frame(group as u8));
+            assert_eq!(rest[1].pts, Some(key(group) + 2160));
+            if group < 39 {
+                assert_eq!(rest[2].stream_index, 0);
+                assert_eq!(rest[2].pts, Some(key(group) + 3600));
+            }
+        }
+        // A target beyond any time stamp (found by the demux fuzz
+        // target: the interpolated times overflowed).
+        assert_eq!(d.seek_to(0, i64::MAX).unwrap(), key(39));
+        while d.next_packet().is_ok() {}
+        assert_eq!(d.seek_to(0, i64::MIN).unwrap(), key(0));
+        // Audio: every frame is an entry point.
+        assert_eq!(d.seek_to(1, key(20) + 2160).unwrap(), key(20) + 2160);
+        let first = loop {
+            let p = d.next_packet().unwrap();
+            if p.stream_index == 1 {
+                break p;
+            }
+        };
+        assert_eq!(first.data, mp2_frame(120));
+        assert!(d.seek_to(7, 0).is_err());
     }
 
     #[test]

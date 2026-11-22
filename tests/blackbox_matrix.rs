@@ -120,6 +120,7 @@ fn cases() -> Vec<Case> {
         case("hevc.ts", "v", "-c:v libx265 -x265-params log-level=none"),
         case("h264_1frame.ts", "v", "-frames:v 1 -c:v libx264"),
         case("m2v_long.ts", "V320x240@50", "-c:v mpeg2video -b:v 3M -g 25"),
+        case("m2v_long.vob", "V320x240@50", "-c:v mpeg2video -b:v 3M -g 25 -f vob"),
         // --- layouts
         case("m2ts.m2ts", "va", "-c:v libx264 -g 12 -bf 2 -c:a mp2 -ac 2 -mpegts_m2ts_mode 1"),
         case("pcr20.ts", "va", "-c:v libx264 -g 12 -bf 2 -c:a mp2 -ac 2 -pcr_period 20"),
@@ -195,7 +196,11 @@ fn generate(dir: &Path, c: &Case) -> bool {
             'A' => format!("sine=f=440:r={spec}"),
             _ => "sine=f=880:r=44100".to_string(),
         };
-        let seconds = if c.name == "m2v_long.ts" { "8" } else { "2" };
+        let seconds = if c.name.starts_with("m2v_long") {
+            "8"
+        } else {
+            "2"
+        };
         cmd.args(["-f", "lavfi", "-i", &source, "-t", seconds]);
     }
     cmd.args(c.args.split_whitespace());
@@ -708,8 +713,14 @@ fn damage_is_contained(path: &Path, dir: &Path) -> Vec<String> {
 /// Seeking in a foreign stream lands on a key frame at or before the
 /// target and the next video packet is that key frame.
 fn seek_lands_on_keyframes(path: &Path) -> Vec<String> {
-    let mut d = MpegTsDemuxer::new(Box::new(std::fs::File::open(path).unwrap())).unwrap();
-    let all = drain(&mut d).unwrap();
+    let file = Box::new(std::fs::File::open(path).unwrap());
+    let mut d: Box<dyn Demuxer> = if is_program_stream(path) {
+        oxideav_mpegts::open_ps_demuxer(file, &NullCodecResolver).unwrap()
+    } else {
+        Box::new(MpegTsDemuxer::new(file).unwrap())
+    };
+    let d = d.as_mut();
+    let all = drain(d).unwrap();
     let video: Vec<&Packet> = all.iter().filter(|p| p.stream_index == 0).collect();
     let keys: Vec<i64> = video
         .iter()
@@ -785,7 +796,7 @@ fn foreign_streams_match_the_black_box_reader() {
             continue;
         }
         // The two high-rate cases get a paced rate above their own.
-        let paced = if matches!(c.name, "m2v_long.ts" | "h264_1080.ts") {
+        let paced = if matches!(c.name, "m2v_long.ts" | "m2v_long.vob" | "h264_1080.ts") {
             40_000_000
         } else {
             6_000_000
@@ -846,13 +857,15 @@ fn foreign_streams_match_the_black_box_reader() {
                 .map(|p| format!("damage: {p}")),
         );
     }
-    let long = dir.join("m2v_long.ts");
-    if long.exists() {
-        failures.extend(
-            seek_lands_on_keyframes(&long)
-                .into_iter()
-                .map(|p| format!("seek: {p}")),
-        );
+    for name in ["m2v_long.ts", "m2v_long.vob"] {
+        let long = dir.join(name);
+        if long.exists() {
+            failures.extend(
+                seek_lands_on_keyframes(&long)
+                    .into_iter()
+                    .map(|p| format!("seek in {name}: {p}")),
+            );
+        }
     }
 
     // Codecs the black box cannot be made to write here: this crate

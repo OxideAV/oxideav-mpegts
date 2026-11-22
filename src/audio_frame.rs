@@ -755,7 +755,7 @@ impl Anchor {
             return self.pts;
         }
         let off = (k * self.samples_per_frame as i128 * 90_000) / self.sample_rate as i128;
-        self.pts + off as i64
+        self.pts.saturating_add(off as i64)
     }
 }
 

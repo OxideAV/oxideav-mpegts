@@ -483,6 +483,12 @@ pub fn exercise_hostile(bytes: &[u8]) {
                 break;
             }
         }
+        // Seeking: any outcome but a panic or a hang.
+        let streams = ps.streams().len() as u32;
+        for (k, target) in [0i64, 90_000, 1 << 32, i64::MAX].into_iter().enumerate() {
+            let _ = ps.seek_to(k as u32 % streams.max(1), target);
+            let _ = ps.next_packet();
+        }
     }
 
     // T-STD replay over the default muxer PID layout: any input must
