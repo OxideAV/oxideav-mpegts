@@ -161,8 +161,9 @@ impl std::fmt::Debug for MpegPsDemuxer {
 
 /// One unit the byte walk produced.
 enum Unit {
-    /// A PES packet (header + payload), with its stream_id.
-    Pes(Vec<u8>),
+    /// A PES packet (header + payload): its byte range in the read
+    /// buffer, valid until the next unit is read.
+    Pes(std::ops::Range<usize>),
     /// Anything else (pack header, system header, end code, resync).
     Other,
 }
@@ -316,7 +317,7 @@ impl MpegPsDemuxer {
                 }
                 self.fill(total)?;
                 let end = (self.pos + total).min(self.buf.len());
-                let pes = self.buf[self.pos..end].to_vec();
+                let pes = self.pos..end;
                 self.pos = end;
                 Ok(Some(Unit::Pes(pes)))
             }
@@ -345,9 +346,10 @@ impl MpegPsDemuxer {
             let Some(unit) = self.next_unit()? else {
                 break;
             };
-            let Unit::Pes(bytes) = unit else {
+            let Unit::Pes(range) = unit else {
                 continue;
             };
+            let bytes = self.buf[range].to_vec();
             let sid = bytes[3];
             if sid == PSM_STREAM_ID {
                 parse_psm(&bytes, &mut psm);
@@ -440,17 +442,18 @@ impl MpegPsDemuxer {
         if !is_es_stream_id(sid) {
             return;
         }
-        let Ok(pes) = PesPacket::parse(bytes) else {
+        let Ok((pes, body_at)) = PesPacket::parse_header(bytes) else {
             return;
         };
-        let Some(key) = stream_key(sid, &pes.payload) else {
+        let body = bytes.get(body_at..).unwrap_or(&[]);
+        let Some(key) = stream_key(sid, body) else {
             return;
         };
         let Some(&idx) = self.keys.get(&key) else {
             return;
         };
         let st = &mut self.states[idx as usize];
-        let payload = pes.payload.get(st.strip..).unwrap_or(&[]);
+        let payload = body.get(st.strip..).unwrap_or(&[]);
         // 33-bit unwrap onto one 64-bit axis, tolerant of the backward
         // steps B-picture reordering puts into presentation times.
         let pts = pes.pts_90k.map(|raw| st.pts.extend(raw) as i64);
@@ -561,7 +564,12 @@ impl Demuxer for MpegPsDemuxer {
                 return Err(CoreError::Eof);
             }
             match self.next_unit()? {
-                Some(Unit::Pes(bytes)) => self.handle_pes(&bytes),
+                Some(Unit::Pes(range)) => {
+                    // The packet is parsed where it was read.
+                    let buf = std::mem::take(&mut self.buf);
+                    self.handle_pes(&buf[range]);
+                    self.buf = buf;
+                }
                 Some(Unit::Other) => {}
                 None => {
                     self.flush_all();
@@ -894,9 +902,21 @@ impl VideoAuSplitter {
         // straddles payloads is picked up on the next push.
         let mut i = self.scanned;
         while i + 6 <= self.buf.len() {
-            if self.buf[i] != 0 || self.buf[i + 1] != 0 || self.buf[i + 2] != 1 {
-                i += 1;
-                continue;
+            // Looking for 00 00 01 at `i`: the third byte decides how
+            // far the search may jump. Above 1, no prefix can start at
+            // any of the three positions it covers; equal to 1 without
+            // two zeros ahead, likewise; a zero may open a prefix one
+            // byte on.
+            match self.buf[i + 2] {
+                1 if self.buf[i] == 0 && self.buf[i + 1] == 0 => {}
+                0 => {
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    i += 3;
+                    continue;
+                }
             }
             let code = self.buf[i + 3];
             let next = self.buf[i + 4];

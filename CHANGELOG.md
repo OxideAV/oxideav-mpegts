@@ -48,6 +48,11 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Changed
 
+- Program-stream demux is 1.8x faster (1 249 → 2 283 MiB/s on a
+  30 Mbit/s stream): three-byte steps in the start-code search, PES
+  packets parsed in the read buffer. Same output.
+- `benches/throughput.rs` measures any stream given in
+  `MPEGTS_BENCH_FILE` (open, demux, remux, seek).
 - Codec ids follow the names the decoder crates register: `h265` (was
   `hevc`), `mpeg4video` (was `mpeg4`); `stream_type` 0x11 is `aac_latm`
   (it is not ADTS). The muxer accepts the old spellings too.

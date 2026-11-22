@@ -327,6 +327,30 @@ bytes straight into the outgoing packet, and fragmenting a frame from
 its PES header and payload without an intermediate copy. The muxed
 stream is byte-identical before and after.
 
+### Streams from another multiplexer
+
+`MPEGTS_BENCH_FILE=<file> cargo bench --bench throughput` runs the legs
+on any transport or program stream. On a 60 s, 30 Mbit/s MPEG-2 video +
+AC-3 stream written by a black-box multiplexer (223 MiB as a transport
+stream; the same packets as 192-byte packets, at a constant 40 Mbit/s
+with null stuffing, and as a program stream), in memory, on the same
+busy machine (medians of five; the program-stream row is the median of
+three alternating before / after rounds):
+
+| Leg | Before | After |
+|-----|-------:|------:|
+| demux, transport stream (188 / 192-byte / constant rate) | — | 4 950 / 4 960 / 5 520 MiB/s |
+| demux, program stream | 1 249 MiB/s | 2 283 MiB/s |
+| remux of the demuxed packets into a transport stream | — | 7 990 MiB/s |
+| open | — | 1.3 ms (transport), 2.2 ms (program) |
+| seek to a key frame + first packet (200 scattered targets) | — | 0.6 ms |
+
+The program-stream gain: the access-unit splitter's start-code search
+steps three bytes whenever the third byte rules a prefix out, and a PES
+packet is parsed where it was read (two payload copies fewer). Output
+is identical. Draining the 223 MiB stream from a file peaks at 4.6 MiB
+resident, four copies of it back to back (891 MiB) at 5.2 MiB.
+
 ## Fuzzing
 
 `fuzz/` carries a cargo-fuzz harness with four structure-aware

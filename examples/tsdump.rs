@@ -6,7 +6,11 @@
 //! tsdump dump  <file> [program_number]
 //! tsdump remux <in> <out.ts> [mux_rate_bps]
 //! tsdump psi   <file>
+//! tsdump count <file>
 //! ```
+//!
+//! `count` drains a file without keeping its packets and prints the
+//! totals — the leg to watch the memory of on a long stream.
 //!
 //! `psi` prints every distinct PAT and PMT section of a transport
 //! stream (plain 188-byte packets): the program list, and per program
@@ -159,6 +163,26 @@ fn remux(src: &str, dst: &str, rate: Option<u64>) -> Result<(), Error> {
     mux.write_trailer()
 }
 
+fn count(path: &str) -> Result<(), Error> {
+    let mut dmx = open(path, None)?;
+    let (mut packets, mut bytes) = (0u64, 0u64);
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => {
+                packets += 1;
+                bytes += p.data.len() as u64;
+            }
+            Err(Error::Eof) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    println!(
+        "{} streams, {packets} packets, {bytes} payload bytes",
+        dmx.streams().len()
+    );
+    Ok(())
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -228,9 +252,10 @@ fn main() {
             remux(&args[2], &args[3], args.get(4).and_then(|v| v.parse().ok()))
         }
         Some("psi") if args.len() >= 3 => psi(&args[2]),
+        Some("count") if args.len() >= 3 => count(&args[2]),
         _ => {
             eprintln!(
-                "usage: tsdump dump <file> [program] | tsdump remux <in> <out.ts> [rate] | tsdump psi <file>"
+                "usage: tsdump dump <file> [program] | remux <in> <out.ts> [rate] | psi <file> | count <file>"
             );
             std::process::exit(2);
         }

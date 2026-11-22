@@ -8,7 +8,11 @@
 //!   (default 5);
 //! * `MPEGTS_BENCH_DIR` — directory for the on-disk copy used by the
 //!   unbuffered-file demux leg (default: the system temp directory);
-//! * `MPEGTS_BENCH_KEEP` — when set, the on-disk copy is left behind.
+//! * `MPEGTS_BENCH_KEEP` — when set, the on-disk copy is left behind;
+//! * `MPEGTS_BENCH_FILE` — measure on this transport or program stream
+//!   (one written by another multiplexer, say) instead of the
+//!   self-muxed one: open time, demux throughput, remux throughput of
+//!   the first program and, for a transport stream, the median seek.
 //!
 //! The stream holds four programs, each with one video stream (40 kB
 //! frames at 25 Hz) and two MPEG audio streams (576-byte frames), so
@@ -175,9 +179,109 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
+/// The legs on a stream somebody else wrote.
+fn foreign(path: &std::path::Path, runs: usize) {
+    use oxideav_core::{Demuxer, NullCodecResolver};
+    let bytes: Arc<[u8]> = std::fs::read(path).expect("read MPEGTS_BENCH_FILE").into();
+    let mib = bytes.len() as f64 / (1 << 20) as f64;
+    let program_stream = bytes.starts_with(&[0, 0, 1, 0xBA]);
+    let open = |data: &Arc<[u8]>| -> Box<dyn Demuxer> {
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(data.clone()));
+        if program_stream {
+            oxideav_mpegts::open_ps_demuxer(input, &NullCodecResolver).expect("open")
+        } else {
+            Box::new(MpegTsDemuxer::new(input).expect("open"))
+        }
+    };
+    println!("stream: {} ({mib:.1} MiB)", path.display());
+
+    let mut opens = Vec::new();
+    let mut rates = Vec::new();
+    let mut packets = Vec::new();
+    let mut infos = Vec::new();
+    for _ in 0..runs {
+        let t = Instant::now();
+        let mut d = open(&bytes);
+        opens.push(t.elapsed().as_secs_f64() * 1e3);
+        let t = Instant::now();
+        packets.clear();
+        while let Ok(p) = d.next_packet() {
+            packets.push(p);
+        }
+        rates.push(mib / t.elapsed().as_secs_f64());
+        infos = d.streams().to_vec();
+    }
+    let payload: usize = packets.iter().map(|p| p.data.len()).sum();
+    println!(
+        "open           : {:8.2} ms (median of {runs})",
+        median(opens)
+    );
+    println!(
+        "demux (memory) : {:8.1} MiB/s (median of {runs}; {} streams, {} packets, {payload} payload bytes)",
+        median(rates),
+        infos.len(),
+        packets.len()
+    );
+
+    let program =
+        ProgramSpec::new(1, 0x0100).with_stream_indices(infos.iter().map(|s| s.index).collect());
+    let config = MpegTsMuxConfig::default().with_programs(vec![program]);
+    let mut rates = Vec::new();
+    let mut written = 0usize;
+    for _ in 0..runs {
+        let buf = SharedBuf::default();
+        let t = Instant::now();
+        let mut m = MpegTsMuxer::with_config(Box::new(buf.clone()), &infos, config.clone())
+            .expect("mux config");
+        m.write_header().expect("header");
+        for p in &packets {
+            m.write_packet(p).expect("packet");
+        }
+        m.write_trailer().expect("trailer");
+        drop(m);
+        written = buf.0.lock().unwrap().get_ref().len();
+        rates.push(written as f64 / (1 << 20) as f64 / t.elapsed().as_secs_f64());
+    }
+    println!(
+        "remux (memory) : {:8.1} MiB/s (median of {runs}; {written} bytes out)",
+        median(rates)
+    );
+
+    if program_stream {
+        return;
+    }
+    let mut d = MpegTsDemuxer::new(Box::new(Cursor::new(bytes.clone()))).expect("open");
+    let (first, last) = packets
+        .iter()
+        .filter(|p| p.stream_index == 0)
+        .filter_map(|p| p.pts)
+        .fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+    let mut cold = Vec::new();
+    let mut warm = Vec::new();
+    for (round, times) in [&mut cold, &mut warm].into_iter().enumerate() {
+        for k in 0..200i64 {
+            // A fixed scatter over the whole duration.
+            let target = first + (last - first) * ((k * 7919 + round as i64 * 13) % 200) / 200;
+            let t = Instant::now();
+            d.seek_to(0, target).expect("seek");
+            let _ = d.next_packet();
+            times.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+    }
+    println!(
+        "seek + packet  : {:8.1} us first pass, {:.1} us second (median of 200 each)",
+        median(cold),
+        median(warm)
+    );
+}
+
 fn main() {
     let frames = env_usize("MPEGTS_BENCH_FRAMES", 900);
     let runs = env_usize("MPEGTS_BENCH_RUNS", 5).max(1);
+    if let Some(path) = std::env::var_os("MPEGTS_BENCH_FILE") {
+        foreign(std::path::Path::new(&path), runs);
+        return;
+    }
     let (infos, packets) = plan(frames);
     let es_bytes: usize = packets.iter().map(|p| p.data.len()).sum();
 
